@@ -156,6 +156,33 @@ def t_physical_release_zeroes():
     assert e.keys[31]["mm"] == 0.0, e.keys[31]["mm"]
 
 
+def t_stale_state_after_mapping_change():
+    """A physical state captured under an older mapping must not suppress a zero."""
+    e = dl.Engine()
+    e.keys[31] = {"vk": 0x41, "mm": 0.0, "count": 0, "speeds": []}
+    e.on_depth(1.0, 31, 2.5)
+    e.vk_held[0x41] = True
+    e.key_state[0x41] = {"gen": e.mapping_gen, "ts": 1.0}
+    assert e.os_key_down(0x41), "fresh state should count"
+    e.bump_mapping()                       # mapping changed while the key is held
+    assert not e.os_key_down(0x41), "stale state must be ignored"
+    e.on_depth(1.1, 31, 0.0)               # so the zero is a real release
+    assert e.keys[31]["mm"] == 0.0, e.keys[31]["mm"]
+
+
+def t_suppressed_counter():
+    """Switch-zero suppressed while held counts as a diagnostic, not a sample."""
+    e = dl.Engine()
+    e.keys[31] = {"vk": 0x41, "mm": 0.0, "count": 0, "speeds": []}
+    e.vk_held[0x41] = True
+    e.key_state[0x41] = {"gen": e.mapping_gen, "ts": 1.0}
+    e.on_depth(1.0, 31, 2.5)
+    before = e.suppressed
+    e.on_depth(1.05, 31, 0.0)
+    assert e.suppressed == before + 1
+    assert e.keys[31]["mm"] == 2.5
+
+
 def t_reset_mapping_clears_state():
     import tempfile
     e = dl.Engine()
@@ -336,6 +363,8 @@ def main():
         ("hold writer without mapping", t_hold_without_mapping),
         ("firmware zero while held", t_firmware_zero_while_held),
         ("physical release zeroes", t_physical_release_zeroes),
+        ("stale state after mapping change", t_stale_state_after_mapping_change),
+        ("suppressed counter", t_suppressed_counter),
         ("reset mapping clears state", t_reset_mapping_clears_state),
         ("render alpha + multiprocess match", t_render_alpha_and_multiprocess_match),
         ("empty exports", t_empty_exports),

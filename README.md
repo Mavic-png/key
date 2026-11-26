@@ -97,13 +97,15 @@ and Premiere imports it as an image sequence with alpha intact.
 python test_pipeline.py
 ```
 
-Thirteen headless checks, including the ones a static review asked for:
+Fifteen headless checks, including the ones a static review asked for:
 
 * firmware switch-zero vs. real release (both orders)
 * hold re-emission when the mapping table is empty
 * mapping reset clearing `vk_held` / `press_state`
 * rendered frames keep RGBA, and 1 worker produces byte-identical output to
   4 workers (spawn on Windows)
+* a physical-key state captured under an old mapping cannot suppress a real
+  release (mapping generation stamp)
 
 ## Licence
 

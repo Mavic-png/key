@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.7"
+VERSION = "1.8"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -262,7 +262,10 @@ class Engine(object):
         self.last_hotkey = None
         self.hold_n = 0
         self.auto = False
-        self.vk_held = {}
+        self.vk_held = {}            # vk -> True while the OS reports it down
+        self.key_state = {}          # vk -> {"gen": mapping generation, "ts": float}
+        self.mapping_gen = 0         # bumped whenever the index<->vk table changes
+        self.suppressed = 0          # firmware switch-zero reports ignored
         self._load_mapping()
 
     # ---- mapping persistence ----------------------------------------
@@ -283,6 +286,7 @@ class Engine(object):
                     self.mapping[int(k)] = int(v)
                 if self.mapping:
                     self.map_path = path
+                    self.bump_mapping()
                     return
             except Exception:
                 continue
@@ -322,8 +326,10 @@ class Engine(object):
                 st["mm"] = 0.0
             # the old physical state must not leak into the new mapping
             self.vk_held.clear()
+            self.key_state.clear()
             self.press_state.clear()
             self.pending_bind = False
+            self.bump_mapping()
         self._save_mapping()
 
     def bind_by_press(self):
@@ -380,14 +386,38 @@ class Engine(object):
                 pass
             time.sleep(0.6)
 
+    def bump_mapping(self):
+        """The index<->vk table changed: old physical state must not be trusted."""
+        self.mapping_gen += 1
+        for st in self.key_state.values():
+            st["gen"] = -1
+
+    def os_key_down(self, vk):
+        """True only if the OS says the key is down AND that reading belongs to
+        the current mapping generation."""
+        if not self.vk_held.get(vk):
+            return False
+        st = self.key_state.get(vk)
+        if st is None:
+            return True
+        return st.get("gen") == self.mapping_gen
+
+    def mark_key(self, vk, down, ts):
+        self.key_state[vk] = {"gen": self.mapping_gen, "ts": ts}
+        if down:
+            self.vk_held[vk] = True
+        else:
+            self.vk_held.pop(vk, None)
+
     def on_depth(self, t, idx, mm):
         with self.lock:
             vk = self.mapping.get(idx)
             if vk is None:
                 vk = self.keys.get(idx, {}).get("vk")
-            if mm <= 0.0 and vk is not None and self.vk_held.get(vk):
+            if mm <= 0.0 and vk is not None and self.os_key_down(vk):
                 # firmware resets the previous key to 0 when another key becomes
                 # active -- keep the value while the key is physically down
+                self.suppressed += 1
                 return
             self.n_depth += 1
             self.samples.append((t, idx, mm))
@@ -523,7 +553,7 @@ class Engine(object):
                 items = []
                 for idx, st in self.keys.items():
                     vk = st.get("vk")
-                    if vk and self.vk_held.get(vk) and st["mm"] > 0.05:
+                    if vk and self.os_key_down(vk) and st["mm"] > 0.05:
                         items.append((idx, st["mm"]))
             for idx, mm in items:
                 try:
@@ -569,10 +599,8 @@ class Engine(object):
                 prev[vk] = down
                 try:
                     with self.lock:
-                        if down:
-                            self.vk_held[vk] = True
-                        else:
-                            self.vk_held.pop(vk, None)
+                        self.mark_key(vk, down, now)
+                        if not down:
                             released = [i for i, st in self.keys.items()
                                         if st.get("vk") == vk]
                             for i in released:
@@ -627,6 +655,7 @@ class Engine(object):
                     idx = moving[0]
                     self.keys[idx]["vk"] = target
                     self.mapping[idx] = target
+                    self.bump_mapping()
                     for other, st0 in self.keys.items():
                         if other != idx and st0["vk"] == target:
                             st0["vk"] = None
@@ -659,6 +688,7 @@ class Engine(object):
                 st["vk"] = vk
                 self.pending_bind = False
                 self.mapping[idx] = vk
+                self.bump_mapping()
                 self._save_mapping()
             ps = self.press_state.get(idx)
             if ps is not None and ps["down"] is None:
@@ -701,6 +731,8 @@ class Engine(object):
                 "notice": self.notice,
                 "hotkey": self.last_hotkey,
                 "hold_n": self.hold_n,
+                "suppressed": self.suppressed,
+                "mapping_gen": self.mapping_gen,
                 "auto": self.auto,
                 "version": VERSION,
                 "binding": self.pending_label,
