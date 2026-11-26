@@ -271,6 +271,17 @@ def t_render_alpha_and_multiprocess_match():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_missed_keyup_edge():
+    """A missed key-up edge must not leave the key stuck in the held set."""
+    e = dl.Engine()
+    e.keys[31] = {"vk": 0x41, "mm": 2.0, "count": 0, "speeds": []}
+    e.mark_key(0x41, True, 1.0)
+    assert 0x41 in e.vk_held
+    e.apply_key_state(0x41, False, 1.1)      # what the watchdog calls
+    assert 0x41 not in e.vk_held, "key stuck as held"
+    assert e.keys[31]["mm"] == 0.0, e.keys[31]["mm"]
+
+
 def t_refresh_blocked_after_reset():
     """A late refresh must not resurrect a key the reset has just forgotten."""
     e = dl.Engine()
@@ -441,6 +452,7 @@ def main():
         ("stale state after mapping change", t_stale_state_after_mapping_change),
         ("suppressed counter", t_suppressed_counter),
         ("reset mapping clears state", t_reset_mapping_clears_state),
+        ("missed key-up edge clears held", t_missed_keyup_edge),
         ("late refresh blocked after reset", t_refresh_blocked_after_reset),
         ("save mapping failure keeps memory", t_save_mapping_failure_keeps_memory),
         ("ffmpeg start failure cleans up", t_ffmpeg_start_failure),

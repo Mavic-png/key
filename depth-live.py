@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -271,6 +271,7 @@ class Engine(object):
         self.key_state = {}          # vk -> {"gen": mapping generation, "ts": float}
         self.mapping_gen = 0         # bumped whenever the index<->vk table changes
         self.suppressed = 0          # firmware switch-zero reports ignored
+        self.released_by_watchdog = 0
         self._load_mapping()
 
     # ---- mapping persistence ----------------------------------------
@@ -631,27 +632,14 @@ class Engine(object):
                 if down == was:
                     continue
                 prev[vk] = down
-                try:
-                    with self.lock:
-                        self.mark_key(vk, down, now)
-                        if not down:
-                            released = [i for i, st in self.keys.items()
-                                        if st.get("vk") == vk]
-                            for i in released:
-                                self.on_depth(now, i, 0.0)
-                        # hold the lock across the transition so a mapping reset
-                        # from another thread cannot slip in between
-                        bumped = self._key_transition(vk, down, now)
-                        if bumped:
-                            # this very press taught/bound the key: keep its
-                            # state, but only if the table still knows the vk
-                            if self.key_known(vk):
-                                self.refresh_key_state(vk, down, now)
-                except Exception:
-                    now_s = time.time()
-                    if now_s - getattr(self, "_last_key_err", 0) > 1.0:
-                        self._last_key_err = now_s
-                        _log_exc("run_keys vk=%d" % vk)
+                self.apply_key_state(vk, down, now)
+            # watchdog: a key marked held but no longer down is a missed edge.
+            # Without this the page can keep a key highlighted forever.
+            for vk in list(self.vk_held):
+                if not (user32.GetAsyncKeyState(vk) & 0x8000):
+                    prev[vk] = False
+                    self.released_by_watchdog += 1
+                    self.apply_key_state(vk, False, now)
             # global hotkeys: work even when the game has focus (no window switching)
             ctrl = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
             alt = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
@@ -683,6 +671,29 @@ class Engine(object):
                         pass
                 hk_prev[hk] = down
             time.sleep(0.004)
+
+    def apply_key_state(self, vk, down, now):
+        """Apply one physical key transition. Shared by the edge detector and the
+        watchdog so a missed edge cannot leave a key stuck as held."""
+        try:
+            with self.lock:
+                self.mark_key(vk, down, now)
+                if not down:
+                    released = [i for i, st in self.keys.items()
+                                if st.get("vk") == vk]
+                    for i in released:
+                        self.on_depth(now, i, 0.0)
+                # hold the lock across the transition so a mapping reset from
+                # another thread cannot slip in between
+                bumped = self._key_transition(vk, down, now)
+                if bumped and self.key_known(vk):
+                    # this very press taught/bound the key: keep its state
+                    self.refresh_key_state(vk, down, now)
+        except Exception:
+            now_s = time.time()
+            if now_s - getattr(self, "_last_key_err", 0) > 1.0:
+                self._last_key_err = now_s
+                _log_exc("apply_key_state vk=%d" % vk)
 
     def _key_transition(self, vk, down, now):
         """Returns True when this call changed the index<->vk table."""
@@ -777,6 +788,7 @@ class Engine(object):
                 "hotkey": self.last_hotkey,
                 "hold_n": self.hold_n,
                 "suppressed": self.suppressed,
+                "watchdog_releases": self.released_by_watchdog,
                 "mapping_gen": self.mapping_gen,
                 "auto": self.auto,
                 "version": VERSION,
