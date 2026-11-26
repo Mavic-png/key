@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.9.3"
+VERSION = "1.9.4"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -267,6 +267,7 @@ class Engine(object):
         self.bind_msg = ""
         self.notice = ""
         self.last_hotkey = None
+        self.last_client = time.time()
         self.hold_n = 0
         self.auto = False
         self.vk_held = {}            # vk -> True while the OS reports it down
@@ -638,6 +639,37 @@ class Engine(object):
                 except Exception:
                     pass
 
+    def request_quit(self, srv):
+        try:
+            if self.recording:
+                self.stop_recording(save=True)
+        except Exception:
+            pass
+        try:
+            if srv is not None:
+                srv.shutdown()
+        except Exception:
+            pass
+
+    def run_idle_exit(self, seconds, srv):
+        """Nobody has looked at the page for a while and nothing is recording:
+        there is no reason to keep a HID reader and a process alive."""
+        if seconds <= 0:
+            return
+        while True:
+            time.sleep(5.0)
+            with self.lock:
+                busy = self.recording or self.auto
+            if busy:
+                self.last_client = time.time()
+                continue
+            if time.time() - self.last_client > seconds:
+                try:
+                    srv.shutdown()
+                except Exception:
+                    pass
+                return
+
     def run_autosave(self, interval):
         """Auto mode: save a segment every `interval` seconds and keep going."""
         while True:
@@ -966,6 +998,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        ENGINE.last_client = time.time()
         url = urlparse(self.path)
         if url.path == "/":
             body = page_html().encode("utf-8")
@@ -1071,6 +1104,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "2")
             self.end_headers()
             self.wfile.write(body)
+        elif url.path == "/quit":
+            body = b"bye"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            threading.Timer(0.5, ENGINE.request_quit, args=(srv_ref[0],)).start()
         elif url.path == "/openfolder":
             try:
                 folder = os.path.join(os.path.expanduser("~"), "Documents",
@@ -1287,6 +1328,7 @@ PAGE = r"""<!DOCTYPE html>
     <option value="100">100 Hz</option><option value="50">50 Hz</option><option value="25">25 Hz</option>
   </select>
   <button onclick="downloadIfRecorded('/export/wide?rate=' + document.getElementById('rate').value)">导出宽表</button>
+  <button id="quitBtn" onclick="quitApp()">退出程序</button>
   <button onclick="fetch('/openfolder')">打开记录文件夹</button>
   <button onclick="fetch('/reset').then(()=>location.reload())">清空重录</button>
 </header>
@@ -1406,6 +1448,13 @@ let lastHeld = {};
 let held = new Set();
 let lastMsg = Date.now();
 let staleHeld = false;
+function quitApp() {
+  if (!confirm('退出磁轴深度监测？录制中的数据会先自动存盘。')) return;
+  fetch('/quit').then(() => {
+    document.body.innerHTML = '<div style="color:#8b93a7;font:16px system-ui;padding:40px">' +
+      '已退出，可以关闭这个标签页了。</div>';
+  });
+}
 function toggleAuto() {
   fetch('/auto?on=' + (autoMode ? '0' : '1')).then(() => showTip(autoMode ? '已关闭自动录制' : '自动录制已开启：每 2 分钟存一段'));
 }
@@ -1603,7 +1652,9 @@ def single_instance():
     try:
         kernel32.CreateMutexW.restype = wt.HANDLE
         kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, ctypes.c_wchar_p]
-        h = kernel32.CreateMutexW(None, True, "Local\\depth-monitor-single")
+        tag = os.environ.get("DEPTH_MONITOR_HOME") or "default"
+        name = "Local\\depth-monitor-single-" + hashlib.md5(tag.encode("utf-8")).hexdigest()[:8]
+        h = kernel32.CreateMutexW(None, True, name)
         if not h:
             return None
         if ctypes.get_last_error() == 183:      # ERROR_ALREADY_EXISTS
@@ -1613,12 +1664,17 @@ def single_instance():
         return None
 
 
+srv_ref = [None]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--auto", action="store_true", help="start recording immediately")
+    ap.add_argument("--idle-exit", type=int, default=90,
+                    help="exit after N seconds with no page open (0 = never)")
     args = ap.parse_args()
 
     try:
@@ -1629,14 +1685,17 @@ def main():
     guard = single_instance()
     if guard is False:
         print("another monitor is already running")
-        try:
-            import ctypes as _c
-            _c.windll.user32.MessageBoxW(None,
-                "磁轴深度监测已经在运行了。\n"
-                "两个实例会互相覆盖键位映射，请先关掉另一个窗口。",
-                "已在运行", 0x40)
-        except Exception:
-            pass
+        # only bother with a modal box when a page was going to be opened;
+        # in --no-browser/automated mode a modal would hang forever
+        if not args.no_browser:
+            try:
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    "磁轴深度监测已经在运行了。\n"
+                    "两个实例会互相覆盖键位映射，请先关掉另一个窗口。",
+                    "已在运行", 0x40)
+            except Exception:
+                pass
         return
 
     start = (ENGINE.run_demo, ENGINE.rate_tick) if args.demo else \
@@ -1659,6 +1718,10 @@ def main():
         th.start()
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    srv_ref[0] = srv
+    th = threading.Thread(target=ENGINE.run_idle_exit, args=(args.idle_exit, srv))
+    th.daemon = True
+    th.start()
     port = srv.server_address[1]
     url = "http://127.0.0.1:%d/" % port
     print("depth monitor on %s" % url)

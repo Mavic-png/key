@@ -43,6 +43,11 @@ python kb-frames.py recording.csv --alias Alt=LAlt --fps 60
 python compose.py game.mp4 kb-frames-out.mov -o final.mp4 --offset 0
 ```
 
+The process exits on its own when nobody is looking: close the page and after
+90 seconds idle (no page, not recording) it shuts down. `--idle-exit 0` keeps it
+alive forever, `--idle-exit 30` makes it quicker. There is also a
+「退出程序」 button in the page and a `GET /quit` endpoint.
+
 `depth-live.py` hotkeys (work while a game has focus, no window switching):
 
 | hotkey | action |
