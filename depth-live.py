@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1592,6 +1592,21 @@ fitUnits();
 
 
 
+def single_instance():
+    """Only one monitor per user: two instances would fight over mapping.json."""
+    try:
+        kernel32.CreateMutexW.restype = wt.HANDLE
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, ctypes.c_wchar_p]
+        h = kernel32.CreateMutexW(None, True, "Local\\depth-monitor-single")
+        if not h:
+            return None
+        if ctypes.get_last_error() == 183:      # ERROR_ALREADY_EXISTS
+            return False
+        return h
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
@@ -1604,6 +1619,19 @@ def main():
         kernel32.timeBeginPeriod(1)
     except Exception:
         pass
+
+    guard = single_instance()
+    if guard is False:
+        print("another monitor is already running")
+        try:
+            import ctypes as _c
+            _c.windll.user32.MessageBoxW(None,
+                "磁轴深度监测已经在运行了。\n"
+                "两个实例会互相覆盖键位映射，请先关掉另一个窗口。",
+                "已在运行", 0x40)
+        except Exception:
+            pass
+        return
 
     start = (ENGINE.run_demo, ENGINE.rate_tick) if args.demo else \
             (ENGINE.run_reader, ENGINE.run_keys, ENGINE.rate_tick)
