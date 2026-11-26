@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1400,6 +1400,7 @@ function showTip(text, ms) {
   toastTimer = setTimeout(() => { t.style.display = 'none'; }, ms || 2600);
 }
 const EMPTY_SET = new Set();
+let lastHeld = {};
 let held = new Set();
 let lastMsg = Date.now();
 let staleHeld = false;
@@ -1555,16 +1556,19 @@ function draw() {
     const mm = (idx !== undefined) ? (live[idx] || 0) : 0;
     const r = Math.max(0, Math.min(1, mm / FULL));
     const prev = lastRatio[name];
+    const isHeld = heldNow.has(name);
+    const wasHeld = lastHeld[name] === true;
     if (prev !== undefined && Math.abs(prev - r) < 0.004 &&
-        !heldNow.has(name) && binding !== name) {
+        !isHeld && !wasHeld && binding !== name) {
       continue;                          // nothing visibly changed
     }
     lastRatio[name] = r;
+    lastHeld[name] = isHeld;             // a released key must repaint once
     const el = els[name];
     el.fill.style.height = (r * 100) + '%';
     el.fill.style.background = color(r);
     el.box.classList.toggle('hot', r > 0.05);
-    el.box.classList.toggle('held', heldNow.has(name) && r < 0.06);
+    el.box.classList.toggle('held', isHeld && r < 0.06);
     el.box.classList.toggle('binding', binding === name);
     el.box.style.boxShadow = r > 0.02
       ? '0 0 ' + (5 + r * 24).toFixed(0) + 'px ' + color(r) + ', inset 0 1px 0 #303c50'
