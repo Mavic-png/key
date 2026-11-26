@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.8.4"
+VERSION = "1.9.0"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -269,6 +269,7 @@ class Engine(object):
         self.auto = False
         self.vk_held = {}            # vk -> True while the OS reports it down
         self.key_state = {}          # vk -> {"gen": mapping generation, "ts": float}
+        self.pending_learn = None    # (vk, deadline) waiting for its analog report
         self.mapping_gen = 0         # bumped whenever the index<->vk table changes
         self.suppressed = 0          # firmware switch-zero reports ignored
         self.released_by_watchdog = 0
@@ -419,6 +420,40 @@ class Engine(object):
             return True
         return st.get("gen") == self.mapping_gen
 
+    def learn_candidate(self, now, min_delta=0.12):
+        """Pick the index that is *rising* right now, never an already-bound one.
+
+        The old code took the deepest moving key, so pressing S while W was held
+        bound S to whichever index happened to be deepest.
+        """
+        best = None
+        for i, st0 in self.keys.items():
+            if st0.get("vk") is not None:
+                continue                      # never steal a bound key
+            d = self._delta(i, now)
+            if d < min_delta:
+                continue
+            if best is None or d > best[0]:
+                best = (d, i)
+        if best is not None:
+            return best[1]
+        # the report can lag the OS edge by a few ms: accept a single fresh index
+        fresh = [i for i, st0 in self.keys.items()
+                 if st0.get("vk") is None and st0.get("mm", 0.0) > 0.25
+                 and now - st0.get("t_last", -9.0) < 0.15]
+        return fresh[0] if len(fresh) == 1 else None
+
+    def bind_index(self, idx, vk, now):
+        st = self.keys.get(idx)
+        if st is None or st.get("vk") is not None:
+            return False
+        st["vk"] = vk
+        self.mapping[idx] = vk
+        self.pending_learn = None
+        self.bump_mapping()
+        self._save_mapping()
+        return True
+
     def key_known(self, vk):
         """True when the current table still maps this vk to some index."""
         return any(st.get("vk") == vk for st in self.keys.values())
@@ -468,6 +503,10 @@ class Engine(object):
                 st = self.keys[idx] = {"vk": self.mapping.get(idx), "mm": 0.0,
                                        "count": 0, "speeds": []}
             st["mm"] = mm
+            st["t_last"] = t
+            if (self.pending_learn is not None and st.get("vk") is None
+                    and mm > 0.25 and t <= self.pending_learn[1]):
+                self.bind_index(idx, self.pending_learn[0], t)
             ps = self.press_state.get(idx)
             if mm > 0.15:
                 if ps is None:
@@ -635,6 +674,8 @@ class Engine(object):
                 self.apply_key_state(vk, down, now)
             # watchdog: a key marked held but no longer down is a missed edge.
             # Without this the page can keep a key highlighted forever.
+            if self.pending_learn is not None and now > self.pending_learn[1]:
+                self.pending_learn = None
             for vk in list(self.vk_held):
                 if not (user32.GetAsyncKeyState(vk) & 0x8000):
                     prev[vk] = False
@@ -724,12 +765,12 @@ class Engine(object):
             if known:
                 idx = known[0]
             elif down:
-                # learn a new key: the one rising fastest (a held key has ~zero delta)
-                moving = [i for i, st0 in self.keys.items() if st0["mm"] > 0.3]
-                if not moving:
+                idx = self.learn_candidate(now)
+                if idx is None:
+                    # analog report has not arrived yet: remember the vk and bind
+                    # it the moment its index starts rising (deferred learning)
+                    self.pending_learn = (vk, now + 0.3)
                     return
-                moving.sort(key=lambda i: (-self._delta(i, now), -self.keys[i]["mm"]))
-                idx = moving[0]
             else:
                 return                      # release of something we never mapped
             st = self.keys[idx]

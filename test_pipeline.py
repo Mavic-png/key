@@ -271,6 +271,29 @@ def t_render_alpha_and_multiprocess_match():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_learning_never_steals_bound():
+    """Pressing a new key while another is held must not rebind the held index."""
+    e = dl.Engine()
+    e.keys[18] = {"vk": 0x57, "mm": 3.5, "t_last": 0.0, "count": 0, "speeds": []}
+    e.keys[31] = {"vk": None, "mm": 0.0, "t_last": 0.0, "count": 0, "speeds": []}
+    e.samples.append((1.0, 18, 3.5))
+    cand = e.learn_candidate(1.0)
+    assert cand != 18, "held key must not be a learning candidate"
+
+
+def t_deferred_learning():
+    """The OS edge arrives before the analog report: bind when the report lands."""
+    e = dl.Engine()
+    e.keys[18] = {"vk": 0x57, "mm": 3.5, "t_last": 0.0, "count": 0, "speeds": []}
+    e.keys[31] = {"vk": None, "mm": 0.0, "t_last": 0.0, "count": 0, "speeds": []}
+    e.apply_key_state(0x53, True, 1.0)          # S pressed, no report yet
+    assert e.pending_learn is not None, "should wait for the analog report"
+    e.on_depth(1.02, 31, 0.8)                   # report for index 31 arrives
+    assert e.mapping.get(31) == 0x53, e.mapping
+    assert e.keys[18]["vk"] == 0x57, "held key must keep its binding"
+    assert e.pending_learn is None
+
+
 def t_missed_keyup_edge():
     """A missed key-up edge must not leave the key stuck in the held set."""
     e = dl.Engine()
@@ -452,6 +475,8 @@ def main():
         ("stale state after mapping change", t_stale_state_after_mapping_change),
         ("suppressed counter", t_suppressed_counter),
         ("reset mapping clears state", t_reset_mapping_clears_state),
+        ("learning never steals a bound key", t_learning_never_steals_bound),
+        ("deferred learning binds on report", t_deferred_learning),
         ("missed key-up edge clears held", t_missed_keyup_edge),
         ("late refresh blocked after reset", t_refresh_blocked_after_reset),
         ("save mapping failure keeps memory", t_save_mapping_failure_keeps_memory),
