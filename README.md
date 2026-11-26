@@ -97,9 +97,13 @@ and Premiere imports it as an image sequence with alpha intact.
 python test_pipeline.py
 ```
 
-Nine headless checks: recording toggle, long/wide export (including keys that
-were pressed outside the recording window), hold re-emission without a mapping
-table, empty exports, save-to-disk, HTTP endpoints, and the video loader.
+Thirteen headless checks, including the ones a static review asked for:
+
+* firmware switch-zero vs. real release (both orders)
+* hold re-emission when the mapping table is empty
+* mapping reset clearing `vk_held` / `press_state`
+* rendered frames keep RGBA, and 1 worker produces byte-identical output to
+  4 workers (spawn on Windows)
 
 ## Licence
 

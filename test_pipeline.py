@@ -135,6 +135,88 @@ def t_hold_without_mapping():
     assert multi > 0, "held key not preserved: %d" % multi
 
 
+def t_firmware_zero_while_held():
+    """A zero report while the OS still sees the key down is a firmware switch."""
+    e = dl.Engine()
+    e.keys[31] = {"vk": 0x41, "mm": 0.0, "count": 0, "speeds": []}
+    e.vk_held[0x41] = True
+    e.on_depth(1.0, 31, 2.5)
+    e.on_depth(1.1, 31, 0.0)
+    assert e.keys[31]["mm"] == 2.5, e.keys[31]["mm"]
+
+
+def t_physical_release_zeroes():
+    """Once the OS reports the key up, the zero is a real release."""
+    e = dl.Engine()
+    e.keys[31] = {"vk": 0x41, "mm": 0.0, "count": 0, "speeds": []}
+    e.vk_held[0x41] = True
+    e.on_depth(1.0, 31, 2.5)
+    e.vk_held.pop(0x41, None)
+    e.on_depth(1.1, 31, 0.0)
+    assert e.keys[31]["mm"] == 0.0, e.keys[31]["mm"]
+
+
+def t_reset_mapping_clears_state():
+    import tempfile
+    e = dl.Engine()
+    e.map_path = os.path.join(tempfile.mkdtemp(), "map.json")
+    e.mapping[31] = 0x41
+    e.keys[31] = {"vk": 0x41, "mm": 2.0, "count": 3, "speeds": []}
+    e.vk_held[0x41] = True
+    e.press_state[31] = {"peak": 2.0}
+    e.pending_bind = True
+    e.reset_mapping()
+    assert not e.mapping, e.mapping
+    assert not e.vk_held, e.vk_held
+    assert not e.press_state, e.press_state
+    assert e.keys[31]["vk"] is None and e.keys[31]["mm"] == 0.0
+    assert not e.pending_bind
+
+
+def _render_cli(csv_path, out_dir, jobs):
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    return subprocess.run([sys.executable, os.path.join(here, "kb-frames.py"), csv_path,
+                           "--png-only", "--jobs", str(jobs), "--fps", "30",
+                           "--size", "320x240", "--keys", "W", "A", "S", "D", "LAlt", "Space",
+                           "-o", out_dir], capture_output=True, text=True)
+
+
+def t_render_alpha_and_multiprocess_match():
+    """Rendering must keep RGBA, and 1 worker must equal N workers byte for byte."""
+    import filecmp, glob, shutil, tempfile
+    here = os.path.dirname(os.path.abspath(__file__))
+    tmp = tempfile.mkdtemp()
+    csv_path = os.path.join(tmp, "t.csv")
+    with io.open(csv_path, "w", encoding="utf-8") as f:
+        f.write("# t_s,wall,W,A\n")
+        f.write("t_s,wall,W,A\n")
+        for i in range(30):
+            t = i / 30.0
+            f.write("%.3f,2026-01-01T00:00:00,%.2f,%.2f\n"
+                    % (t, 3.5 if t > 0.3 else 0.0, 2.0 if t > 0.5 else 0.0))
+    single = os.path.join(tmp, "single")
+    multi = os.path.join(tmp, "multi")
+    r1 = _render_cli(csv_path, single, 1)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    r2 = _render_cli(csv_path, multi, 4)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+
+    from PIL import Image
+    frames = sorted(glob.glob(os.path.join(single, "*.png")))
+    assert len(frames) == 31, len(frames)
+    img = Image.open(frames[20])
+    assert img.mode == "RGBA", img.mode
+    alpha_min, alpha_max = img.getchannel("A").getextrema()
+    assert alpha_min == 0 and alpha_max > 200, (alpha_min, alpha_max)
+
+    for f in frames:
+        mate = os.path.join(multi, os.path.basename(f))
+        assert os.path.exists(mate), mate
+        assert filecmp.cmp(f, mate, shallow=False), "frame mismatch: " + f
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def t_long_export():
     e = make_engine()
     e.recording = True
@@ -252,6 +334,10 @@ def main():
         ("wide export (keys without samples)", t_wide_export_keys_without_samples),
         ("long export", t_long_export),
         ("hold writer without mapping", t_hold_without_mapping),
+        ("firmware zero while held", t_firmware_zero_while_held),
+        ("physical release zeroes", t_physical_release_zeroes),
+        ("reset mapping clears state", t_reset_mapping_clears_state),
+        ("render alpha + multiprocess match", t_render_alpha_and_multiprocess_match),
         ("empty exports", t_empty_exports),
         ("save recording to disk", t_save_recording),
         ("http endpoints", t_http_endpoints),

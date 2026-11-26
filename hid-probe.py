@@ -103,6 +103,9 @@ kernel32.DeviceIoControl.argtypes = [ctypes.c_void_p, wt.DWORD, ctypes.c_void_p,
                                      ctypes.c_void_p, wt.DWORD,
                                      ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
 kernel32.CancelIoEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+kernel32.CancelIoEx.restype = wt.BOOL
+kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+kernel32.CloseHandle.restype = wt.BOOL
 
 hid.HidD_GetAttributes.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDD_ATTRIBUTES)]
 hid.HidD_GetPreparsedData.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
@@ -132,12 +135,17 @@ def hid_interface_paths():
                                                        idx, ctypes.byref(iface)):
                 break
             idx += 1
-            buf = ctypes.create_string_buffer(2048)
             needed = wt.DWORD(0)
+            setupapi.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(iface), None, 0,
+                                                      ctypes.byref(needed), None)
+            if needed.value <= 0:
+                continue
+            size = max(needed.value, ctypes.sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + 2)
+            buf = ctypes.create_string_buffer(size)
             struct = ctypes.cast(buf, ctypes.POINTER(SP_DEVICE_INTERFACE_DETAIL_DATA_W))
             struct.contents.cbSize = ctypes.sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)
             ok = setupapi.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(iface), buf,
-                                                          2048, ctypes.byref(needed), None)
+                                                          size, ctypes.byref(needed), None)
             if not ok:
                 continue
             off = SP_DEVICE_INTERFACE_DETAIL_DATA_W.DevicePath.offset
@@ -156,8 +164,12 @@ def wide_string(path, fn):
 
 def open_hid(path, write=False):
     """HID collections reject IOCTLs on a zero-access handle, so try widening."""
-    attempts = [GENERIC_READ | (GENERIC_WRITE if write else 0),
-                GENERIC_READ, GENERIC_READ | GENERIC_WRITE, 0]
+    base = [GENERIC_READ | (GENERIC_WRITE if write else 0), GENERIC_READ,
+            GENERIC_READ | GENERIC_WRITE, 0]
+    attempts = []
+    for a in base:
+        if a not in attempts:
+            attempts.append(a)
     for access in attempts:
         h = kernel32.CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                  None, OPEN_EXISTING, 0, None)
@@ -427,18 +439,26 @@ def _hook_proc(n_code, w_param, l_param):
 # -------------------------------------------------------------------- listen
 
 class Reader(threading.Thread):
-    def __init__(self, index, path, length, sink, handles, lock):
+    """Reads one HID collection. Owns its handle: it opens and closes it itself so
+    the main thread can never close a handle that is still blocked in ReadFile."""
+
+    def __init__(self, index, path, length, sink):
         threading.Thread.__init__(self)
         self.daemon = True
         self.index = index
         self.path = path
         self.length = max(length, 64)
         self.sink = sink
-        self.handles = handles
-        self.lock = lock
-        self.stop_flag = False
-        self.error = None
+        self.stop_event = threading.Event()
         self.handle = None
+        self.error = None
+        self.reads = 0
+
+    def stop(self):
+        self.stop_event.set()
+        h = self.handle
+        if h:
+            kernel32.CancelIoEx(h, None)
 
     def run(self):
         h = kernel32.CreateFileW(self.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -447,19 +467,33 @@ class Reader(threading.Thread):
             self.error = "CreateFile failed err=%d" % ctypes.get_last_error()
             return
         self.handle = h
-        with self.lock:
-            self.handles.append(h)
         buf = (ctypes.c_ubyte * self.length)()
         nread = wt.DWORD(0)
-        while not self.stop_flag:
-            if not kernel32.ReadFile(h, buf, self.length, ctypes.byref(nread), None):
-                err = ctypes.get_last_error()
-                if err in (995, 1167, 6):
-                    return
-                time.sleep(0.02)
-                continue
-            t = time.perf_counter()
-            self.sink.append((t, self.index, bytes(buf[:nread.value])))
+        consecutive = 0
+        try:
+            while not self.stop_event.is_set():
+                if not kernel32.ReadFile(h, buf, self.length, ctypes.byref(nread), None):
+                    err = ctypes.get_last_error()
+                    if err in (995, 6):
+                        return                      # cancelled / invalid handle
+                    if err in (1167, 109):
+                        self.error = "device gone err=%d" % err
+                        return
+                    consecutive += 1
+                    if consecutive >= 50:           # ~1 s of failures: give up
+                        self.error = "read kept failing err=%d" % err
+                        return
+                    time.sleep(0.02)
+                    continue
+                consecutive = 0
+                n = nread.value
+                if n <= 0 or n > self.length:
+                    continue
+                self.reads += 1
+                self.sink.append((time.perf_counter(), self.index, bytes(buf[:n])))
+        finally:
+            self.handle = None
+            kernel32.CloseHandle(h)
 
 
 def cmd_listen(args):
@@ -497,13 +531,11 @@ def cmd_listen(args):
     print("\nreading collections: %s" % chosen)
 
     events = []
-    handles = []
-    lock = threading.Lock()
     readers = []
     for i in chosen:
         info = infos[i]
         length = info.get("in_len") or 64
-        r = Reader(i, info["path"], length, events, handles, lock)
+        r = Reader(i, info["path"], length, events)
         readers.append(r)
         r.start()
 
@@ -524,19 +556,20 @@ def cmd_listen(args):
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
             time.sleep(0.001)
-            for r in readers:
-                if r.error and r.is_alive() is False:
-                    pass
+            if readers and not any(r.is_alive() for r in readers):
+                print("all readers stopped: %s"
+                      % "; ".join(r.error for r in readers if r.error))
+                break
     except KeyboardInterrupt:
         pass
     finally:
-        for h in handles:
-            kernel32.CancelIoEx(h, None)
         for r in readers:
-            r.stop_flag = True
-            r.join(0.5)
-        for h in handles:
-            kernel32.CloseHandle(h)
+            r.stop()                     # cancel the blocked ReadFile, keep the handle alive
+        for r in readers:
+            r.join(2.0)                  # the reader closes its own handle in its finally
+        still = [r.index for r in readers if r.is_alive()]
+        if still:
+            print("warning: readers %s did not stop in time" % still)
         if hook:
             user32.UnhookWindowsHookEx(hook)
 

@@ -219,6 +219,7 @@ def render_frame(idx, fps, size, slots, series):
 # ------------------------------------------------------------------ workers
 
 def _init(cfg):
+    _W.clear()
     _W.update(cfg)
 
 
@@ -238,15 +239,32 @@ def _render_segment(job):
     start, end, path = job
     size, fps = _W["size"], _W["fps"]
     proc = subprocess.Popen(_segment_cmd(path, size, fps), stdin=subprocess.PIPE)
+    written = 0
+    error = None
     try:
         for i in range(start, end):
             img = render_frame(i, fps, size, _W["slots"], _W["series"])
             proc.stdin.write(img.tobytes())
-        proc.stdin.close()
+            written += 1
     except BrokenPipeError:
-        pass
+        error = "ffmpeg closed the pipe"
+    except Exception as exc:                     # noqa: BLE001 - worker must report, not crash
+        error = "%r" % (exc,)
+    finally:
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        except Exception:
+            pass
+        if error is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
     rc = proc.wait()
-    return rc, end - start, path
+    if rc != 0:
+        error = error or "ffmpeg exit %d" % rc
+    return (0 if error is None else -1), written, path, error
 
 
 def _render_range(rng):
@@ -276,8 +294,16 @@ def encode_segments(out_dir, movie, fps, n, jobs):
                "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
                "-alpha_bits", "16", "-vendor", "apl0", seg]
         procs.append(subprocess.Popen(cmd))
-    for proc in procs:
-        proc.wait()
+    failed = []
+    for proc, seg in zip(procs, segs):
+        rc = proc.wait()
+        if rc != 0:
+            failed.append((seg, rc))
+    if failed:
+        for seg, rc in failed:
+            print("encode segment failed: %s (exit %d)" % (os.path.basename(seg), rc))
+        shutil.rmtree(seg_dir, ignore_errors=True)
+        return 4
     lst = os.path.join(seg_dir, "list.txt")
     with open(lst, "w", encoding="utf-8") as f:
         for seg in segs:
@@ -385,13 +411,21 @@ def main():
             for k, i in enumerate(range(0, n, chunk)):
                 last = min(n, i + chunk)
                 jobs_list.append((i, last, os.path.join(seg_dir, "seg_%02d.mov" % k)))
+            failures = []
             with mp.Pool(jobs, initializer=_init, initargs=(cfg,)) as pool:
                 done = 0
-                for rc, got, path in pool.imap_unordered(_render_segment, jobs_list):
+                for rc, got, path, err in pool.imap_unordered(_render_segment, jobs_list):
                     done += got
+                    if rc != 0:
+                        failures.append((path, err))
                     sys.stdout.write("\r  %d/%d frames encoded" % (done, n))
                     sys.stdout.flush()
             print()
+            if failures:
+                for path, err in failures:
+                    print("segment failed: %s (%s)" % (os.path.basename(path), err))
+                shutil.rmtree(seg_dir, ignore_errors=True)
+                return 4
             elapsed = time.perf_counter() - t0
             print("rendered+encoded in %.1fs (%.0f fps)" % (elapsed, n / max(0.001, elapsed)))
             movie = out_dir + ".mov"
@@ -427,9 +461,12 @@ def main():
         if args.mp4:
             import time as _t
             t_mp4 = _t.perf_counter()
-            encode_nvenc(out_dir, args.mp4, args.fps, jobs)
-            print("preview -> %s (%.1fs, NVENC h264, no alpha)"
-                  % (args.mp4, _t.perf_counter() - t_mp4))
+            rc = encode_nvenc(out_dir, args.mp4, args.fps, jobs)
+            if rc != 0:
+                print("preview failed (ffmpeg exit %d)" % rc)
+            else:
+                print("preview -> %s (%.1fs, NVENC h264, no alpha)"
+                      % (args.mp4, _t.perf_counter() - t_mp4))
         print("PNG sequence: %s" % out_dir)
         print("Premiere: import frame_00000.png, tick 'Image Sequence', %d fps" % args.fps)
         print("(sequence is ~4x faster than ProRes and keeps alpha)")
@@ -447,8 +484,11 @@ def main():
         import time as _t
         t_mp4 = _t.perf_counter()
         rc = encode_nvenc(out_dir, args.mp4, args.fps, jobs)
-        print("preview -> %s (%.1fs, NVENC h264, no alpha)"
-              % (args.mp4, _t.perf_counter() - t_mp4))
+        if rc != 0:
+            print("preview failed (ffmpeg exit %d)" % rc)
+        else:
+            print("preview -> %s (%.1fs, NVENC h264, no alpha)"
+                  % (args.mp4, _t.perf_counter() - t_mp4))
     if not args.keep_frames:
         shutil.rmtree(out_dir, ignore_errors=True)
     print("video -> %s (ProRes 4444 with alpha)" % movie)

@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.6"
+VERSION = "1.7"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -55,6 +55,9 @@ kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, wt.DWORD, wt.DWORD, ctypes.c_
 kernel32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.DWORD,
                               ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
 kernel32.CancelIoEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+kernel32.CancelIoEx.restype = wt.BOOL
+kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+kernel32.CloseHandle.restype = wt.BOOL
 user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 
@@ -316,6 +319,11 @@ class Engine(object):
             self.mapping = {}
             for st in self.keys.values():
                 st["vk"] = None
+                st["mm"] = 0.0
+            # the old physical state must not leak into the new mapping
+            self.vk_held.clear()
+            self.press_state.clear()
+            self.pending_bind = False
         self._save_mapping()
 
     def bind_by_press(self):
@@ -571,7 +579,10 @@ class Engine(object):
                                 self.on_depth(now, i, 0.0)
                     self._key_transition(vk, down, now)
                 except Exception:
-                    pass
+                    now_s = time.time()
+                    if now_s - getattr(self, "_last_key_err", 0) > 1.0:
+                        self._last_key_err = now_s
+                        _log_exc("run_keys vk=%d" % vk)
             # global hotkeys: work even when the game has focus (no window switching)
             ctrl = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
             alt = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
