@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -256,9 +256,11 @@ class Engine(object):
         self._mark = 0               # absolute sample counter for SSE cursors
         self.t0 = time.time()
         self.started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        self.map_path = os.path.join(
-            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-            "depth-monitor", "mapping.json")
+        data_home = os.environ.get("DEPTH_MONITOR_HOME")
+        if not data_home:
+            data_home = os.path.join(
+                os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "depth-monitor")
+        self.map_path = os.path.join(data_home, "mapping.json")
         self.mapping = {}
         self.pending_bind = False
         self.pending_label = None
@@ -279,7 +281,7 @@ class Engine(object):
     def _map_paths(self):
         paths = [self.map_path]
         appdata = os.environ.get("APPDATA")
-        if appdata:
+        if appdata and not os.environ.get("DEPTH_MONITOR_HOME"):
             paths.append(os.path.join(appdata, "depth-monitor", "mapping.json"))
         return paths
 
