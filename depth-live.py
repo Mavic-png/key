@@ -36,7 +36,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.9.7"
+VERSION = "1.9.8"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -461,6 +461,8 @@ class Engine(object):
         self.pending_learn = None
         self.bump_mapping()
         self._save_mapping()
+        # the press that triggered this binding is still down: keep it valid
+        self.refresh_key_state(vk, True, now)
         return True
 
     def key_known(self, vk):
@@ -658,19 +660,23 @@ class Engine(object):
         except Exception:
             _log_exc("request_quit save")
             return False
-        self.stop_io.set()                     # ask the HID reader to leave its loop
+        return self.shutdown_app(srv, defer)
+
+    def shutdown_app(self, srv, defer=False):
+        """Stop the HID reader, then the HTTP server -- same path for every exit."""
+        self.stop_io.set()
         h = getattr(self, "io_handle", None)
         if h:
             try:
-                kernel32.CancelIoEx(h, None)   # unblock a pending ReadFile
+                kernel32.CancelIoEx(h, None)
             except Exception:
                 pass
-        if srv is not None:
-            if defer:
-                # the response is already flushed by the handler at this point
-                threading.Timer(0.25, self._shutdown_srv, args=(srv,)).start()
-            else:
-                self._shutdown_srv(srv)
+        if srv is None:
+            return True
+        if defer:
+            threading.Timer(0.25, self._shutdown_srv, args=(srv,)).start()
+        else:
+            self._shutdown_srv(srv)
         return True
 
     def _shutdown_srv(self, srv):
@@ -696,10 +702,7 @@ class Engine(object):
                 self.last_client = time.time()
                 continue
             if time.time() - self.last_client > seconds:
-                try:
-                    srv.shutdown()
-                except Exception:
-                    pass
+                self.shutdown_app(srv)          # same ordered path as /quit
                 return
 
     def run_autosave(self, interval):
@@ -826,7 +829,7 @@ class Engine(object):
                 else:
                     self.bind_msg = "没抓到按键，请再按一次"
                 self.pending_label = None
-                return
+                return bumped
             known = [i for i, st0 in self.keys.items() if st0["vk"] == vk]
             if known:
                 idx = known[0]
@@ -1031,6 +1034,15 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        host = (self.headers.get("Host") or "").strip().lower()
+        host = host.rsplit(":", 1)[0] if host else ""
+        if host not in ("127.0.0.1", "localhost", "[::1]", ""):
+            body = b"bad host"
+            self.send_response(403)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         ENGINE.last_client = time.time()
         url = urlparse(self.path)
         if url.path == "/":
@@ -1732,6 +1744,20 @@ def main():
         pass
 
     guard = single_instance()
+    if guard is None:
+        # without the guard two instances would overwrite mapping.json
+        print("single-instance guard unavailable; refusing to start")
+        if not args.no_browser:
+            try:
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    "无法创建单实例互斥量。\n"
+                    "为了避免多个实例互相覆盖键位映射，程序不会启动。\n"
+                    "请重启系统后再试。",
+                    "启动失败", 0x30)
+            except Exception:
+                pass
+        return
     if guard is False:
         print("another monitor is already running")
         # only bother with a modal box when a page was going to be opened;

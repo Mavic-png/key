@@ -495,6 +495,80 @@ def t_sse_keeps_idle_alive():
         srv.shutdown()
 
 
+def t_manual_bind_refreshes_state():
+    """The press that performs a manual bind must stay valid afterwards."""
+    e = dl.Engine()
+    e.keys[31] = {"vk": None, "mm": 2.5, "t_last": 1.0, "count": 0, "speeds": []}
+    e.samples.append((1.0, 31, 2.5))
+    e.pending_label = "A"
+    e.mark_key(0x41, True, 1.0)             # what apply_key_state does first
+    bumped = e._key_transition(0x41, True, 1.0)
+    assert bumped is True, "manual bind must report that it bumped the mapping"
+    if e.key_known(0x41):
+        e.refresh_key_state(0x41, True, 1.0)
+    assert e.os_key_down(0x41), "the binding press must not be treated as stale"
+
+
+def t_deferred_bind_refreshes_state():
+    """bind_index() bumps the mapping too, so it must refresh its own key."""
+    e = dl.Engine()
+    e.keys[31] = {"vk": None, "mm": 0.0, "t_last": 0.0, "count": 0, "speeds": []}
+    e.pending_learn = (0x53, 2.0)
+    e.on_depth(1.0, 31, 0.9)                # report arrives -> deferred bind
+    assert e.mapping.get(31) == 0x53
+    assert e.os_key_down(0x53), "deferred binding must leave the key held"
+
+
+def t_idle_exit_uses_full_shutdown():
+    """The idle timer must run the same ordered shutdown as /quit."""
+    import threading, time
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    dl.ENGINE.last_client = time.time() - 10
+    dl.ENGINE.run_idle_exit(1, srv)
+    assert dl.ENGINE.stop_io.is_set(), "idle exit must stop the HID reader"
+    try:
+        srv.fileno()
+        raise AssertionError("server should be closed")
+    except Exception:
+        pass
+
+
+def t_quit_http_409_when_save_fails():
+    """A real /quit request must return 409 and keep the server alive."""
+    dl.ENGINE = make_engine()
+    dl.ENGINE.recording = True
+    dl.ENGINE.rec.append((0.0, 31, 1.0))
+    dl.ENGINE.save_recording = lambda: None
+    srv, port = start_server()
+    try:
+        code = None
+        try:
+            fetch(port, "/quit?t=" + dl.ENGINE.token)
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        assert code == 409, "expected 409 on save failure, got %r" % (code,)
+        fetch(port, "/snapshot")            # still serving
+        assert not dl.ENGINE.stop_io.is_set(), "must not stop I/O when save failed"
+    finally:
+        srv.shutdown()
+
+
+def t_rejects_foreign_host():
+    """DNS-rebinding style requests with a foreign Host must be refused."""
+    import http.client
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/snapshot", headers={"Host": "evil.example.com"})
+        resp = conn.getresponse()
+        assert resp.status == 403, resp.status
+        conn.close()
+    finally:
+        srv.shutdown()
+
+
 def t_single_instance_guard():
     """Second instance on the same config dir must exit; another dir must start."""
     import subprocess, tempfile, time
@@ -599,6 +673,11 @@ def main():
         ("quit requires token", t_quit_requires_token),
         ("quit blocked when save fails", t_quit_blocked_when_save_fails),
         ("sse keeps idle alive", t_sse_keeps_idle_alive),
+        ("manual bind refreshes state", t_manual_bind_refreshes_state),
+        ("deferred bind refreshes state", t_deferred_bind_refreshes_state),
+        ("idle exit runs full shutdown", t_idle_exit_uses_full_shutdown),
+        ("quit 409 over real http", t_quit_http_409_when_save_fails),
+        ("foreign host rejected", t_rejects_foreign_host),
         ("single instance guard", t_single_instance_guard),
         ("frames loader (wide csv)", t_frames_from_wide),
     ]:
