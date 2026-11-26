@@ -17,6 +17,7 @@ import ctypes
 import io
 import json
 import os
+import secrets
 import socket
 import threading
 import time
@@ -34,7 +35,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.9.4"
+VERSION = "1.9.5"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -268,6 +269,7 @@ class Engine(object):
         self.notice = ""
         self.last_hotkey = None
         self.last_client = time.time()
+        self.token = secrets.token_hex(8)
         self.hold_n = 0
         self.auto = False
         self.vk_held = {}            # vk -> True while the OS reports it down
@@ -640,16 +642,24 @@ class Engine(object):
                     pass
 
     def request_quit(self, srv):
+        """Save first; if the recording cannot be written, stay alive."""
         try:
             if self.recording:
-                self.stop_recording(save=True)
+                path = self.stop_recording(save=True)
+                with self.lock:
+                    pending = len(self.rec)
+                if pending and not path:
+                    self.notice = "\u4fdd\u5b58\u5931\u8d25\uff0c\u672a\u9000\u51fa"
+                    return False
         except Exception:
-            pass
+            _log_exc("request_quit save")
+            return False
         try:
             if srv is not None:
                 srv.shutdown()
         except Exception:
             pass
+        return True
 
     def run_idle_exit(self, seconds, srv):
         """Nobody has looked at the page for a while and nothing is recording:
@@ -867,6 +877,7 @@ class Engine(object):
                 "mapping_gen": self.mapping_gen,
                 "auto": self.auto,
                 "version": VERSION,
+                "token": self.token,
                 "binding": self.pending_label,
                 "bind_msg": self.bind_msg,
                 "recording": self.recording,
@@ -1105,13 +1116,23 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif url.path == "/quit":
-            body = b"bye"
-            self.send_response(200)
+            q = parse_qs(url.query)
+            token = (q.get("t") or [""])[0]
+            if token != ENGINE.token:
+                # a random web page must not be able to stop the monitor
+                body = b"forbidden"
+                self.send_response(403)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            ok = ENGINE.request_quit(srv_ref[0])
+            body = b"bye" if ok else "\u4fdd\u5b58\u5931\u8d25\uff0c\u672a\u9000\u51fa".encode("utf-8")
+            self.send_response(200 if ok else 409)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-            threading.Timer(0.5, ENGINE.request_quit, args=(srv_ref[0],)).start()
         elif url.path == "/openfolder":
             try:
                 folder = os.path.join(os.path.expanduser("~"), "Documents",
@@ -1172,6 +1193,7 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 snap = ENGINE.snapshot(cursor)
                 cursor = snap["n"]
+                ENGINE.last_client = time.time()   # the page is still watching
                 self.wfile.write(("data: " + json.dumps(snap, separators=(",", ":")) +
                                   "\n\n").encode("utf-8"))
                 self.wfile.flush()
@@ -1450,7 +1472,8 @@ let lastMsg = Date.now();
 let staleHeld = false;
 function quitApp() {
   if (!confirm('退出磁轴深度监测？录制中的数据会先自动存盘。')) return;
-  fetch('/quit').then(() => {
+  fetch('/quit?t=' + encodeURIComponent(window.__token || '')).then(r => {
+    if (r.status === 409) { alert('保存失败，程序没有退出'); return; }
     document.body.innerHTML = '<div style="color:#8b93a7;font:16px system-ui;padding:40px">' +
       '已退出，可以关闭这个标签页了。</div>';
   });
@@ -1515,6 +1538,7 @@ es.onmessage = ev => {
     window.__lastNotice = m.notice;
     bigTip(m.notice, 3500);
   }
+  if (m.token) window.__token = m.token;
   if (m.version) {
     const small = document.querySelector('h1 small');
     if (small) small.textContent = '\u78c1\u8f74\u6df1\u5ea6\u5b9e\u65f6\u76d1\u6d4b v' + m.version;

@@ -102,7 +102,7 @@ and Premiere imports it as an image sequence with alpha intact.
 python test_pipeline.py
 ```
 
-Twenty-one headless checks, including the ones static reviews asked for:
+Twenty-six headless checks, including the ones static reviews asked for:
 
 * firmware switch-zero vs. real release (both orders)
 * hold re-emission when the mapping table is empty
@@ -118,6 +118,9 @@ Twenty-one headless checks, including the ones static reviews asked for:
 * ffmpeg refusing to start leaves no output file and no segment directory
 * a missed key-up edge is repaired by the watchdog instead of leaving the key
   highlighted forever
+* `/quit` rejects requests without the per-process token (a random web page
+  cannot stop the monitor)
+* a failed save keeps the process alive instead of dropping the recording
 
 ## Licence
 

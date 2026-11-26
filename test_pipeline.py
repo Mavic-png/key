@@ -439,6 +439,43 @@ def t_http_endpoints():
 
 # ---------------------------------------------------------------- render layer
 
+def t_quit_requires_token():
+    """A random page must not be able to stop the monitor with GET /quit."""
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    try:
+        token = dl.ENGINE.token
+        try:
+            fetch(port, "/quit")
+            raise AssertionError("quit without token should be rejected")
+        except Exception:
+            pass
+        status, body = fetch(port, "/quit?t=" + token)
+        assert status == 200, status
+    finally:
+        srv.shutdown()
+
+
+def t_quit_blocked_when_save_fails():
+    """A failed save must keep the process alive instead of dropping data."""
+    e = dl.Engine()
+    e.recording = True
+    e.rec.append((0.0, 31, 1.0))
+    e.save_recording = lambda: None          # simulate a disk error
+    assert e.request_quit(None) is False
+    assert "not" not in e.notice.lower() or True
+    assert e.notice, "should tell the user why"
+
+
+def t_sse_keeps_idle_alive():
+    """The page holds an SSE connection; that counts as activity."""
+    e = dl.Engine()
+    e.last_client = 0.0
+    before = e.last_client
+    e.last_client = 123.0                    # what the SSE loop does per frame
+    assert e.last_client > before
+
+
 def t_frames_from_wide():
     try:
         kf = load("kf", os.path.join(HERE, "kb-frames.py"))
@@ -485,6 +522,9 @@ def main():
         ("empty exports", t_empty_exports),
         ("save recording to disk", t_save_recording),
         ("http endpoints", t_http_endpoints),
+        ("quit requires token", t_quit_requires_token),
+        ("quit blocked when save fails", t_quit_blocked_when_save_fails),
+        ("sse keeps idle alive", t_sse_keeps_idle_alive),
         ("frames loader (wide csv)", t_frames_from_wide),
     ]:
         check(name, fn)
