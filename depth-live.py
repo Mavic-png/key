@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1220,6 +1220,9 @@ PAGE = r"""<!DOCTYPE html>
            padding:8px 16px; border-radius:999px; font-size:13px; display:none;
            z-index:9; }
   .k.binding { border-color:#fbbf24 !important; box-shadow:0 0 0 2px #fbbf2488, inset 0 1px 0 #303c50; }
+  #staleTip { display:none; position:fixed; left:50%; top:14px; transform:translateX(-50%);
+              background:#2a1113f2; border:1px solid #7f1d1d; color:#fecaca;
+              padding:10px 16px; border-radius:10px; font-size:13px; z-index:30; }
   #hint { position:fixed; right:20px; bottom:12px; font-size:11px; color:#3c4a5d; }
 </style></head>
 <body>
@@ -1276,6 +1279,7 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 <div id="bigtip"></div>
 <div id="toast"></div>
+<div id="staleTip">数据流已断开（服务端没在推快照），按住状态已重置 —— 刷新页面或检查程序是否还在运行</div>
 <div id="hint">Ctrl+Alt+R 开始/停止录制 · Ctrl+Alt+S 保存到「文档\depth-recordings」 · 数据约 100 帧/秒</div>
 
 <script>
@@ -1354,7 +1358,10 @@ function showTip(text, ms) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { t.style.display = 'none'; }, ms || 2600);
 }
+const EMPTY_SET = new Set();
 let held = new Set();
+let lastMsg = Date.now();
+let staleHeld = false;
 function toggleAuto() {
   fetch('/auto?on=' + (autoMode ? '0' : '1')).then(() => showTip(autoMode ? '已关闭自动录制' : '自动录制已开启：每 2 分钟存一段'));
 }
@@ -1394,6 +1401,7 @@ function bindNow() {
 }
 const es = new EventSource('/events');
 es.onmessage = ev => {
+  lastMsg = Date.now();
   const m = JSON.parse(ev.data);
   if (m.s) for (const p of m.s) live[p[1]] = p[2];
   if (m.k) {
@@ -1493,6 +1501,13 @@ function renderPanel() {
 
 function draw() {
   if (!kbOn) { drawing = false; return; } // idle: no work, but resumable
+  const stale = Date.now() - lastMsg > 2000;
+  if (stale !== staleHeld) {
+    staleHeld = stale;
+    const tipEl = document.getElementById('staleTip');
+    if (tipEl) tipEl.style.display = stale ? 'block' : 'none';
+  }
+  const heldNow = stale ? EMPTY_SET : held;
 
   for (const name in els) {
     const idx = nameIdx[name];
@@ -1500,7 +1515,7 @@ function draw() {
     const r = Math.max(0, Math.min(1, mm / FULL));
     const prev = lastRatio[name];
     if (prev !== undefined && Math.abs(prev - r) < 0.004 &&
-        !held.has(name) && binding !== name) {
+        !heldNow.has(name) && binding !== name) {
       continue;                          // nothing visibly changed
     }
     lastRatio[name] = r;
@@ -1508,7 +1523,7 @@ function draw() {
     el.fill.style.height = (r * 100) + '%';
     el.fill.style.background = color(r);
     el.box.classList.toggle('hot', r > 0.05);
-    el.box.classList.toggle('held', held.has(name) && r < 0.06);
+    el.box.classList.toggle('held', heldNow.has(name) && r < 0.06);
     el.box.classList.toggle('binding', binding === name);
     el.box.style.boxShadow = r > 0.02
       ? '0 0 ' + (5 + r * 24).toFixed(0) + 'px ' + color(r) + ', inset 0 1px 0 #303c50'
