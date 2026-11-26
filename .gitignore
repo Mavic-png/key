@@ -6,14 +6,16 @@ dist/
 build/
 vendor/
 
-# generated media / captures
+# generated media / captures (keep the docs preview and the sample data)
 *.mp4
 *.mov
 *.mkv
 *.wav
 *.png
+!docs/preview.png
 *.jpg
 *.csv
+!sample/sample-wide.csv
 
 # editor
 .vscode/
