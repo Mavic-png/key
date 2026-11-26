@@ -1,0 +1,22 @@
+﻿__pycache__/
+*.pyc
+*.spec
+.build/
+dist/
+build/
+vendor/
+
+# generated media / captures
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.png
+*.jpg
+*.csv
+
+# editor
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
