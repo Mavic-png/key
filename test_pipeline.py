@@ -40,6 +40,9 @@ def load(name, path):
     return mod
 
 
+# tests must never read or write the real mapping file
+os.environ["DEPTH_MONITOR_HOME"] = tempfile.mkdtemp(prefix="dl-test-")
+
 dl = load("dl", os.path.join(HERE, "depth-live.py"))
 
 
