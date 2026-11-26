@@ -455,17 +455,22 @@ class Reader(threading.Thread):
         self.error = None
         self.reads = 0
 
-    def stop(self):
-        """Safe before the thread opened its handle: the reader re-checks the
-        event right after the handle becomes visible."""
+    def stop(self, wait=1.0):
+        """CancelIoEx only cancels I/O that is already pending, and the reader may
+        not have issued its ReadFile yet, so keep cancelling until it stops."""
         self.stop_event.set()
-        with self.lock:
-            h = self.handle
-        if h:
-            try:
-                kernel32.CancelIoEx(h, None)
-            except Exception:
-                pass
+        deadline = time.time() + wait
+        while True:
+            with self.lock:
+                h = self.handle
+            if h:
+                try:
+                    kernel32.CancelIoEx(h, None)
+                except Exception:
+                    pass
+            if not self.is_alive() or time.time() >= deadline:
+                return not self.is_alive()
+            time.sleep(0.01)
 
     def run(self):
         h = kernel32.CreateFileW(self.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,

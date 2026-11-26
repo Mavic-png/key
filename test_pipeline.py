@@ -271,6 +271,52 @@ def t_render_alpha_and_multiprocess_match():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_refresh_blocked_after_reset():
+    """A late refresh must not resurrect a key the reset has just forgotten."""
+    e = dl.Engine()
+    e.keys[31] = {"vk": 0x41, "mm": 2.0, "count": 0, "speeds": []}
+    e.mapping[31] = 0x41
+    assert e.key_known(0x41)
+    e.mark_key(0x41, True, 1.0)
+    e.bump_mapping()
+    e.reset_mapping()
+    assert not e.key_known(0x41), "reset must drop the mapping"
+    assert not e.os_key_down(0x41)
+
+
+def t_save_mapping_failure_keeps_memory():
+    """When the file cannot be written the in-memory table must stay usable."""
+    e = dl.Engine()
+    e.mapping[31] = 0x41
+    e.keys[31] = {"vk": 0x41, "mm": 0.0, "count": 0, "speeds": []}
+    e._map_paths = lambda: [os.path.join("Z:\\definitely\\not\\here", "map.json")]
+    saved = e._save_mapping()
+    assert saved is False, saved
+    assert e.mapping == {31: 0x41}
+    assert e.keys[31]["vk"] == 0x41
+
+
+def t_ffmpeg_start_failure():
+    """encode_segments must clean up and return 5 when ffmpeg cannot start."""
+    import shutil, tempfile
+    kf = load("kf", os.path.join(os.path.dirname(os.path.abspath(__file__)), "kb-frames.py"))
+    tmp = tempfile.mkdtemp()
+    frames = os.path.join(tmp, "frames")
+    os.makedirs(frames)
+    with open(os.path.join(frames, "frame_00000.png"), "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+    old_ff = kf.FFMPEG
+    kf.FFMPEG = os.path.join(tmp, "no-such-ffmpeg.exe")
+    try:
+        rc = kf.encode_segments(frames, os.path.join(tmp, "out.mov"), 30, 1, 2)
+    finally:
+        kf.FFMPEG = old_ff
+    assert rc == 5, rc
+    assert not os.path.exists(os.path.join(tmp, "out.mov"))
+    assert not os.path.exists(frames + "-seg")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def t_long_export():
     e = make_engine()
     e.recording = True
@@ -395,6 +441,9 @@ def main():
         ("stale state after mapping change", t_stale_state_after_mapping_change),
         ("suppressed counter", t_suppressed_counter),
         ("reset mapping clears state", t_reset_mapping_clears_state),
+        ("late refresh blocked after reset", t_refresh_blocked_after_reset),
+        ("save mapping failure keeps memory", t_save_mapping_failure_keeps_memory),
+        ("ffmpeg start failure cleans up", t_ffmpeg_start_failure),
         ("render alpha + multiprocess match", t_render_alpha_and_multiprocess_match),
         ("empty exports", t_empty_exports),
         ("save recording to disk", t_save_recording),

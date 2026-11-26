@@ -97,7 +97,7 @@ and Premiere imports it as an image sequence with alpha intact.
 python test_pipeline.py
 ```
 
-Seventeen headless checks, including the ones static reviews asked for:
+Twenty headless checks, including the ones static reviews asked for:
 
 * firmware switch-zero vs. real release (both orders)
 * hold re-emission when the mapping table is empty
@@ -108,6 +108,9 @@ Seventeen headless checks, including the ones static reviews asked for:
   release (mapping generation stamp)
 * the press that teaches a new key keeps its own held state, while re-stamping
   one key does not resurrect the others
+* a late refresh cannot resurrect a key that a reset already forgot
+* a failing mapping save keeps the in-memory table usable
+* ffmpeg refusing to start leaves no output file and no segment directory
 
 ## Licence
 

@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -418,6 +418,10 @@ class Engine(object):
             return True
         return st.get("gen") == self.mapping_gen
 
+    def key_known(self, vk):
+        """True when the current table still maps this vk to some index."""
+        return any(st.get("vk") == vk for st in self.keys.values())
+
     def refresh_key_state(self, vk, down, ts):
         """Re-stamp one key after a mapping change it caused itself.
 
@@ -629,19 +633,20 @@ class Engine(object):
                 prev[vk] = down
                 try:
                     with self.lock:
-                        gen_before = self.mapping_gen
                         self.mark_key(vk, down, now)
                         if not down:
                             released = [i for i, st in self.keys.items()
                                         if st.get("vk") == vk]
                             for i in released:
                                 self.on_depth(now, i, 0.0)
-                    self._key_transition(vk, down, now)
-                    if self.mapping_gen != gen_before:
-                        # this very press taught/bound the key: keep its state,
-                        # but under the new generation
-                        with self.lock:
-                            self.refresh_key_state(vk, down, now)
+                        # hold the lock across the transition so a mapping reset
+                        # from another thread cannot slip in between
+                        bumped = self._key_transition(vk, down, now)
+                        if bumped:
+                            # this very press taught/bound the key: keep its
+                            # state, but only if the table still knows the vk
+                            if self.key_known(vk):
+                                self.refresh_key_state(vk, down, now)
                 except Exception:
                     now_s = time.time()
                     if now_s - getattr(self, "_last_key_err", 0) > 1.0:
@@ -680,6 +685,8 @@ class Engine(object):
             time.sleep(0.004)
 
     def _key_transition(self, vk, down, now):
+        """Returns True when this call changed the index<->vk table."""
+        bumped = False
         with self.lock:
             # a key we already know: attribute the event to it directly
             if down and self.pending_label:
@@ -692,6 +699,7 @@ class Engine(object):
                     self.keys[idx]["vk"] = target
                     self.mapping[idx] = target
                     self.bump_mapping()
+                    bumped = True
                     for other, st0 in self.keys.items():
                         if other != idx and st0["vk"] == target:
                             st0["vk"] = None
@@ -724,11 +732,13 @@ class Engine(object):
                 self.pending_bind = False
                 self.mapping[idx] = vk
                 self.bump_mapping()
+                bumped = True
                 self._save_mapping()
             ps = self.press_state.get(idx)
             if ps is not None and ps["down"] is None:
                 ps["down"] = self._depth_near(idx, now)
                 ps["vk"] = vk
+        return bumped
 
     def _depth_near(self, idx, t, window=0.03):
         best = None
