@@ -35,7 +35,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.9.5"
+VERSION = "1.9.6"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -641,7 +641,7 @@ class Engine(object):
                 except Exception:
                     pass
 
-    def request_quit(self, srv):
+    def request_quit(self, srv, defer=False):
         """Save first; if the recording cannot be written, stay alive."""
         try:
             if self.recording:
@@ -654,12 +654,19 @@ class Engine(object):
         except Exception:
             _log_exc("request_quit save")
             return False
+        if srv is not None:
+            if defer:
+                # let the HTTP response reach the page before the server stops
+                threading.Timer(0.4, self._shutdown_srv, args=(srv,)).start()
+            else:
+                self._shutdown_srv(srv)
+        return True
+
+    def _shutdown_srv(self, srv):
         try:
-            if srv is not None:
-                srv.shutdown()
+            srv.shutdown()
         except Exception:
             pass
-        return True
 
     def run_idle_exit(self, seconds, srv):
         """Nobody has looked at the page for a while and nothing is recording:
@@ -1126,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            ok = ENGINE.request_quit(srv_ref[0])
+            ok = ENGINE.request_quit(srv_ref[0], defer=True)
             body = b"bye" if ok else "\u4fdd\u5b58\u5931\u8d25\uff0c\u672a\u9000\u51fa".encode("utf-8")
             self.send_response(200 if ok else 409)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
