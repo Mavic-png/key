@@ -284,16 +284,33 @@ def encode_segments(out_dir, movie, fps, n, jobs):
     shutil.rmtree(seg_dir, ignore_errors=True)
     os.makedirs(seg_dir)
     procs, segs = [], []
-    for k, start in enumerate(range(0, n, per)):
-        end = min(n, start + per)
-        seg = os.path.join(seg_dir, "seg_%02d.mov" % k)
-        segs.append(seg)
-        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-               "-framerate", str(fps), "-start_number", str(start), "-i", pattern,
-               "-frames:v", str(end - start),
-               "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
-               "-alpha_bits", "16", "-vendor", "apl0", seg]
-        procs.append(subprocess.Popen(cmd))
+    try:
+        for k, start in enumerate(range(0, n, per)):
+            end = min(n, start + per)
+            seg = os.path.join(seg_dir, "seg_%02d.mov" % k)
+            segs.append(seg)
+            cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                   "-framerate", str(fps), "-start_number", str(start), "-i", pattern,
+                   "-frames:v", str(end - start),
+                   "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
+                   "-alpha_bits", "16", "-vendor", "apl0", seg]
+            procs.append(subprocess.Popen(cmd))
+    except Exception as exc:
+        # ffmpeg missing or refusing to start mid-way: reap what we already started
+        print("failed to start encoder segment: %r" % (exc,))
+        for proc in procs:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        for proc in procs:
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        shutil.rmtree(seg_dir, ignore_errors=True)
+        return 5
     failed = []
     for proc, seg in zip(procs, segs):
         rc = proc.wait()

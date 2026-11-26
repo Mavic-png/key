@@ -34,7 +34,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.8"
+VERSION = "1.8.1"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -131,11 +131,16 @@ def interface_paths():
                                                        idx, ctypes.byref(iface)):
                 break
             idx += 1
-            buf = ctypes.create_string_buffer(2048)
             need = wt.DWORD(0)
+            setupapi.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(iface), None, 0,
+                                                     ctypes.byref(need), None)
+            if need.value <= 0:
+                continue
+            size = max(need.value, ctypes.sizeof(SP_DETAIL) + 2)
+            buf = ctypes.create_string_buffer(size)
             st = ctypes.cast(buf, ctypes.POINTER(SP_DETAIL))
             st.contents.cbSize = ctypes.sizeof(SP_DETAIL)
-            if setupapi.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(iface), buf, 2048,
+            if setupapi.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(iface), buf, size,
                                                         ctypes.byref(need), None):
                 off = SP_DETAIL.DevicePath.offset
                 out.append(ctypes.wstring_at(ctypes.addressof(buf) + off))
@@ -368,22 +373,33 @@ class Engine(object):
             length = max(info.get("in_len") or 21, 21)
             buf = (ctypes.c_ubyte * length)()
             nread = wt.DWORD(0)
-            while True:
-                if not kernel32.ReadFile(h, buf, length, ctypes.byref(nread), None):
-                    break
-                t = time.perf_counter()
-                ev = decode(bytes(buf[:nread.value]))
-                if ev is None:
-                    continue
-                if ev[0] == "depth":
-                    self.on_depth(t, ev[1], ev[2])
-                else:
-                    self.n_event += 1
-            self.connected = False
             try:
-                kernel32.CloseHandle(h)
+                while True:
+                    if not kernel32.ReadFile(h, buf, length, ctypes.byref(nread), None):
+                        break
+                    t = time.perf_counter()
+                    n = nread.value
+                    if n <= 0 or n > length:
+                        continue
+                    ev = decode(bytes(buf[:n]))
+                    if ev is None:
+                        continue
+                    if ev[0] == "depth":
+                        self.on_depth(t, ev[1], ev[2])
+                    else:
+                        self.n_event += 1
             except Exception:
-                pass
+                _log_exc("run_reader loop")
+            finally:
+                self.connected = False
+                try:
+                    kernel32.CancelIoEx(h, None)
+                except Exception:
+                    pass
+                try:
+                    kernel32.CloseHandle(h)
+                except Exception:
+                    pass
             time.sleep(0.6)
 
     def bump_mapping(self):
@@ -401,6 +417,20 @@ class Engine(object):
         if st is None:
             return True
         return st.get("gen") == self.mapping_gen
+
+    def refresh_key_state(self, vk, down, ts):
+        """Re-stamp one key after a mapping change it caused itself.
+
+        Only the key that triggered the change is refreshed: re-validating every
+        key would resurrect state that belongs to the old mapping, which is
+        exactly what the generation stamp exists to prevent.
+        """
+        if vk in self.key_state or down:
+            self.key_state[vk] = {"gen": self.mapping_gen, "ts": ts}
+            if down:
+                self.vk_held[vk] = True
+            else:
+                self.vk_held.pop(vk, None)
 
     def mark_key(self, vk, down, ts):
         self.key_state[vk] = {"gen": self.mapping_gen, "ts": ts}
@@ -599,6 +629,7 @@ class Engine(object):
                 prev[vk] = down
                 try:
                     with self.lock:
+                        gen_before = self.mapping_gen
                         self.mark_key(vk, down, now)
                         if not down:
                             released = [i for i, st in self.keys.items()
@@ -606,6 +637,11 @@ class Engine(object):
                             for i in released:
                                 self.on_depth(now, i, 0.0)
                     self._key_transition(vk, down, now)
+                    if self.mapping_gen != gen_before:
+                        # this very press taught/bound the key: keep its state,
+                        # but under the new generation
+                        with self.lock:
+                            self.refresh_key_state(vk, down, now)
                 except Exception:
                     now_s = time.time()
                     if now_s - getattr(self, "_last_key_err", 0) > 1.0:
@@ -659,7 +695,6 @@ class Engine(object):
                     for other, st0 in self.keys.items():
                         if other != idx and st0["vk"] == target:
                             st0["vk"] = None
-                    self._save_mapping()
                     saved = self._save_mapping()
                     self.bind_msg = ("已绑定 %s（已存盘）" if saved else "已绑定 %s（存盘失败）") % label
                 else:

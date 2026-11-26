@@ -450,15 +450,22 @@ class Reader(threading.Thread):
         self.length = max(length, 64)
         self.sink = sink
         self.stop_event = threading.Event()
+        self.lock = threading.Lock()
         self.handle = None
         self.error = None
         self.reads = 0
 
     def stop(self):
+        """Safe before the thread opened its handle: the reader re-checks the
+        event right after the handle becomes visible."""
         self.stop_event.set()
-        h = self.handle
+        with self.lock:
+            h = self.handle
         if h:
-            kernel32.CancelIoEx(h, None)
+            try:
+                kernel32.CancelIoEx(h, None)
+            except Exception:
+                pass
 
     def run(self):
         h = kernel32.CreateFileW(self.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -466,7 +473,16 @@ class Reader(threading.Thread):
         if h == INVALID_HANDLE_VALUE:
             self.error = "CreateFile failed err=%d" % ctypes.get_last_error()
             return
-        self.handle = h
+        with self.lock:
+            self.handle = h
+        if self.stop_event.is_set():          # stop() won the race: abort now
+            with self.lock:
+                self.handle = None
+            try:
+                kernel32.CloseHandle(h)
+            except Exception:
+                pass
+            return
         buf = (ctypes.c_ubyte * self.length)()
         nread = wt.DWORD(0)
         consecutive = 0
@@ -492,8 +508,15 @@ class Reader(threading.Thread):
                 self.reads += 1
                 self.sink.append((time.perf_counter(), self.index, bytes(buf[:n])))
         finally:
-            self.handle = None
-            kernel32.CloseHandle(h)
+            with self.lock:
+                self.handle = None
+            try:
+                kernel32.CloseHandle(h)
+            except Exception:
+                pass
+
+
+_capture_incomplete = False
 
 
 def cmd_listen(args):
@@ -569,9 +592,16 @@ def cmd_listen(args):
             r.join(2.0)                  # the reader closes its own handle in its finally
         still = [r.index for r in readers if r.is_alive()]
         if still:
-            print("warning: readers %s did not stop in time" % still)
+            print("warning: readers %s did not stop in time -- output skipped,"
+                  " the capture would be incomplete" % still)
+            global _capture_incomplete
+            _capture_incomplete = True
         if hook:
             user32.UnhookWindowsHookEx(hook)
+
+    if globals().get("_capture_incomplete"):
+        print("capture incomplete: csv/analysis skipped (readers still running)")
+        return 3
 
     for r in readers:
         if r.error:

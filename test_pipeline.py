@@ -156,6 +156,33 @@ def t_physical_release_zeroes():
     assert e.keys[31]["mm"] == 0.0, e.keys[31]["mm"]
 
 
+def t_learning_key_keeps_state():
+    """The press that triggers learning must not invalidate its own state."""
+    e = dl.Engine()
+    e.keys[31] = {"vk": None, "mm": 2.5, "count": 0, "speeds": []}
+    e.mark_key(0x41, True, 1.0)
+    # _key_transition learnt the key -> generation bumped
+    e.mapping[31] = 0x41
+    e.keys[31]["vk"] = 0x41
+    e.bump_mapping()
+    e.refresh_key_state(0x41, True, 1.0)      # the fix under test
+    e.on_depth(1.05, 31, 0.0)                 # firmware switch-zero
+    assert e.keys[31]["mm"] == 2.5, "learning press lost its held state"
+
+
+def t_refresh_does_not_resurrect_others():
+    """Re-stamping one key must not re-validate state from the old mapping."""
+    e = dl.Engine()
+    for idx, vk in ((31, 0x41), (33, 0x44)):
+        e.keys[idx] = {"vk": vk, "mm": 1.0, "count": 0, "speeds": []}
+    e.mark_key(0x41, True, 1.0)
+    e.mark_key(0x44, True, 1.0)
+    e.bump_mapping()
+    e.refresh_key_state(0x41, True, 1.0)
+    assert e.os_key_down(0x41)
+    assert not e.os_key_down(0x44), "old-generation key must stay invalid"
+
+
 def t_stale_state_after_mapping_change():
     """A physical state captured under an older mapping must not suppress a zero."""
     e = dl.Engine()
@@ -363,6 +390,8 @@ def main():
         ("hold writer without mapping", t_hold_without_mapping),
         ("firmware zero while held", t_firmware_zero_while_held),
         ("physical release zeroes", t_physical_release_zeroes),
+        ("learning key keeps its state", t_learning_key_keeps_state),
+        ("refresh does not resurrect others", t_refresh_does_not_resurrect_others),
         ("stale state after mapping change", t_stale_state_after_mapping_change),
         ("suppressed counter", t_suppressed_counter),
         ("reset mapping clears state", t_reset_mapping_clears_state),
