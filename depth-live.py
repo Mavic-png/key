@@ -14,6 +14,7 @@ one process, one browser tab, smooth 60 fps rendering.
 import argparse
 import collections
 import ctypes
+import hashlib
 import io
 import json
 import os
@@ -35,7 +36,7 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs
 
 FULL = 3.50
-VERSION = "1.9.6"
+VERSION = "1.9.7"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -269,6 +270,7 @@ class Engine(object):
         self.notice = ""
         self.last_hotkey = None
         self.last_client = time.time()
+        self.stop_io = threading.Event()
         self.token = secrets.token_hex(8)
         self.hold_n = 0
         self.auto = False
@@ -377,11 +379,12 @@ class Engine(object):
                 time.sleep(1.0)
                 continue
             self.connected = True
+            self.io_handle = h
             length = max(info.get("in_len") or 21, 21)
             buf = (ctypes.c_ubyte * length)()
             nread = wt.DWORD(0)
             try:
-                while True:
+                while not self.stop_io.is_set():
                     if not kernel32.ReadFile(h, buf, length, ctypes.byref(nread), None):
                         break
                     t = time.perf_counter()
@@ -399,6 +402,7 @@ class Engine(object):
                 _log_exc("run_reader loop")
             finally:
                 self.connected = False
+                self.opened = False
                 try:
                     kernel32.CancelIoEx(h, None)
                 except Exception:
@@ -654,10 +658,17 @@ class Engine(object):
         except Exception:
             _log_exc("request_quit save")
             return False
+        self.stop_io.set()                     # ask the HID reader to leave its loop
+        h = getattr(self, "io_handle", None)
+        if h:
+            try:
+                kernel32.CancelIoEx(h, None)   # unblock a pending ReadFile
+            except Exception:
+                pass
         if srv is not None:
             if defer:
-                # let the HTTP response reach the page before the server stops
-                threading.Timer(0.4, self._shutdown_srv, args=(srv,)).start()
+                # the response is already flushed by the handler at this point
+                threading.Timer(0.25, self._shutdown_srv, args=(srv,)).start()
             else:
                 self._shutdown_srv(srv)
         return True
@@ -665,6 +676,10 @@ class Engine(object):
     def _shutdown_srv(self, srv):
         try:
             srv.shutdown()
+        except Exception:
+            pass
+        try:
+            srv.server_close()                 # close the listening socket too
         except Exception:
             pass
 
@@ -1132,6 +1147,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                self.wfile.flush()
                 return
             ok = ENGINE.request_quit(srv_ref[0], defer=True)
             body = b"bye" if ok else "\u4fdd\u5b58\u5931\u8d25\uff0c\u672a\u9000\u51fa".encode("utf-8")
@@ -1691,7 +1707,9 @@ def single_instance():
         if ctypes.get_last_error() == 183:      # ERROR_ALREADY_EXISTS
             return False
         return h
-    except Exception:
+    except Exception as exc:
+        print("warning: single-instance guard unavailable: %r" % (exc,))
+        _log_exc("single_instance")
         return None
 
 

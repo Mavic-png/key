@@ -102,7 +102,7 @@ and Premiere imports it as an image sequence with alpha intact.
 python test_pipeline.py
 ```
 
-Twenty-six headless checks, including the ones static reviews asked for:
+Twenty-seven headless checks, including the ones static reviews asked for:
 
 * firmware switch-zero vs. real release (both orders)
 * hold re-emission when the mapping table is empty
@@ -121,6 +121,8 @@ Twenty-six headless checks, including the ones static reviews asked for:
 * `/quit` rejects requests without the per-process token (a random web page
   cannot stop the monitor)
 * a failed save keeps the process alive instead of dropping the recording
+* the single-instance guard really blocks a second process on the same config
+  dir (real processes, not a mock)
 
 ## Licence
 

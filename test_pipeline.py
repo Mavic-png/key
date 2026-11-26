@@ -441,15 +441,18 @@ def t_http_endpoints():
 
 def t_quit_requires_token():
     """A random page must not be able to stop the monitor with GET /quit."""
+    import urllib.error
     dl.ENGINE = make_engine()
     srv, port = start_server()
     try:
         token = dl.ENGINE.token
+        code = None
         try:
             fetch(port, "/quit")
-            raise AssertionError("quit without token should be rejected")
-        except Exception:
-            pass
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        assert code == 403, "expected 403 without token, got %r" % (code,)
+        assert srv.fileno() >= 0, "server must still be up after a rejected quit"
         status, body = fetch(port, "/quit?t=" + token)
         assert status == 200, status
     finally:
@@ -463,17 +466,88 @@ def t_quit_blocked_when_save_fails():
     e.rec.append((0.0, 31, 1.0))
     e.save_recording = lambda: None          # simulate a disk error
     assert e.request_quit(None) is False
-    assert "not" not in e.notice.lower() or True
-    assert e.notice, "should tell the user why"
+    assert "\u5931\u8d25" in e.notice, e.notice     # "failed"
+    assert not e.stop_io.is_set(), "must not stop the HID reader"
 
 
 def t_sse_keeps_idle_alive():
-    """The page holds an SSE connection; that counts as activity."""
-    e = dl.Engine()
-    e.last_client = 0.0
-    before = e.last_client
-    e.last_client = 123.0                    # what the SSE loop does per frame
-    assert e.last_client > before
+    """An open /events stream must keep the server alive past the idle timeout."""
+    import threading, time, urllib.request
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    idle = threading.Thread(target=dl.ENGINE.run_idle_exit, args=(2, srv), daemon=True)
+    idle.start()
+    resp = urllib.request.urlopen("http://127.0.0.1:%d/events" % port, timeout=10)
+    try:
+        got = 0
+        deadline = time.time() + 6
+        while got < 4 and time.time() < deadline:
+            if resp.readline().startswith(b"data:"):
+                got += 1
+        assert got >= 3, "expected SSE frames, got %d" % got
+        time.sleep(3.2)                      # longer than the idle timeout
+        stamp = dl.ENGINE.last_client
+        assert time.time() - stamp < 1.5, "last_client not refreshed by SSE"
+        # the server must still answer while the stream is open
+        fetch(port, "/snapshot")
+    finally:
+        resp.close()
+        srv.shutdown()
+
+
+def t_single_instance_guard():
+    """Second instance on the same config dir must exit; another dir must start."""
+    import subprocess, tempfile, time
+
+    def up(port):
+        import urllib.request
+        try:
+            urllib.request.urlopen("http://127.0.0.1:%d/snapshot" % port, timeout=1).read()
+            return True
+        except Exception:
+            return False
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "depth-live.py")
+    home1, home2 = tempfile.mkdtemp(), tempfile.mkdtemp()
+
+    def launch(home, port):
+        env = dict(os.environ, DEPTH_MONITOR_HOME=home)
+        return subprocess.Popen([sys.executable, script, "--no-browser",
+                                 "--port", str(port), "--idle-exit", "0"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+
+    p1 = launch(home1, 8899)
+    p3 = None
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not up(8899):
+            time.sleep(0.2)
+        assert up(8899), "first instance did not come up"
+
+        p2 = launch(home1, 8898)
+        try:
+            out, err = p2.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            p2.kill()
+            raise AssertionError("second instance kept running: the guard is dead")
+        assert p2.returncode == 0, (p2.returncode, out, err)
+        assert "another monitor is already running" in (out or ""), out
+
+        p3 = launch(home2, 8897)
+        deadline = time.time() + 20
+        while time.time() < deadline and not up(8897):
+            time.sleep(0.2)
+        assert up(8897), "a different config dir must be allowed to run"
+    finally:
+        for proc in (p1, p3):
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(5)
+                except Exception:
+                    proc.kill()
 
 
 def t_frames_from_wide():
@@ -525,6 +599,7 @@ def main():
         ("quit requires token", t_quit_requires_token),
         ("quit blocked when save fails", t_quit_blocked_when_save_fails),
         ("sse keeps idle alive", t_sse_keeps_idle_alive),
+        ("single instance guard", t_single_instance_guard),
         ("frames loader (wide csv)", t_frames_from_wide),
     ]:
         check(name, fn)
