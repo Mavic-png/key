@@ -103,7 +103,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.13.0"
+VERSION = "1.13.1"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1815,6 +1815,7 @@ PAGE = r"""<!DOCTYPE html>
     <option value="100">100 Hz</option><option value="50">50 Hz</option><option value="25">25 Hz</option>
   </select>
   <button onclick="downloadIfRecorded('/export/wide?rate=' + document.getElementById('rate').value)">导出宽表</button>
+  <button onclick="window.open('/wb','_blank')" style="border-color:#1f6f4a;color:#7ee2b8">素材选段</button>
   <button id="quitBtn" onclick="quitApp()">退出程序</button>
   <button onclick="api('/openfolder')">打开记录文件夹</button>
   <button onclick="api('/reset').then(()=>location.reload())">清空重录</button>
