@@ -395,6 +395,7 @@ class Engine(object):
         self._abs = 0                # absolute sample counter (monotonic)
         self.recording = False
         self.rec = []                # (t, index, mm) only while recording
+        self.rec_mouse = []          # (t, dx, dy, btn_mask, wheel) only while recording
         self.rec_t0 = None
         self.keys = {}               # index -> {"vk":..,"mm":..}
         self.recent = collections.deque(maxlen=12)
@@ -869,15 +870,27 @@ class Engine(object):
                 self.last_press = press
                 self.recent.appendleft(press)
 
-    def on_mouse(self, dx, dy, btns=None, wheel=0):
+    def _mouse_btn_mask_locked(self):
+        b = self.mouse_btns
+        return ((1 if b["l"] else 0) | (2 if b["r"] else 0) |
+                (4 if b["m"] else 0) | (8 if b["x1"] else 0) | (16 if b["x2"] else 0))
+
+    def on_mouse(self, dx, dy, btns=None, wheel=0, t=None):
         with self.lock:
+            changed = False
             if btns:
-                self.mouse_btns.update(btns)
+                for k, v in btns.items():
+                    if self.mouse_btns.get(k) != bool(v):
+                        changed = True
+                    self.mouse_btns[k] = bool(v)
             if dx or dy or wheel:
                 self.mouse_events.append((int(dx), int(dy), int(wheel)))
                 if len(self.mouse_events) > 4000:
                     del self.mouse_events[:1000]
                 self._mouse_abs += 1
+            if self.recording and (dx or dy or wheel or changed):
+                ts = time.perf_counter() if t is None else float(t)
+                self.rec_mouse.append((ts, int(dx), int(dy), self._mouse_btn_mask_locked(), int(wheel)))
 
     def run_mouse(self):
         """Passive read-only Windows Raw Input mouse listener (works in locked-cursor FPS games)."""
@@ -983,6 +996,7 @@ class Engine(object):
     def start_recording(self):
         with self.lock:
             self.rec = []
+            self.rec_mouse = []
             self.rec_t0 = None
             self.recording = True
             self.notice = "\u5f55\u5236\u4e2d"
@@ -995,10 +1009,35 @@ class Engine(object):
             return self.save_recording()
         return None
 
+    def mouse_lines(self, t0=None):
+        """Yield synchronized mouse CSV aligned to the same perf_counter t0 as long/wide CSV."""
+        with self.lock:
+            rows = list(self.rec_mouse)
+            if t0 is None and self.rec:
+                t0 = self.rec[0][0]
+            span = self.mouse_span
+        yield "# tool=depth-live  mouse_span=%d  btn_mask=1:L,2:R,4:M,8:X1,16:X2\n" % span
+        yield "t_s,dx,dy,btn,wheel\n"
+        if not rows:
+            return
+        if t0 is None:
+            t0 = rows[0][0]
+        batch = []
+        for t, dx, dy, mask, w in rows:
+            rel = max(0.0, t - t0)
+            batch.append("%.6f,%d,%d,%d,%d\n" % (rel, dx, dy, mask, w))
+            if len(batch) >= 500:
+                yield "".join(batch)
+                batch = []
+        if batch:
+            yield "".join(batch)
+
     def save_recording(self):
         """Write the current recording to Documents\\depth-recordings and report the path."""
         with self.lock:
             n = len(self.rec)
+            t0 = self.rec[0][0] if self.rec else None
+            has_mouse = len(self.rec_mouse) > 0
         if not n:
             with self.lock:
                 self.notice = "\u6ca1\u6709\u5f55\u5236\u6570\u636e"
@@ -1008,13 +1047,16 @@ class Engine(object):
         version_dir = os.path.join(base, stamp)
         long_path = os.path.join(version_dir, "long.csv")
         wide_path = os.path.join(version_dir, "wide.csv")
+        mouse_path = os.path.join(version_dir, "mouse.csv")
         try:
             if not os.path.isdir(version_dir):
                 os.makedirs(version_dir)
             # both files are written inside one fresh directory; the manifest
             # below is the only thing that makes the pair "committed"
-            for path, chunks in ((long_path, self.long_lines()),
-                                 (wide_path, self.wide_lines())):
+            pairs = [(long_path, self.long_lines()), (wide_path, self.wide_lines())]
+            if has_mouse:
+                pairs.append((mouse_path, self.mouse_lines(t0)))
+            for path, chunks in pairs:
                 with io.open(path, "w", encoding="utf-8", newline="") as f:
                     for chunk in chunks:
                         f.write(chunk)
@@ -1034,6 +1076,8 @@ class Engine(object):
                 "samples": n,
                 "long": os.path.relpath(long_path, base).replace("\\", "/"),
                 "wide": os.path.relpath(wide_path, base).replace("\\", "/"),
+                "mouse": (os.path.relpath(mouse_path, base).replace("\\", "/")
+                          if has_mouse and os.path.isfile(mouse_path) else ""),
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "integrity": integrity,
             }
@@ -1147,6 +1191,7 @@ class Engine(object):
                 self.save_recording()
                 with self.lock:
                     self.rec = []
+                    self.rec_mouse = []
                     self.rec_t0 = None
 
     # ---- workbench -------------------------------------------------
@@ -1215,11 +1260,13 @@ class Engine(object):
                     continue
                 try:
                     keys, dur, samples = self._read_wide_meta(wide)
+                    mouse_p = os.path.join(base, name, "mouse.csv")
                     items.append({
                         "stamp": name,
                         "duration": round(dur, 3),
                         "samples": samples,
                         "keys": keys,
+                        "has_mouse": os.path.isfile(mouse_p),
                         "is_latest": name == latest_stamp,
                     })
                 except Exception:
@@ -1269,11 +1316,83 @@ class Engine(object):
         except Exception as exc:
             return {"ok": False, "error": "\u8bfb\u53d6\u5f55\u5236\u5931\u8d25\uff1a%s" % exc,
                     "base": base}
+        mouse_p = os.path.join(os.path.dirname(wide), "mouse.csv")
         return {"ok": True, "base": base, "stamp": manifest.get("stamp"),
                 "created": manifest.get("created"), "duration": round(dur, 3),
                 "samples": samples, "keys": keys,
+                "has_mouse": os.path.isfile(mouse_p),
                 "wide": manifest.get("wide"), "long": manifest.get("long"),
                 "integrity": manifest.get("integrity")}
+
+    def _load_wb_mouse(self, wide_path, times):
+        """Integrate mouse.csv onto `times` with smart lift-off recenter for scrub-safe replay."""
+        mouse_p = os.path.join(os.path.dirname(wide_path), "mouse.csv")
+        if not os.path.isfile(mouse_p) or not times:
+            return None
+        import math, re
+        span = self.mouse_span
+        evts = []
+        try:
+            with io.open(mouse_p, encoding="utf-8") as f:
+                header_seen = False
+                for line in f:
+                    if line.startswith("#"):
+                        m = re.search(r"mouse_span\s*=\s*(\d+)", line)
+                        if m:
+                            v = int(m.group(1))
+                            if 500 <= v <= 200000:
+                                span = v
+                        continue
+                    if not header_seen:
+                        header_seen = True
+                        continue
+                    parts = line.strip().split(",")
+                    if len(parts) < 5:
+                        continue
+                    evts.append((float(parts[0]), int(parts[1]), int(parts[2]),
+                                 int(parts[3]), int(parts[4])))
+        except Exception:
+            return None
+        if not evts:
+            return None
+        xs, ys, bs, ws, spds = [], [], [], [], []
+        tx = ty = 0.0
+        btn = 0
+        last_move = -9.0
+        prev_t = times[0]
+        idx = 0
+        n_ev = len(evts)
+        step_x = 2.0 / max(500.0, float(span))
+        aspect = (306.0 - 44.0) / (254.0 - 84.0)
+        for t in times:
+            dt = max(0.0, min(0.2, t - prev_t))
+            prev_t = t
+            sum_dx = sum_dy = w_acc = 0
+            while idx < n_ev and evts[idx][0] <= t:
+                et, dx, dy, bmask, wh = evts[idx]
+                sum_dx += dx
+                sum_dy += dy
+                btn = bmask
+                if wh:
+                    w_acc = wh
+                if dx or dy:
+                    last_move = et
+                idx += 1
+            if sum_dx or sum_dy:
+                tx = max(-1.0, min(1.0, tx + sum_dx * step_x))
+                ty = max(-1.0, min(1.0, ty + sum_dy * step_x * aspect))
+            elif t - last_move > 0.20 and dt > 0:
+                dist = min(1.4, math.hypot(tx, ty))
+                k = math.exp(-dt * (1.6 + dist * 4.2))
+                tx *= k
+                ty *= k
+            spd = min(1.0, math.hypot(sum_dx, sum_dy) / max(1.0, span * max(0.015, dt) * 1.4))
+            xs.append(round(tx, 3))
+            ys.append(round(ty, 3))
+            bs.append(btn)
+            ws.append(w_acc)
+            spds.append(round(spd, 2))
+        return {"span": span, "x": xs, "y": ys, "b": bs, "w": ws, "spd": spds}
 
     def wb_series(self, step=0.02, limit=1600, stamp=None):
         manifest, _, _, wide = self._resolve_wide(stamp)
@@ -1298,11 +1417,14 @@ class Engine(object):
             return {"ok": False, "error": "empty recording"}
         stride = max(1, int(len(rows) / limit))
         rows = rows[::stride]
+        ts = [round(r[0], 3) for r in rows]
+        mouse = self._load_wb_mouse(wide, ts)
         return {"ok": True, "stamp": manifest.get("stamp"), "keys": keys, "duration": rows[-1][0],
                 "step": round(rows[1][0] - rows[0][0], 4) if len(rows) > 1 else step,
-                "t": [round(r[0], 3) for r in rows],
+                "t": ts,
                 "v": {keys[i]: [round(r[1 + i], 2) for r in rows]
-                      for i in range(len(keys))}}
+                      for i in range(len(keys))},
+                "mouse": mouse}
 
     def export_status(self):
         with self.lock:
@@ -1952,12 +2074,14 @@ class Handler(BaseHTTPRequestHandler):
             with ENGINE.lock:
                 if url.path == "/rec/start":
                     ENGINE.rec = []
+                    ENGINE.rec_mouse = []
                     ENGINE.rec_t0 = None
                     ENGINE.recording = True
                 elif url.path == "/rec/stop":
                     ENGINE.recording = False
                 else:
                     ENGINE.rec = []
+                    ENGINE.rec_mouse = []
                     ENGINE.rec_t0 = None
             if url.path == "/rec/stop":
                 ENGINE.save_recording()
@@ -2118,6 +2242,7 @@ class Handler(BaseHTTPRequestHandler):
             with ENGINE.lock:
                 ENGINE.samples = []
                 ENGINE.rec = []
+                ENGINE.rec_mouse = []
                 ENGINE.rec_t0 = None
                 ENGINE.recent.clear()
                 ENGINE.presses = 0
@@ -4194,8 +4319,40 @@ def workbench_html():
   button.play { background:rgba(56,189,248,.16); border-color:rgba(56,189,248,.45); color:#bae6fd; min-width:96px; }
   button.play.on { background:rgba(244,63,94,.22); border-color:rgba(244,63,94,.55); color:#fecdd3; }
 
-  #prevStage { display:flex; align-items:center; justify-content:center; min-height:140px; padding:10px 4px; overflow:hidden; }
-  #kbPrev { position:relative; }
+  #prevStage { display:flex; align-items:center; justify-content:center; gap:24px; flex-wrap:wrap;
+               min-height:170px; padding:10px 4px; overflow:hidden; }
+  #kbPrev { position:relative; flex-shrink:0; }
+  #wbPadWrap { position:relative; flex-shrink:0; display:flex; flex-direction:column; align-items:center; gap:4px; }
+  #wbPadWrap.off { display:none; }
+  #wbPad { position:relative; width:220px; height:182px; border-radius:11px;
+           background:rgba(14,16,20,.72); border:1px solid rgba(255,255,255,.14);
+           backdrop-filter:blur(8px); overflow:hidden; user-select:none; }
+  #wbPad::before { content:""; position:absolute; inset:0; pointer-events:none;
+                   background:linear-gradient(to right,transparent calc(50% - 0.5px),rgba(255,255,255,.06) 50%,transparent calc(50% + 0.5px)),
+                              linear-gradient(to bottom,transparent calc(50% - 0.5px),rgba(255,255,255,.06) 50%,transparent calc(50% + 0.5px)); }
+  .wb-c { position:absolute; width:8px; height:8px; pointer-events:none; border-color:rgba(255,255,255,.22); border-style:solid; }
+  .wb-tl { top:5px; left:5px; border-width:1.5px 0 0 1.5px; border-radius:2px 0 0 0; }
+  .wb-tr { top:5px; right:5px; border-width:1.5px 1.5px 0 0; border-radius:0 2px 0 0; }
+  .wb-bl { bottom:5px; left:5px; border-width:0 0 1.5px 1.5px; border-radius:0 0 0 2px; }
+  .wb-br { bottom:5px; right:5px; border-width:0 1.5px 1.5px 0; border-radius:0 0 2px 0; }
+  #wbTrail { position:absolute; inset:0; width:100%; height:100%; display:block; pointer-events:none; }
+  #wbMouse { position:absolute; left:0; top:0; width:32px; height:60px; pointer-events:none;
+             will-change:transform; filter:drop-shadow(0 3px 7px rgba(0,0,0,.55)); }
+  #wbMouse svg { width:100%; height:100%; display:block; overflow:visible; }
+  .wm-shell { fill:url(#wbViperGrad); stroke:rgba(255,255,255,.5); stroke-width:18; stroke-linejoin:round; }
+  .wm-seam { fill:none; stroke:rgba(255,255,255,.22); stroke-width:12; stroke-linecap:round; }
+  .wm-btn { fill:rgba(255,255,255,.03); }
+  .wm-btn.on { fill:var(--acc); fill-opacity:.82; }
+  .wm-wheel { fill:rgba(255,255,255,.16); stroke:rgba(255,255,255,.48); stroke-width:12; }
+  .wm-wheel.on { fill:var(--acc); stroke:#fff; }
+  .wm-side { fill:rgba(255,255,255,.16); stroke:rgba(255,255,255,.42); stroke-width:10; }
+  .wm-side.on { fill:var(--acc); stroke:#fff; }
+  .wm-led { fill:var(--acc); opacity:.45; }
+  .wm-led.hot { opacity:1; }
+  #wbMouseEmpty { position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+                  text-align:center; padding:12px; font-size:11px; color:var(--dim);
+                  background:rgba(12,14,19,.72); backdrop-filter:blur(4px); }
+  #wbMouseEmpty.on { display:flex; }
   .k { position:absolute; border-radius:calc(var(--u) * 0.125); overflow:hidden;
        background:rgba(14,16,20,.68); border:1px solid rgba(255,255,255,.13);
        backdrop-filter:blur(8px); user-select:none; transition:transform .04s linear; }
@@ -4212,9 +4369,10 @@ def workbench_html():
   #hoverRead { font-size:12px; color:#cbd5e1; min-height:18px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   #hoverRead .hk { background:rgba(56,189,248,.12); border:1px solid rgba(56,189,248,.3); color:#bae6fd;
                    padding:1px 6px; border-radius:5px; font-size:11px; }
+  #hoverRead .hk.m { background:rgba(244,63,94,.16); border-color:rgba(244,63,94,.42); color:#fecdd3; }
   #tracks { position:relative; margin-top:8px; }
-  canvas { width:100%; height:264px; display:block; background:#0b0e13; border:1px solid rgba(255,255,255,.07);
-           border-radius:8px; cursor:crosshair; }
+  #cv { width:100%; height:264px; display:block; background:#0b0e13; border:1px solid rgba(255,255,255,.07);
+        border-radius:8px; cursor:crosshair; }
   #hint { color:var(--dim); font-size:11px; margin-top:6px; display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; }
   .key-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
   .kchip { display:inline-flex; align-items:center; gap:5px; padding:3px 8px; border-radius:6px; font-size:12px;
@@ -4235,6 +4393,7 @@ def workbench_html():
   .hist-meta { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:12px; }
   .hist-tag { font-size:10px; padding:1px 6px; border-radius:999px; background:rgba(52,211,153,.16);
               color:#6ee7b7; border:1px solid rgba(52,211,153,.35); }
+  .hist-tag.m { background:rgba(56,189,248,.16); color:#bae6fd; border-color:rgba(56,189,248,.38); }
   .hist-keys { font-size:11px; color:var(--dim); max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   button.danger { color:#fca5a5; border-color:rgba(239,68,68,.32); background:rgba(239,68,68,.10); padding:3px 8px; font-size:11px; }
   button.danger:hover { background:rgba(239,68,68,.22); }
@@ -4270,6 +4429,7 @@ def workbench_html():
         <div id="hoverRead" class="num"><span style="color:var(--dim)">移动鼠标到时间轴查看实时按键深度</span></div>
       </div>
       <div class="row">
+        <label id="showMouseChip" class="kchip on" style="margin:0"><input id="showMouse" type="checkbox" checked onchange="toggleWbMouse()">同步鼠标</label>
         <span class="sub">布局</span>
         <select id="layout" onchange="buildPreviewKb()">
           <option value="hud">HUD 键簇</option>
@@ -4289,7 +4449,42 @@ def workbench_html():
         <input id="wbFull" class="num" type="number" min="1.0" max="5.0" step="0.05" value="3.50" style="width:66px" onchange="onWbFullChange(this.value)">
       </div>
     </div>
-    <div id="prevStage"><div id="kbPrev"></div></div>
+    <div id="prevStage">
+      <div id="kbPrev"></div>
+      <div id="wbPadWrap">
+        <div id="wbPad" title="鼠标同步回放 (Zowie G-SR III · Viper V4 Pro)">
+          <div class="wb-c wb-tl"></div><div class="wb-c wb-tr"></div>
+          <div class="wb-c wb-bl"></div><div class="wb-c wb-br"></div>
+          <canvas id="wbTrail"></canvas>
+          <div id="wbMouse">
+            <svg viewBox="-22 -18 682 1307" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <linearGradient id="wbViperGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#222631" stop-opacity="0.92"/>
+                  <stop offset="55%" stop-color="#151820" stop-opacity="0.92"/>
+                  <stop offset="100%" stop-color="#0f1117" stop-opacity="0.94"/>
+                </linearGradient>
+                <path id="wbViperOutline" d="M268.5 1268c-66.5-11-128.7-41.4-173.3-85-75-73.3-104.2-175-92.9-323.1 2.1-27 3.9-69.3 4.1-93.9 1.1-144.3.9-138.4 6.9-144.4 6.6-6.6 7.8-28.3 1.8-33.3-2.9-2.4-4.2-20-5.7-74.5-1.8-63.7-1.5-72.4 2.7-80.5 3.7-7.2 4.3-13.6 3-31.7-7-91.8-8.4-276.4-2.3-293.8 4.1-11.7 17.8-24.6 26-24.6 3.9 0 5.5 2.1 5.7 7.7.2 6.1.9 5.3 2.9-4l2.6-11.7 31.4-13.2C150.6 32 258.8-4 267.3-.8c3 1.1 4 7.5 4 25.6 0 21.5.5 24 4.9 23.2 2.7-.5 5.3-3.6 5.8-6.9 1.1-7.7 7.5-9.3 37.5-9.3 28.3 0 38.7 3 38.7 11.1 0 3.2 1.9 5.7 4.2 5.7 3.4 0 4.2-4.3 4.2-22.1 0-29.4 1.6-30.6 29.6-22.7 50.3 14.1 180.7 62.4 191.2 70.8 1.9 1.5 3.5 7.1 3.5 12.3s1 9.5 2.3 9.5c1.3 0 2.2-2.8 2.1-6.3-.4-11 10.2-9.4 21.5 3.1 8.1 8.9 10.5 14.3 12.2 27.5 3.7 27.6 2 154.9-3.2 243.5-8 136.1-6.8 246.9 4.1 398.2 14.8 205.3 9.9 262.2-29.6 341.6-41.4 83.1-117.7 139.9-215.6 160.3-30.7 6.4-86.6 7.8-116.4 2.9z"/>
+                <clipPath id="wbViperClip"><use href="#wbViperOutline"/></clipPath>
+              </defs>
+              <use href="#wbViperOutline" class="wm-shell"/>
+              <g clip-path="url(#wbViperClip)">
+                <path id="wbMbL" class="wm-btn" d="M 0 0 L 312 0 L 312 486 Q 160 510, 0 462 Z"/>
+                <path id="wbMbR" class="wm-btn" d="M 326 0 L 640 0 L 640 462 Q 480 510, 326 486 Z"/>
+                <path class="wm-seam" d="M 10 462 Q 165 510, 319 488 Q 473 510, 628 462"/>
+                <line class="wm-seam" x1="319" y1="32" x2="319" y2="488"/>
+              </g>
+              <use href="#wbViperOutline" fill="none" stroke="rgba(255,255,255,0.52)" stroke-width="18" stroke-linejoin="round"/>
+              <rect id="wbMbM" class="wm-wheel" x="284" y="138" width="70" height="184" rx="35"/>
+              <rect id="wbMbX2" class="wm-side" x="-6" y="430" width="32" height="156" rx="14"/>
+              <rect id="wbMbX1" class="wm-side" x="-6" y="618" width="32" height="156" rx="14"/>
+              <circle id="wbMbLed" class="wm-led" cx="319" cy="560" r="15"/>
+            </svg>
+          </div>
+          <div id="wbMouseEmpty">该录制无鼠标数据<br>新录制将自动同步记录</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -4309,7 +4504,7 @@ def workbench_html():
     </div>
     <div id="tracks"><canvas id="cv"></canvas></div>
     <div id="hint">
-      <span>拖拽选择区间 · 滚轮缩放时间轴 · 悬停实时预览键盘深度 · 双击清除选区</span>
+      <span>拖拽选区 · 滚轮缩放 · 悬停实时同步预览键鼠 · 双击清选 · Space 播/停 · ←/→ 逐帧微调</span>
       <span id="viewSpan" class="num">0.000s — 0.000s</span>
     </div>
   </div>
@@ -4337,7 +4532,7 @@ def workbench_html():
       <span class="sub">帧率</span>
       <select id="fps"><option>30</option><option selected>60</option><option>120</option></select>
       <span class="sub">倍速</span>
-      <select id="speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
+      <select id="speed"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
       <span class="sub">格式</span>
       <select id="fmt">
         <option value="prores">ProRes 4444（透明）</option>
@@ -4374,9 +4569,10 @@ const CLUSTERS = {
 const HUD_DEFAULT_KEYS = new Set(['Q','W','E','R','A','S','D','LShift','LCtrl','LAlt','Space']);
 
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const wbTrailCv = document.getElementById('wbTrail'), wbTrailCtx = wbTrailCv ? wbTrailCv.getContext('2d') : null;
 const RULER_H = 22, CV_H = 264;
 let info = null, data = null, view = [0, 1], sel = [0, 0], dragging = false, dragFrom = 0;
-let hoverT = null, playT = 0, playing = false, playLastMs = 0;
+let hoverT = null, playT = 0, playing = false, playLastMs = 0, showMouse = true;
 let selectedKeys = new Set(), prevEls = {};
 
 function fmt(t) { return (t || 0).toFixed(3); }
@@ -4421,6 +4617,24 @@ function sampleAt(t) {
     out[norm(k)] = v;
   }
   return out;
+}
+
+function sampleMouseAt(t) {
+  if (!data || !data.ok || !data.mouse || !data.t || !data.t.length) return null;
+  const ts = data.t, m = data.mouse, n = Math.min(ts.length, (m.x || []).length);
+  if (!n) return null;
+  let lo = 0, hi = n - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ts[mid] <= t) lo = mid + 1; else hi = mid - 1;
+  }
+  const i = Math.max(0, Math.min(n - 1, hi));
+  const j = Math.min(n - 1, i + 1);
+  const dt = ts[j] - ts[i];
+  const f = (dt > 1e-6 && dt <= 0.12 && t >= ts[i]) ? Math.max(0, Math.min(1, (t - ts[i]) / dt)) : 0;
+  const x = f > 0 ? (m.x[i] + (m.x[j] - m.x[i]) * f) : m.x[i];
+  const y = f > 0 ? (m.y[i] + (m.y[j] - m.y[i]) * f) : m.y[i];
+  return { x, y, b: (m.b && m.b[i]) || 0, w: (m.w && m.w[i]) || 0, spd: (m.spd && m.spd[i]) || 0, idx: i };
 }
 
 function chooseTickStep(span, pxW) {
@@ -4475,9 +4689,12 @@ function draw() {
     ctx.stroke();
   }
 
-  // Per-key tracks
+  // Per-key tracks (+ optional bottom Mouse lane)
   const keys = data.keys, n = keys.length;
-  const rowH = (h - RULER_H - 6) / Math.max(1, n);
+  const hasMouseLane = !!(showMouse && data.mouse && data.mouse.x && data.mouse.x.length);
+  const MOUSE_H = hasMouseLane ? 34 : 0;
+  const keyAreaH = h - RULER_H - 6 - MOUSE_H;
+  const rowH = keyAreaH / Math.max(1, n);
   const trackCols = ['#38bdf8', '#34d399', '#fbbf24', '#f472b6', '#a78bfa', '#fb7185'];
   keys.forEach((k, row) => {
     const on = selectedKeys.has(k);
@@ -4500,6 +4717,49 @@ function draw() {
     ctx.lineWidth = on ? 1.35 : 0.8;
     ctx.stroke();
   });
+
+  if (hasMouseLane) {
+    const m = data.mouse, my = RULER_H + 3 + keyAreaH, mBase = h - 4, mH = Math.max(12, MOUSE_H - 12);
+    ctx.strokeStyle = 'rgba(255,255,255,0.11)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, my + 0.5); ctx.lineTo(w, my + 0.5); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.72)';
+    ctx.fillText('Mouse', 5, my + 11);
+    const spds = m.spd || [], bs = m.b || [], ws = m.w || [];
+    const nM = Math.min(data.t.length, spds.length);
+    let maxS = 1.2;
+    for (let i = 0; i < nM; i++) if (spds[i] > maxS) maxS = spds[i];
+    maxS = Math.min(maxS, 5.0);
+    ctx.beginPath();
+    let started = false, firstX = 0, lastX = 0;
+    for (let i = 0; i < nM; i++) {
+      const t = data.t[i];
+      if (t < view[0] || t > view[1]) continue;
+      const x = xOf(t);
+      const yv = mBase - Math.min(1, spds[i] / maxS) * mH;
+      if (!started) { ctx.moveTo(x, yv); firstX = x; started = true; } else ctx.lineTo(x, yv);
+      lastX = x;
+    }
+    if (started) {
+      ctx.strokeStyle = 'rgba(56,189,248,0.82)';
+      ctx.lineWidth = 1.25;
+      ctx.stroke();
+      ctx.lineTo(lastX, mBase); ctx.lineTo(firstX, mBase); ctx.closePath();
+      ctx.fillStyle = 'rgba(56,189,248,0.14)';
+      ctx.fill();
+    }
+    for (let i = 0; i < nM; i++) {
+      const t = data.t[i];
+      if (t < view[0] || t > view[1]) continue;
+      const b = bs[i] || 0, wh = ws[i] || 0;
+      if (!b && !wh) continue;
+      const x0m = xOf(t), x1m = i + 1 < nM ? xOf(data.t[i + 1]) : x0m + 2;
+      const bw = Math.max(2, x1m - x0m);
+      if (b & 1) { ctx.fillStyle = 'rgba(244,63,94,0.78)'; ctx.fillRect(x0m, my + 2, bw, 5); }
+      if (b & 2) { ctx.fillStyle = 'rgba(251,191,36,0.78)'; ctx.fillRect(x0m, my + 8, bw, 4); }
+      if ((b & 28) || wh) { ctx.fillStyle = 'rgba(52,211,153,0.78)'; ctx.fillRect(x0m, my + 13, bw, 3); }
+    }
+  }
 
   // Playhead + Hover cursor
   if (playT >= view[0] && playT <= view[1]) {
@@ -4594,7 +4854,9 @@ function buildPreviewKb() {
     if (it.x + it.w > maxX) maxX = it.x + it.w;
     if (it.r > maxR) maxR = it.r;
   }
-  const availW = Math.max(260, (stage ? stage.clientWidth : 800) - 24);
+  const stW = stage ? stage.clientWidth : 800;
+  const padReserve = (showMouse && stW > 560) ? 252 : 0;
+  const availW = Math.max(240, stW - 24 - padReserve);
   const baseU = lay === 'full' ? 38 : 50;
   const u = Math.max(24, Math.min(baseU, Math.floor(availW / (maxX + 0.2))));
   const gap = Math.max(4, Math.round(u * 0.11));
@@ -4615,6 +4877,81 @@ function buildPreviewKb() {
     prevEls[it.k] = { box: d, fill: d.children[0], mm: d.children[2] };
   }
   renderPreviewAt(activeTime());
+}
+
+function toggleWbMouse() {
+  const cb = document.getElementById('showMouse');
+  showMouse = cb ? cb.checked : true;
+  const chip = document.getElementById('showMouseChip');
+  if (chip) chip.classList.toggle('on', showMouse);
+  const wrap = document.getElementById('wbPadWrap');
+  if (wrap) wrap.classList.toggle('off', !showMouse);
+  buildPreviewKb();
+  draw();
+}
+
+function renderMousePreviewAt(t) {
+  const pad = document.getElementById('wbPad');
+  const mEl = document.getElementById('wbMouse');
+  const emptyEl = document.getElementById('wbMouseEmpty');
+  if (!pad || !mEl) return;
+  const preset = FILL_PRESETS[document.getElementById('theme').value] || FILL_PRESETS.ramp;
+  const acc = preset.style(0.78).line || '#38bdf8';
+  pad.style.setProperty('--acc', acc);
+  if (!showMouse) return;
+  const ms = sampleMouseAt(t);
+  const hasData = !!ms;
+  if (emptyEl) emptyEl.classList.toggle('on', !hasData);
+  mEl.style.display = hasData ? '' : 'none';
+  const PW = 220, PH = 182, MW = 32, MH = 60, IN = 7;
+  if (wbTrailCv && wbTrailCtx) {
+    const dpr = window.devicePixelRatio || 1;
+    if (wbTrailCv.width !== Math.round(PW * dpr) || wbTrailCv.height !== Math.round(PH * dpr)) {
+      wbTrailCv.width = Math.round(PW * dpr); wbTrailCv.height = Math.round(PH * dpr);
+    }
+    wbTrailCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    wbTrailCtx.clearRect(0, 0, PW, PH);
+  }
+  if (!hasData) return;
+  const toXY = (nx, ny) => [
+    IN + MW / 2 + (nx + 1) * 0.5 * (PW - MW - IN * 2),
+    IN + MH / 2 + (ny + 1) * 0.5 * (PH - MH - IN * 2)
+  ];
+  const [cx, cy] = toXY(ms.x, ms.y);
+  mEl.style.transform = 'translate(' + (cx - MW / 2).toFixed(1) + 'px,' + (cy - MH / 2).toFixed(1) + 'px)';
+  const b = ms.b || 0;
+  document.getElementById('wbMbL').classList.toggle('on', !!(b & 1));
+  document.getElementById('wbMbR').classList.toggle('on', !!(b & 2));
+  document.getElementById('wbMbM').classList.toggle('on', !!((b & 4) || ms.w !== 0));
+  document.getElementById('wbMbX1').classList.toggle('on', !!(b & 8));
+  document.getElementById('wbMbX2').classList.toggle('on', !!(b & 16));
+  document.getElementById('wbMbLed').classList.toggle('hot', b !== 0 || ms.spd > 0.25);
+  if (wbTrailCtx && data.t && data.mouse) {
+    const ts = data.t, mx = data.mouse.x, my = data.mouse.y, win = 0.55;
+    let k0 = ms.idx;
+    while (k0 > 0 && (t - ts[k0 - 1]) <= win) k0--;
+    let prev = null;
+    wbTrailCtx.lineCap = 'round';
+    for (let k = k0; k <= ms.idx; k++) {
+      const p = toXY(mx[k], my[k]);
+      const age = Math.max(0, t - ts[k]);
+      const a = Math.max(0, 1 - age / win);
+      if (prev) {
+        wbTrailCtx.strokeStyle = acc;
+        wbTrailCtx.globalAlpha = a * 0.65;
+        wbTrailCtx.lineWidth = 1.2 + a * 1.4;
+        wbTrailCtx.beginPath(); wbTrailCtx.moveTo(prev[0], prev[1]); wbTrailCtx.lineTo(p[0], p[1]); wbTrailCtx.stroke();
+      }
+      prev = p;
+    }
+    if (prev) {
+      wbTrailCtx.strokeStyle = acc;
+      wbTrailCtx.globalAlpha = 0.72;
+      wbTrailCtx.lineWidth = 2.4;
+      wbTrailCtx.beginPath(); wbTrailCtx.moveTo(prev[0], prev[1]); wbTrailCtx.lineTo(cx, cy); wbTrailCtx.stroke();
+    }
+    wbTrailCtx.globalAlpha = 1;
+  }
 }
 
 function renderPreviewAt(t) {
@@ -4641,14 +4978,26 @@ function renderPreviewAt(t) {
     el.mm.textContent = r > 0.08 ? mm.toFixed(1) : '';
   }
 
+  renderMousePreviewAt(t);
+
   const hr = document.getElementById('hoverRead');
   if (hr && data && data.ok) {
     const activeList = data.keys
       .filter(k => selectedKeys.has(k) && (vals[k] || 0) > 0.03)
       .sort((a, b) => (vals[b] || 0) - (vals[a] || 0));
-    hr.innerHTML = activeList.length
-      ? activeList.map(k => '<span class="hk">' + disp(norm(k)) + ' ' + (vals[k] || 0).toFixed(2) + 'mm</span>').join('')
-      : '<span style="color:var(--dim)">当前时刻无按下键</span>';
+    const chips = activeList.map(k => '<span class="hk">' + disp(norm(k)) + ' ' + (vals[k] || 0).toFixed(2) + 'mm</span>');
+    const ms = showMouse ? sampleMouseAt(t) : null;
+    if (ms) {
+      const b = ms.b || 0;
+      if (b & 1) chips.push('<span class="hk m">LMB</span>');
+      if (b & 2) chips.push('<span class="hk m">RMB</span>');
+      if (b & 4) chips.push('<span class="hk m">MMB</span>');
+      if (b & 8) chips.push('<span class="hk m">X1</span>');
+      if (b & 16) chips.push('<span class="hk m">X2</span>');
+      if (ms.w > 0) chips.push('<span class="hk m">滚轮↑</span>');
+      if (ms.w < 0) chips.push('<span class="hk m">滚轮↓</span>');
+    }
+    hr.innerHTML = chips.length ? chips.join('') : '<span style="color:var(--dim)">当前时刻无按下键</span>';
   }
 }
 
@@ -4749,7 +5098,7 @@ function renderHistoryUI() {
       for (const it of historyItems) {
         const opt = document.createElement('option');
         opt.value = it.stamp;
-        opt.textContent = it.stamp + ' · ' + (it.duration || 0).toFixed(1) + 's' + (it.is_latest ? ' [最新]' : '');
+        opt.textContent = it.stamp + ' · ' + (it.duration || 0).toFixed(1) + 's' + (it.has_mouse ? ' [键鼠]' : '') + (it.is_latest ? ' [最新]' : '');
         if (it.stamp === currentStamp) opt.selected = true;
         selEl.appendChild(opt);
       }
@@ -4770,6 +5119,7 @@ function renderHistoryUI() {
       const ks = (it.keys || []).map(k => disp(norm(k))).join(' ');
       meta.innerHTML = '<b class="num">' + it.stamp + '</b>' +
         (it.is_latest ? '<span class="hist-tag">最新</span>' : '') +
+        (it.has_mouse ? '<span class="hist-tag m">键鼠</span>' : '') +
         '<span class="num" style="color:var(--dim)">' + (it.duration || 0).toFixed(2) + 's · ' + it.samples + ' 点</span>' +
         '<span class="hist-keys">' + (ks || '—') + '</span>';
       const del = document.createElement('button');
@@ -4906,6 +5256,27 @@ fetch('/snapshot').then(r => r.json()).then(j => {
     const tEl = document.getElementById('theme');
     if (tEl) tEl.value = j.theme;
     renderPreviewAt(activeTime());
+  }
+});
+window.addEventListener('keydown', e => {
+  const tag = (e.target && e.target.tagName) || '';
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.code === 'Space') {
+    e.preventDefault();
+    togglePlay();
+  } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    if (!data || !data.ok) return;
+    e.preventDefault();
+    if (playing) togglePlay();
+    const step = e.shiftKey ? 0.1 : 0.02;
+    const dir = e.key === 'ArrowRight' ? 1 : -1;
+    const lo = sel[1] > sel[0] ? sel[0] : 0;
+    const hi = sel[1] > sel[0] ? sel[1] : (data.duration || 0);
+    playT = Math.max(lo, Math.min(hi, playT + dir * step));
+    hoverT = null;
+    draw();
+    renderPreviewAt(playT);
   }
 });
 addEventListener('resize', () => { fit(); buildPreviewKb(); });

@@ -913,6 +913,47 @@ def t_frames_from_wide():
     assert kf_slots
 
 
+def t_sync_mouse_record_and_wb_replay():
+    """Synced keyboard + mouse recording persists mouse.csv and aligns in /wb/series."""
+    e = make_engine()
+    e.mouse_span = 10000
+    e.start_recording()
+    t0 = time.perf_counter()
+    for i in range(40):
+        ti = t0 + i * 0.02
+        e.on_depth(ti, 31, 3.0 if 10 <= i < 25 else 0.0)
+        btns = {"l": True} if 15 <= i < 22 else {"l": False}
+        dx = 180 if i < 20 else -90
+        dy = 40 if i < 20 else -30
+        e.on_mouse(dx, dy, btns=btns, wheel=(1 if i == 12 else 0), t=ti)
+    out = e.save_recording()
+    assert out and os.path.isfile(out), out
+    vdir = os.path.dirname(out)
+    stamp = os.path.basename(vdir)
+    mouse_csv = os.path.join(vdir, "mouse.csv")
+    assert os.path.isfile(mouse_csv), mouse_csv
+    with io.open(os.path.join(dl.recordings_dir(), "latest.json"), "r", encoding="utf-8") as f:
+        man = json.load(f)
+    assert man.get("mouse") == stamp + "/mouse.csv", man
+
+    info = e.wb_info(stamp)
+    assert info["ok"] and info.get("has_mouse") is True, info
+    ser = e.wb_series(step=0.02, stamp=stamp)
+    assert ser["ok"] and ser.get("mouse"), ser
+    m = ser["mouse"]
+    assert len(m["x"]) == len(ser["t"]) and len(m["b"]) == len(ser["t"])
+    assert max(abs(v) for v in m["x"]) > 0.05, "mouse motion not integrated"
+    assert any((b & 1) for b in m["b"]), "LMB clicks not preserved"
+    assert any(w > 0 for w in m["w"]), "wheel event not preserved"
+
+    # Legacy recording without mouse.csv stays backwards-compatible
+    os.remove(mouse_csv)
+    info2 = e.wb_info(stamp)
+    assert info2["ok"] and info2.get("has_mouse") is False, info2
+    ser2 = e.wb_series(step=0.02, stamp=stamp)
+    assert ser2["ok"] and ser2.get("mouse") is None, ser2
+
+
 def main():
     print("depth pipeline tests")
     for name, fn in [
@@ -961,6 +1002,7 @@ def main():
         ("reader stop before io", t_reader_stop_before_io),
         ("workbench info + series", t_wb_info_and_series),
         ("frames loader (wide csv)", t_frames_from_wide),
+        ("synced mouse record + wb replay", t_sync_mouse_record_and_wb_replay),
     ]:
         check(name, fn)
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
