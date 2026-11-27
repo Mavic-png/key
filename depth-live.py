@@ -36,7 +36,24 @@ except ImportError:                      # Python < 3.7
 from urllib.parse import urlparse, parse_qs, urlsplit
 
 FULL = 3.50
-VERSION = "1.9.9"
+
+
+def data_home():
+    """Where mapping/logs live.  Tests point this at a temp dir."""
+    h = os.environ.get("DEPTH_MONITOR_HOME")
+    if h:
+        return h
+    return os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                        "depth-monitor")
+
+
+def recordings_dir():
+    """Where saved recordings go.  Isolated together with data_home()."""
+    h = os.environ.get("DEPTH_MONITOR_HOME")
+    if h:
+        return os.path.join(h, "recordings")
+    return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
+VERSION = "1.10.0"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -598,28 +615,42 @@ class Engine(object):
             with self.lock:
                 self.notice = "\u6ca1\u6709\u5f55\u5236\u6570\u636e"
             return None
-        folder = os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-        try:
-            if not os.path.isdir(folder):
-                os.makedirs(folder)
-        except Exception:
-            folder = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+        base = recordings_dir()
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        long_path = os.path.join(folder, "depth-%s-long.csv" % stamp)
-        wide_path = os.path.join(folder, "depth-%s-wide.csv" % stamp)
+        version_dir = os.path.join(base, stamp)
+        long_path = os.path.join(version_dir, "long.csv")
+        wide_path = os.path.join(version_dir, "wide.csv")
         try:
-            with io.open(long_path, "w", encoding="utf-8", newline="") as f:
-                for chunk in self.long_lines():
-                    f.write(chunk)
-            with io.open(wide_path, "w", encoding="utf-8", newline="") as f:
-                for chunk in self.wide_lines():
-                    f.write(chunk)
+            if not os.path.isdir(version_dir):
+                os.makedirs(version_dir)
+            # both files are written inside one fresh directory; the manifest
+            # below is the only thing that makes the pair "committed"
+            for path, chunks in ((long_path, self.long_lines()),
+                                 (wide_path, self.wide_lines())):
+                with io.open(path, "w", encoding="utf-8", newline="") as f:
+                    for chunk in chunks:
+                        f.write(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+            manifest = {
+                "stamp": stamp,
+                "samples": n,
+                "long": os.path.relpath(long_path, base).replace("\\", "/"),
+                "wide": os.path.relpath(wide_path, base).replace("\\", "/"),
+                "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            tmp = os.path.join(base, ".latest.tmp")
+            with io.open(tmp, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, os.path.join(base, "latest.json"))
         except Exception as exc:
             with self.lock:
                 self.notice = "\u4fdd\u5b58\u5931\u8d25\uff1a%s" % exc
             return None
         with self.lock:
-            self.notice = "\u5df2\u4fdd\u5b58 %d \u70b9\uff1a%s" % (n, os.path.basename(wide_path))
+            self.notice = "\u5df2\u4fdd\u5b58 %d \u70b9\uff1a%s" % (n, stamp)
         return wide_path
 
     def run_hold(self):
@@ -758,9 +789,7 @@ class Engine(object):
                 if down and not hk_prev.get(hk):
                     self.last_hotkey = "%s %s" % (action, time.strftime("%H:%M:%S"))
                     try:
-                        d = os.path.join(os.environ.get("LOCALAPPDATA",
-                                                        os.path.expanduser("~")),
-                                         "depth-monitor")
+                        d = data_home()
                         if not os.path.isdir(d):
                             os.makedirs(d)
                         with io.open(os.path.join(d, "hotkeys.log"), "a",
@@ -1013,8 +1042,7 @@ ENGINE = Engine()
 
 def _log_exc(where):
     try:
-        folder = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                              "depth-monitor")
+        folder = data_home()
         if not os.path.isdir(folder):
             os.makedirs(folder)
         import traceback
@@ -1036,47 +1064,72 @@ class Handler(BaseHTTPRequestHandler):
     STATE_PATHS = ("/rec/start", "/rec/stop", "/rec/clear", "/auto", "/bind",
                    "/resetmap", "/reset", "/openfolder", "/quit")
 
-    def same_origin(self):
-        """Reject cross-site writes. Browsers send Origin (fetch) or Referer
-        (img/script); a plain local client sends neither and is allowed."""
-        port = self.server.server_address[1]
-
-        def ok(hostname, p):
-            return hostname in ("127.0.0.1", "localhost", "::1") and p in (None, port)
-
-        for header in ("Origin", "Referer"):
-            raw = (self.headers.get(header) or "").strip()
-            if not raw:
-                continue
-            try:
-                parts = urlsplit(raw)
-            except ValueError:
-                return False
-            return ok(parts.hostname, parts.port)
-        return True
-
-    def do_GET(self):
-        raw_host = (self.headers.get("Host") or "").strip().lower()
+    def _send_text(self, status, text):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
         try:
-            host = urlsplit("//" + raw_host).hostname if raw_host else ""
+            self.wfile.flush()
+        except Exception:
+            pass
+
+    def _host_ok(self):
+        """Host must be loopback *and* name this very port."""
+        raw = (self.headers.get("Host") or "").strip().lower()
+        if not raw:
+            return False
+        try:
+            parts = urlsplit("//" + raw)
+            port = parts.port
         except ValueError:
-            host = None
-        if host not in ("127.0.0.1", "localhost", "::1", ""):
-            body = b"bad host"
-            self.send_response(403)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            return False
+        if parts.hostname not in ("127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"):
+            return False
+        return port == self.server.server_address[1]
+
+    def _same_origin(self):
+        """True only for a request that provably comes from this page."""
+        port = self.server.server_address[1]
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return False                       # no Origin -> not a page request
+        try:
+            parts = urlsplit(origin)
+            port_ok = parts.port == port
+        except ValueError:
+            return False
+        return (parts.scheme == "http" and port_ok and
+                parts.hostname in ("127.0.0.1", "localhost", "::1"))
+
+    def _authorized(self, url):
+        """Browser page: must be same-origin (a foreign Origin is always refused,
+        even with a token). Local scripts: must present the process token."""
+        if (self.headers.get("Origin") or "").strip():
+            return self._same_origin()
+        q = parse_qs(url.query)
+        token = (q.get("t") or [""])[0] or (self.headers.get("X-Depth-Token") or "")
+        return bool(token) and secrets.compare_digest(token, ENGINE.token)
+
+    def _handle(self, method):
+        if not self._host_ok():
+            self._send_text(403, "bad host")
             return
         ENGINE.last_client = time.time()
         url = urlparse(self.path)
-        if url.path in self.STATE_PATHS and not self.same_origin():
-            body = b"cross-origin rejected"
-            self.send_response(403)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+        if url.path in self.STATE_PATHS:
+            if method != "POST":
+                # a cross-site <img>/<a> can only issue GET; refuse it outright
+                self.send_response(405)
+                self.send_header("Allow", "POST")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if not self._authorized(url):
+                self._send_text(403, "not authorized")
+                return
         if url.path == "/":
             body = page_html().encode("utf-8")
             self.send_response(200)
@@ -1182,17 +1235,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif url.path == "/quit":
-            q = parse_qs(url.query)
-            token = (q.get("t") or [""])[0]
-            if token != ENGINE.token:
-                # a random web page must not be able to stop the monitor
-                body = b"forbidden"
-                self.send_response(403)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                self.wfile.flush()
-                return
+            # authorization already happened in _handle(): POST + origin/token
             ok = ENGINE.request_quit(srv_ref[0], defer=True)
             body = b"bye" if ok else "\u4fdd\u5b58\u5931\u8d25\uff0c\u672a\u9000\u51fa".encode("utf-8")
             self.send_response(200 if ok else 409)
@@ -1202,8 +1245,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif url.path == "/openfolder":
             try:
-                folder = os.path.join(os.path.expanduser("~"), "Documents",
-                                      "depth-recordings")
+                folder = recordings_dir()
                 if not os.path.isdir(folder):
                     os.makedirs(folder)
                 os.startfile(folder)
@@ -1248,6 +1290,18 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             self.send_error(404)
+
+    def do_GET(self):
+        self._handle("GET")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 0:
+            try:
+                self.rfile.read(length)
+            except Exception:
+                pass
+        self._handle("POST")
 
     def stream(self):
         self.send_response(200)
@@ -1412,14 +1466,14 @@ PAGE = r"""<!DOCTYPE html>
   <div class="pill" id="recPill" style="display:none">已录 <b id="recInfo" style="color:#fca5a5">0</b></div>
   <button onclick="downloadIfRecorded('/export/long')">导出长表</button>
   <button onclick="showTip('点击键盘上的某个键，再按一下对应的物理键，即可建立映射')">绑定说明</button>
-  <button onclick="fetch('/resetmap').then(()=>location.reload())">重新识别</button>
+  <button onclick="api('/resetmap').then(()=>location.reload())">重新识别</button>
   <select id="rate" title="宽表采样率" style="background:#16202e;color:#cbd5e1;border:1px solid #1f2836;border-radius:8px;padding:6px 8px;font-size:12px">
     <option value="100">100 Hz</option><option value="50">50 Hz</option><option value="25">25 Hz</option>
   </select>
   <button onclick="downloadIfRecorded('/export/wide?rate=' + document.getElementById('rate').value)">导出宽表</button>
   <button id="quitBtn" onclick="quitApp()">退出程序</button>
-  <button onclick="fetch('/openfolder')">打开记录文件夹</button>
-  <button onclick="fetch('/reset').then(()=>location.reload())">清空重录</button>
+  <button onclick="api('/openfolder')">打开记录文件夹</button>
+  <button onclick="api('/reset').then(()=>location.reload())">清空重录</button>
 </header>
 
 <div id="wrap">
@@ -1471,7 +1525,7 @@ for (const k of LAYOUT) {
   d.style.cursor = 'pointer';
   d.title = '点击后按一下对应的物理键';
   d.addEventListener('click', () => {
-    fetch('/bind?key=' + encodeURIComponent(k.k));
+    api('/bind?key=' + encodeURIComponent(k.k));
     showTip('请按一下物理键：' + k.k);
   });
   kb.appendChild(d);
@@ -1537,18 +1591,23 @@ let lastHeld = {};
 let held = new Set();
 let lastMsg = Date.now();
 let staleHeld = false;
+function api(path) {
+  return fetch(path, { method: 'POST',
+                       headers: { 'X-Depth-Token': window.__token || '' } });
+}
+
 function quitApp() {
   if (!confirm('退出磁轴深度监测？录制中的数据会先自动存盘。')) return;
-  fetch('/quit?t=' + encodeURIComponent(window.__token || '')).then(r => {
+  api('/quit').then(r => {
     if (r.status === 409) { alert('保存失败，程序没有退出'); return; }
     document.body.innerHTML = '<div style="color:#8b93a7;font:16px system-ui;padding:40px">' +
       '已退出，可以关闭这个标签页了。</div>';
   });
 }
 function toggleAuto() {
-  fetch('/auto?on=' + (autoMode ? '0' : '1')).then(() => showTip(autoMode ? '已关闭自动录制' : '自动录制已开启：每 2 分钟存一段'));
+  api('/auto?on=' + (autoMode ? '0' : '1')).then(() => showTip(autoMode ? '已关闭自动录制' : '自动录制已开启：每 2 分钟存一段'));
 }
-function toggleRec() { fetch(rec.on ? '/rec/stop' : '/rec/start'); }
+function toggleRec() { api(rec.on ? '/rec/stop' : '/rec/start'); }
 function bigTip(html, ms) {
   const el = document.getElementById('bigtip');
   el.innerHTML = html;
@@ -1578,7 +1637,7 @@ function download(url) {
   showTip('正在生成文件…');
 }
 function bindNow() {
-  fetch('/bind').then(() => {
+  api('/bind').then(() => {
     document.getElementById('conn').textContent = '请按下想绑定的物理按键…';
   });
 }

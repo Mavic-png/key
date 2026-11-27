@@ -378,6 +378,27 @@ def t_empty_exports():
     assert "t_s" in long
 
 
+def t_save_is_isolated_and_manifested():
+    """Saved recordings go under the temp home and are committed by a manifest."""
+    base = dl.recordings_dir()
+    assert base.startswith(dl.data_home()), (base, dl.data_home())
+    e = make_engine()
+    e.recording = True
+    now = time.perf_counter()
+    for k in range(40):
+        e.on_depth(now + k * 0.01, 31, (k % 5) * 0.6)
+    path = e.save_recording()
+    assert path and path.startswith(base), path
+    manifest_path = os.path.join(base, "latest.json")
+    assert os.path.exists(manifest_path), manifest_path
+    with io.open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    for key in ("long", "wide"):
+        full = os.path.join(base, manifest[key])
+        assert os.path.exists(full), full
+        assert os.path.getsize(full) > 0
+
+
 def t_save_recording():
     e = make_engine()
     e.recording = True
@@ -408,9 +429,20 @@ def start_server():
     return srv, srv.server_address[1]
 
 
-def fetch(port, path):
-    with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path), timeout=15) as r:
+def fetch(port, path, method="GET", token=None, origin=None):
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), method=method)
+    if token:
+        req.add_header("X-Depth-Token", token)
+    if origin:
+        req.add_header("Origin", origin)
+    with urllib.request.urlopen(req, timeout=15) as r:
         return r.status, r.read()
+
+
+def api(port, path):
+    """What the page does for every state change."""
+    return fetch(port, path, method="POST", token=dl.ENGINE.token,
+                 origin="http://127.0.0.1:%d" % port)
 
 
 def t_http_endpoints():
@@ -422,12 +454,12 @@ def t_http_endpoints():
         status, body = fetch(port, "/snapshot")
         snap = json.loads(body.decode("utf-8"))
         assert "rec_n" in snap and "rate" in snap
-        status, body = fetch(port, "/rec/start")
+        status, body = api(port, "/rec/start")
         e = dl.ENGINE
         now = time.perf_counter()
         for k in range(60):
             e.on_depth(now + k * 0.01, 31, (k % 6) * 0.5)
-        status, body = fetch(port, "/rec/stop")
+        status, body = api(port, "/rec/stop")
         assert status == 200
         for ep in ("/export/wide", "/export/long"):
             status, body = fetch(port, ep)
@@ -436,9 +468,9 @@ def t_http_endpoints():
             assert "t_s" in text, "%s has no header: %r" % (ep, text[:60])
             assert text.count("\ufeff") <= 1, "%s has repeated BOM" % ep
             assert len(text.splitlines()) > 3, "%s too short" % ep
-        status, body = fetch(port, "/bind?key=W")
+        status, body = api(port, "/bind?key=W")
         assert status == 200
-        status, body = fetch(port, "/resetmap")
+        status, body = api(port, "/resetmap")
         assert status == 200
     finally:
         srv.shutdown()
@@ -455,12 +487,12 @@ def t_quit_requires_token():
         token = dl.ENGINE.token
         code = None
         try:
-            fetch(port, "/quit")
+            fetch(port, "/quit", method="POST")
         except urllib.error.HTTPError as exc:
             code = exc.code
         assert code == 403, "expected 403 without token, got %r" % (code,)
         assert srv.fileno() >= 0, "server must still be up after a rejected quit"
-        status, body = fetch(port, "/quit?t=" + token)
+        status, body = fetch(port, "/quit", method="POST", token=token)
         assert status == 200, status
     finally:
         srv.shutdown()
@@ -551,7 +583,7 @@ def t_quit_http_409_when_save_fails():
     try:
         code = None
         try:
-            fetch(port, "/quit?t=" + dl.ENGINE.token)
+            fetch(port, "/quit", method="POST", token=dl.ENGINE.token)
         except urllib.error.HTTPError as exc:
             code = exc.code
         assert code == 409, "expected 409 on save failure, got %r" % (code,)
@@ -599,13 +631,47 @@ def t_cross_origin_state_change_rejected():
     srv, port = start_server()
     try:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        conn.request("GET", "/resetmap", headers={"Origin": "http://evil.example.com"})
+        conn.request("POST", "/resetmap", headers={"Origin": "http://evil.example.com"},
+                     body=b"")
         resp = conn.getresponse()
         resp.read()
         assert resp.status == 403, resp.status
         conn.close()
         # a same-origin request still works
-        fetch(port, "/resetmap")
+        api(port, "/resetmap")
+    finally:
+        srv.shutdown()
+
+
+def t_foreign_origin_beats_token():
+    """A foreign Origin is refused even if the request carries the token."""
+    import urllib.error
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    try:
+        code = None
+        try:
+            fetch(port, "/resetmap", method="POST", token=dl.ENGINE.token,
+                  origin="http://evil.example.com")
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        assert code == 403, "foreign origin must win over a token, got %r" % (code,)
+    finally:
+        srv.shutdown()
+
+
+def t_state_rejects_get():
+    """A cross-site <img>/<a> can only issue GET, so GET must not change state."""
+    import urllib.error
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    try:
+        code = None
+        try:
+            fetch(port, "/resetmap", token=dl.ENGINE.token)
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        assert code == 405, "expected 405 for GET /resetmap, got %r" % (code,)
     finally:
         srv.shutdown()
 
@@ -665,6 +731,63 @@ def t_single_instance_guard():
                     proc.kill()
 
 
+class FakeHidApi(object):
+    """Minimal kernel32 stand-in: ReadFile blocks until a cancel arrives."""
+
+    def __init__(self):
+        self.read_calls = 0
+        self.cancels = 0
+        self.closed = 0
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def CreateFileW(self, *a):
+        return 1234
+
+    def ReadFile(self, h, buf, n, byref_n, overlapped):
+        self.read_calls += 1
+        self.blocked.set()
+        self.release.wait(2.0)          # stands in for a blocking kernel call
+        return False                    # -> caller reads the error code
+
+    def CancelIoEx(self, h, ov):
+        self.cancels += 1
+        self.release.set()
+
+    def CloseHandle(self, h):
+        self.closed += 1
+
+    def get_last_error(self):
+        return 995                       # ERROR_OPERATION_ABORTED
+
+
+def t_reader_cancel_window():
+    """stop() must also cover 'cancel arrived before ReadFile was issued'."""
+    hp = load("hp", os.path.join(HERE, "hid-probe.py"))
+    api = FakeHidApi()
+    sink = []
+    r = hp.Reader(0, "fake", 21, sink, api=api)
+    r.start()
+    assert api.blocked.wait(3.0), "reader never reached ReadFile"
+    stopped = r.stop(wait=2.0)
+    r.join(3.0)
+    assert stopped or not r.is_alive(), "reader did not stop"
+    assert api.closed == 1, "handle must be closed exactly once"
+    assert not r.is_alive()
+
+
+def t_reader_stop_before_io():
+    """A stop that lands before the loop starts must not call ReadFile."""
+    hp = load("hp", os.path.join(HERE, "hid-probe.py"))
+    api = FakeHidApi()
+    r = hp.Reader(0, "fake", 21, [], api=api)
+    r.stop_event.set()                  # stop() before start()
+    r.start()
+    r.join(3.0)
+    assert api.read_calls == 0, "no read should be issued after an early stop"
+    assert api.closed == 1
+
+
 def t_frames_from_wide():
     try:
         kf = load("kf", os.path.join(HERE, "kb-frames.py"))
@@ -709,6 +832,7 @@ def main():
         ("ffmpeg start failure cleans up", t_ffmpeg_start_failure),
         ("render alpha + multiprocess match", t_render_alpha_and_multiprocess_match),
         ("empty exports", t_empty_exports),
+        ("save is isolated + manifest", t_save_is_isolated_and_manifested),
         ("save recording to disk", t_save_recording),
         ("http endpoints", t_http_endpoints),
         ("quit requires token", t_quit_requires_token),
@@ -721,7 +845,11 @@ def main():
         ("foreign host rejected", t_rejects_foreign_host),
         ("ipv6 host allowed", t_ipv6_host_allowed),
         ("cross-origin write rejected", t_cross_origin_state_change_rejected),
+        ("foreign origin beats token", t_foreign_origin_beats_token),
+        ("state rejects GET", t_state_rejects_get),
         ("single instance guard", t_single_instance_guard),
+        ("reader cancel window", t_reader_cancel_window),
+        ("reader stop before io", t_reader_stop_before_io),
         ("frames loader (wide csv)", t_frames_from_wide),
     ]:
         check(name, fn)

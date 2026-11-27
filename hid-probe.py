@@ -219,7 +219,7 @@ def describe(path):
             info["descriptor"] = b""
         return info
     finally:
-        kernel32.CloseHandle(h)
+        self.api.CloseHandle(h)
 
 
 # ------------------------------------------------------- report descriptor parse
@@ -442,18 +442,23 @@ class Reader(threading.Thread):
     """Reads one HID collection. Owns its handle: it opens and closes it itself so
     the main thread can never close a handle that is still blocked in ReadFile."""
 
-    def __init__(self, index, path, length, sink):
+    def __init__(self, index, path, length, sink, api=None):
         threading.Thread.__init__(self)
         self.daemon = True
         self.index = index
         self.path = path
         self.length = max(length, 64)
         self.sink = sink
+        self.api = api or kernel32          # injectable for fault injection
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.handle = None
         self.error = None
         self.reads = 0
+
+    def _last_error(self):
+        fn = getattr(self.api, "get_last_error", None)
+        return fn() if fn else ctypes.get_last_error()
 
     def stop(self, wait=1.0):
         """CancelIoEx only cancels I/O that is already pending, and the reader may
@@ -465,7 +470,7 @@ class Reader(threading.Thread):
                 h = self.handle
             if h:
                 try:
-                    kernel32.CancelIoEx(h, None)
+                    self.api.CancelIoEx(h, None)
                 except Exception:
                     pass
             if not self.is_alive() or time.time() >= deadline:
@@ -473,10 +478,10 @@ class Reader(threading.Thread):
             time.sleep(0.01)
 
     def run(self):
-        h = kernel32.CreateFileW(self.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        h = self.api.CreateFileW(self.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                  None, OPEN_EXISTING, 0, None)
         if h == INVALID_HANDLE_VALUE:
-            self.error = "CreateFile failed err=%d" % ctypes.get_last_error()
+            self.error = "CreateFile failed err=%d" % self._last_error()
             return
         with self.lock:
             self.handle = h
@@ -484,7 +489,7 @@ class Reader(threading.Thread):
             with self.lock:
                 self.handle = None
             try:
-                kernel32.CloseHandle(h)
+                self.api.CloseHandle(h)
             except Exception:
                 pass
             return
@@ -493,8 +498,8 @@ class Reader(threading.Thread):
         consecutive = 0
         try:
             while not self.stop_event.is_set():
-                if not kernel32.ReadFile(h, buf, self.length, ctypes.byref(nread), None):
-                    err = ctypes.get_last_error()
+                if not self.api.ReadFile(h, buf, self.length, ctypes.byref(nread), None):
+                    err = self._last_error()
                     if err in (995, 6):
                         return                      # cancelled / invalid handle
                     if err in (1167, 109):
@@ -516,7 +521,7 @@ class Reader(threading.Thread):
             with self.lock:
                 self.handle = None
             try:
-                kernel32.CloseHandle(h)
+                self.api.CloseHandle(h)
             except Exception:
                 pass
 
@@ -764,7 +769,7 @@ def cmd_feature(args):
                         print("%.3f id=%d %s" % (time.perf_counter(), rid, hx(data)))
                         last[rid] = data
                 else:
-                    err = ctypes.get_last_error()
+                    err = self._last_error()
                     if last.get(rid) != "err":
                         print("id=%d unsupported/err=%d" % (rid, err))
                         last[rid] = "err"
@@ -772,7 +777,7 @@ def cmd_feature(args):
     except KeyboardInterrupt:
         pass
     finally:
-        kernel32.CloseHandle(h)
+        self.api.CloseHandle(h)
     return 0
 
 
