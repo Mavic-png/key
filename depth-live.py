@@ -53,7 +53,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.10.3"
+VERSION = "1.10.5"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1468,10 +1468,11 @@ PAGE = r"""<!DOCTYPE html>
   <div class="pill">深度 <b id="dr" style="color:#cbd5e1">0</b>/s</div>
   <div class="pill">事件 <b id="er" style="color:#cbd5e1">0</b>/s</div>
   <div class="pill">按压 <b id="pc" style="color:#cbd5e1">0</b> 次</div>
+  <div class="pill">按住 <b id="heldList" style="color:#7dd3fc">—</b></div>
   <div class="spacer"></div>
   <button id="kbToggle" class="tgl" onclick="toggleKb()">键盘渲染 ●</button>
-  <button id="autoBtn" onclick="toggleAuto()">自动录制</button>
-  <button id="recBtn" class="rec" onclick="toggleRec()">● 开始录制</button>
+  <button id="autoBtn" onclick="toggleAuto(); this.blur()">自动录制</button>
+  <button id="recBtn" class="rec" onclick="toggleRec(); this.blur()">● 开始录制</button>
   <div class="pill" id="recPill" style="display:none">已录 <b id="recInfo" style="color:#fca5a5">0</b></div>
   <button onclick="downloadIfRecorded('/export/long')">导出长表</button>
   <button onclick="showTip('点击键盘上的某个键，再按一下对应的物理键，即可建立映射')">绑定说明</button>
@@ -1662,7 +1663,11 @@ es.onmessage = ev => {
   rate = m.rate; presses = m.presses; connected = m.conn;
   if (m.st) stats = m.st;
   if (m.rec) recent = m.rec;
-  if (m.held) held = new Set(m.held.map(norm));
+  if (m.held) {
+    held = new Set(m.held.map(norm));
+    const hl = document.getElementById('heldList');
+    if (hl) hl.textContent = held.size ? Array.from(held).join(' ') : '—';
+  }
   if (m.binding !== undefined) {
     if (m.binding && m.binding !== binding) showTip('\u8bf7\u6309\u4e00\u4e0b\u7269\u7406\u952e：' + m.binding);
     binding = m.binding;
@@ -1788,9 +1793,17 @@ function draw() {
 }
 startDraw();
 setInterval(renderPanel, 90);
+// Space / Enter would "click" whatever button still has focus from the last
+// click (e.g. 开始录制), so pressing Space stopped the recording instead of
+// being recorded as a key. Swallow those activations on the page.
 addEventListener('keydown', e => {
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if ((e.code === 'Space' || e.code === 'Enter') &&
+      (tag === 'BUTTON' || tag === 'SELECT' || tag === 'INPUT')) {
+    e.preventDefault();
+  }
   if (e.code === 'KeyK' && !e.ctrlKey && !e.altKey && !e.metaKey) toggleKb();
-});
+}, true);
 
 function fitUnits() {
   const box = document.getElementById('kbc');
