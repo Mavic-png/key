@@ -23,7 +23,14 @@ from PIL import Image, ImageDraw, ImageFont
 
 FULL = 3.50
 THEMES = {
-    "ramp": dict(fill_a=(46, 200, 96), fill_b=(250, 204, 21), fill_c=(239, 68, 68)),
+    "ramp": dict(stops=[(0.0, (56, 189, 248)), (0.36, (52, 211, 153)),
+                        (0.70, (251, 191, 36)), (1.0, (244, 63, 94))]),
+    "smooth": dict(stops=[(0.0, (56, 189, 248)), (0.36, (52, 211, 153)),
+                          (0.70, (251, 191, 36)), (1.0, (244, 63, 94))]),
+    "cyan": dict(fill_a=(14, 165, 233), fill_b=(56, 189, 248), fill_c=(125, 211, 252)),
+    "mint": dict(fill_a=(16, 185, 129), fill_b=(52, 211, 153), fill_c=(110, 231, 183)),
+    "amber": dict(fill_a=(217, 119, 6), fill_b=(251, 191, 36), fill_c=(253, 230, 138)),
+    "crimson": dict(fill_a=(225, 29, 72), fill_b=(244, 63, 94), fill_c=(253, 164, 175)),
     "violet": dict(fill_a=(139, 92, 246), fill_b=(139, 92, 246), fill_c=(139, 92, 246)),
 }
 
@@ -35,13 +42,35 @@ LAYOUTS = {
     ],
     # compact cluster for overlaying on gameplay: movement keys, crouch, jump
     "hud": [
-        ("W", 1.0, 0.0, 1.0),
+        ("Q", 0.0, 0.0, 1.0), ("W", 1.0, 0.0, 1.0), ("E", 2.0, 0.0, 1.0), ("R", 3.0, 0.0, 1.0),
         ("A", 0.0, 1.0, 1.0), ("S", 1.0, 1.0, 1.0), ("D", 2.0, 1.0, 1.0),
-        ("LCtrl", 0.0, 2.0, 1.25), ("Space", 1.25, 2.0, 3.0),
+        ("LShift", 0.0, 2.0, 1.35), ("LCtrl", 1.35, 2.0, 1.2), ("LAlt", 2.55, 2.0, 1.15), ("Space", 3.7, 2.0, 2.6),
+    ],
+    "full": [
+        ("Esc", 0.0, 0, 1), ("F1", 1.3, 0, 1), ("F2", 2.3, 0, 1), ("F3", 3.3, 0, 1), ("F4", 4.3, 0, 1),
+        ("F5", 5.55, 0, 1), ("F6", 6.55, 0, 1), ("F7", 7.55, 0, 1), ("F8", 8.55, 0, 1),
+        ("F9", 9.8, 0, 1), ("F10", 10.8, 0, 1), ("F11", 11.8, 0, 1), ("F12", 12.8, 0, 1),
+        ("Del", 14.2, 0, 1), ("Home", 15.35, 0, 1),
+        ("`", 0.0, 1, 1), ("1", 1, 1, 1), ("2", 2, 1, 1), ("3", 3, 1, 1), ("4", 4, 1, 1),
+        ("5", 5, 1, 1), ("6", 6, 1, 1), ("7", 7, 1, 1), ("8", 8, 1, 1), ("9", 9, 1, 1),
+        ("0", 10, 1, 1), ("-", 11, 1, 1), ("=", 12, 1, 1), ("Bksp", 13, 1, 2.15), ("PgUp", 15.35, 1, 1),
+        ("Tab", 0.0, 2, 1.5), ("Q", 1.5, 2, 1), ("W", 2.5, 2, 1), ("E", 3.5, 2, 1), ("R", 4.5, 2, 1),
+        ("T", 5.5, 2, 1), ("Y", 6.5, 2, 1), ("U", 7.5, 2, 1), ("I", 8.5, 2, 1), ("O", 9.5, 2, 1),
+        ("P", 10.5, 2, 1), ("[", 11.5, 2, 1), ("]", 12.5, 2, 1), ("\\", 13.5, 2, 1.65), ("PgDn", 15.35, 2, 1),
+        ("Caps", 0.0, 3, 1.75), ("A", 1.75, 3, 1), ("S", 2.75, 3, 1), ("D", 3.75, 3, 1), ("F", 4.75, 3, 1),
+        ("G", 5.75, 3, 1), ("H", 6.75, 3, 1), ("J", 7.75, 3, 1), ("K", 8.75, 3, 1), ("L", 9.75, 3, 1),
+        (";", 10.75, 3, 1), ("'", 11.75, 3, 1), ("Enter", 12.75, 3, 2.4), ("End", 15.35, 3, 1),
+        ("LShift", 0.0, 4, 2.25), ("Z", 2.25, 4, 1), ("X", 3.25, 4, 1), ("C", 4.25, 4, 1), ("V", 5.25, 4, 1),
+        ("B", 6.25, 4, 1), ("N", 7.25, 4, 1), ("M", 8.25, 4, 1), (",", 9.25, 4, 1), (".", 10.25, 4, 1),
+        ("/", 11.25, 4, 1), ("RShift", 12.25, 4, 1.85), ("↑", 14.25, 4, 1),
+        ("LCtrl", 0.0, 5, 1.25), ("LWin", 1.25, 5, 1.25), ("LAlt", 2.5, 5, 1.25),
+        ("Space", 3.75, 5, 6.25), ("RAlt", 10.0, 5, 1.05), ("Fn", 11.05, 5, 1.05), ("RCtrl", 12.1, 5, 1.05),
+        ("←", 13.25, 5, 1), ("↓", 14.25, 5, 1), ("→", 15.25, 5, 1),
     ],
 }
-LABELS = {"LAlt": "Alt", "Space": "", "Bksp": "Back", "LShift": "Shift",
-          "LCtrl": "Ctrl", "Enter": "Enter", "Tab": "Tab"}
+LABELS = {"LAlt": "Alt", "RAlt": "Alt", "Space": "", "Bksp": "Back", "LShift": "Shift",
+          "RShift": "Shift", "LCtrl": "Ctrl", "RCtrl": "Ctrl", "LWin": "Win",
+          "Enter": "Enter", "Tab": "Tab"}
 
 _W = {}          # per-worker state
 
@@ -136,6 +165,15 @@ def sample_value(arr, t):
 
 def depth_color(ratio, theme):
     ratio = max(0.0, min(1.0, ratio))
+    stops = theme.get("stops")
+    if stops:
+        for i in range(1, len(stops)):
+            if ratio <= stops[i][0]:
+                t = (ratio - stops[i - 1][0]) / max(1e-6, stops[i][0] - stops[i - 1][0])
+                f = 0.5 - 0.5 * math.cos(math.pi * t)
+                a, b = stops[i - 1][1], stops[i][1]
+                return tuple(int(a[k] + (b[k] - a[k]) * f) for k in range(3))
+        return stops[-1][1]
     a, b, c = theme["fill_a"], theme["fill_b"], theme["fill_c"]
     if ratio < 0.5:
         f = ratio / 0.5
@@ -190,14 +228,15 @@ def build_slot(label, x, y, w, unit, gap, theme, alpha, width_px):
                 label_img=label_img, width=width_px, theme=theme)
 
 
-def render_frame(idx, fps, size, slots, series, bg=None):
+def render_frame(idx, fps, size, slots, series, bg=None, full=FULL):
     W, H = size
     canvas = Image.new("RGBA", (W, H), bg if bg else (0, 0, 0, 0))
     t = idx / float(fps)
     draw = ImageDraw.Draw(canvas)
+    full_mm = max(0.5, float(full or FULL))
     for s in slots:
         mm = sample_value(series.get(s["label"], []), t)
-        ratio = max(0.0, min(1.0, mm / FULL))
+        ratio = max(0.0, min(1.0, mm / full_mm))
         kw, kh = s["w"], s["h"]
         canvas.alpha_composite(s["body"], (s["x"], s["y"]))
         if ratio > 0.02:
@@ -212,8 +251,7 @@ def render_frame(idx, fps, size, slots, series, bg=None):
             canvas.alpha_composite(fill, (s["x"], s["y"] + kh - fh))
             line = Image.new("RGBA", (kw, 2), (255, 255, 255, int(160 * min(1, ratio * 3))))
             canvas.alpha_composite(line, (s["x"], s["y"] + kh - fh))
-        border = (depth_color(ratio, s["theme"]) + (int(190 + 60 * ratio),)) \
-            if ratio > 0.03 else (255, 255, 255, 46)
+        border = (255, 255, 255, 46)
         draw.rounded_rectangle([s["x"], s["y"], s["x"] + kw - 1, s["y"] + kh - 1],
                                radius=s["r"], outline=border, width=s["width"])
         img = s["label_img"].get(ratio > 0.05)
@@ -229,12 +267,31 @@ def _init(cfg):
     _W.update(cfg)
 
 
-FFMPEG = r"C:\Users\74005\ffmpeg\bin\ffmpeg.exe"
+def _default_ffmpeg():
+    env = os.environ.get("FFMPEG")
+    if env:
+        return env
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [
+        os.path.join(here, "ffmpeg.exe"),
+        os.path.join(here, "ffmpeg", "bin", "ffmpeg.exe"),
+        os.path.join(os.path.expanduser("~"), "ffmpeg", "bin", "ffmpeg.exe"),
+    ]
+    for p in cands:
+        if os.path.isfile(p):
+            return p
+    return "ffmpeg"
 
 
-def _segment_cmd(path, size, fps):
+FFMPEG = _default_ffmpeg()
+
+
+def _segment_cmd(path, size, fps, ffmpeg=None):
     W, H = size
-    return [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+    return [ffmpeg or FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "rgba", "-s", "%dx%d" % (W, H),
             "-r", str(fps), "-i", "-",
             "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
@@ -244,12 +301,13 @@ def _segment_cmd(path, size, fps):
 def _render_segment(job):
     start, end, path = job
     size, fps = _W["size"], _W["fps"]
-    proc = subprocess.Popen(_segment_cmd(path, size, fps), stdin=subprocess.PIPE)
+    proc = subprocess.Popen(_segment_cmd(path, size, fps, _W.get("ffmpeg")), stdin=subprocess.PIPE)
     written = 0
     error = None
     try:
         for i in range(start, end):
-            img = render_frame(i, fps, size, _W["slots"], _W["series"])
+            img = render_frame(i, fps, size, _W["slots"], _W["series"],
+                               _W.get("bg"), _W.get("full", FULL))
             proc.stdin.write(img.tobytes())
             written += 1
     except BrokenPipeError:
@@ -278,7 +336,7 @@ def _render_range(rng):
     out = _W["out"]
     for i in range(start, end):
         img = render_frame(i, _W["fps"], _W["size"], _W["slots"], _W["series"],
-                           _W.get("bg"))
+                           _W.get("bg"), _W.get("full", FULL))
         img.save(os.path.join(out, "frame_%05d.png" % i), "PNG", compress_level=1)
     return end - start
 
@@ -353,12 +411,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
     ap.add_argument("-o", "--out", default=None)
-    ap.add_argument("--keys", nargs="*", default=["W", "A", "S", "D", "LAlt", "Space"])
+    ap.add_argument("--keys", nargs="*", default=None)
     ap.add_argument("--layout", default="wasd", choices=sorted(LAYOUTS))
     ap.add_argument("--size", default="1920x1080")
     ap.add_argument("--fps", type=int, default=60)
     ap.add_argument("--u", type=float, default=0)
     ap.add_argument("--theme", default="ramp", choices=sorted(THEMES))
+    ap.add_argument("--full", type=float, default=FULL,
+                    help="full switch travel in mm (default 3.50)")
+    ap.add_argument("--ffmpeg", default="", help="path to ffmpeg executable")
     ap.add_argument("--alpha", type=float, default=0.86)
     ap.add_argument("--alias", default="")
     ap.add_argument("--speed", type=float, default=1.0,
@@ -373,6 +434,10 @@ def main():
     ap.add_argument("--keep-frames", action="store_true")
     ap.add_argument("--mp4", default="", help="also write a quick preview mp4 (GPU/NVENC)")
     args = ap.parse_args()
+    global FFMPEG
+    if args.ffmpeg:
+        FFMPEG = args.ffmpeg
+    full_mm = max(1.0, min(5.0, float(args.full)))
 
     W, H = [int(v) for v in args.size.lower().split("x")]
     series, dur = load_csv(args.csv)
@@ -402,8 +467,18 @@ def main():
         dur = dur * factor
 
     theme = THEMES[args.theme]
-    slots_def = [(label, x, y, w) for label, x, y, w in LAYOUTS[args.layout]
-                 if label in args.keys]
+    layout_defs = LAYOUTS[args.layout]
+    if args.keys:
+        want = set(args.keys)
+        slots_def = [(label, x, y, w) for label, x, y, w in layout_defs if label in want]
+    elif args.layout == "full":
+        slots_def = list(layout_defs)
+    else:
+        default_keys = {"W", "A", "S", "D", "LAlt", "LCtrl", "LShift", "Space"}
+        slots_def = [(label, x, y, w) for label, x, y, w in layout_defs if label in default_keys]
+    if not slots_def:
+        print("no matching keys for layout %s" % args.layout)
+        return 2
     maxx = max(x + w for _, x, y, w in slots_def)
     maxy = max(y + 1 for _, x, y, w in slots_def)
     unit = args.u or min(W * 0.82 / maxx, H * 0.78 / maxy)
@@ -439,7 +514,8 @@ def main():
         else:
             print("bad --bg value, expected #RRGGBB or #RRGGBBAA")
             return 2
-    cfg = dict(out=out_dir, fps=args.fps, size=(W, H), slots=slots, series=series, bg=bg)
+    cfg = dict(out=out_dir, fps=args.fps, size=(W, H), slots=slots, series=series,
+               bg=bg, full=full_mm, ffmpeg=FFMPEG)
     if jobs <= 1 or n < 40:
         _init(cfg)
         _render_range((0, n))

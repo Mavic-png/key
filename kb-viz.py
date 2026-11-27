@@ -58,9 +58,56 @@ ALIAS = {"Backspace": "Bksp", "Back": "Bksp", "<-": "←", "Up": "↑", "Down": 
          "Space": "Space", "LMeta": "LWin", "RMeta": "RWin", "菜单": "Fn"}
 
 
+def detect_full_mm(path):
+    """Read '# ... full=3.80mm' from CSV header comments if present."""
+    import re
+    try:
+        with io.open(path, encoding="utf-8-sig", errors="replace") as f:
+            for _ in range(12):
+                ln = f.readline()
+                if not ln:
+                    break
+                if not ln.lstrip().startswith("#"):
+                    break
+                m = re.search(r"full\s*=\s*([0-9]+(?:\.[0-9]+)?)", ln, re.I)
+                if m:
+                    v = float(m.group(1))
+                    if 1.0 <= v <= 5.0:
+                        return round(v, 2)
+    except Exception:
+        pass
+    return None
+
+
 def read_rows(path):
     with io.open(path, encoding="utf-8-sig", errors="replace") as f:
-        rows = [ln for ln in f if not ln.lstrip().startswith("#")]
+        rows = [ln for ln in f if not ln.lstrip().startswith("#") and ln.strip()]
+    if not rows:
+        return {}, 0.0
+    header = [h.strip() for h in rows[0].strip().split(",")]
+    lower = [h.lower() for h in header]
+    if "key" not in lower and "mm" not in lower and len(header) >= 3:
+        keycols = [(i, ALIAS.get(header[i], header[i])) for i in range(1, len(header))
+                   if lower[i] not in ("wall", "t_s", "t")]
+        data = {}
+        tmin = None
+        for ln in rows[1:]:
+            parts = ln.strip().split(",")
+            if len(parts) < len(header):
+                continue
+            try:
+                t = float(parts[0])
+            except ValueError:
+                continue
+            if tmin is None or t < tmin:
+                tmin = t
+            for idx, name in keycols:
+                try:
+                    mm = float(parts[idx])
+                except (ValueError, IndexError):
+                    mm = 0.0
+                data.setdefault(name, []).append((t, mm))
+        return data, (tmin or 0.0)
     reader = csv.DictReader(rows)
     cols = {c.lower(): c for c in (reader.fieldnames or [])}
     tcol = cols.get("t_s") or cols.get("t") or "t_s"
@@ -104,8 +151,17 @@ HTML = u"""<!DOCTYPE html>
   body.theme-amber {
     --glow: 245, 158, 11; --glow-2: 251, 191, 36; --fill-b: 217, 119, 6;
   }
-  body.theme-ice {
-    --glow: 56, 189, 248; --glow-2: 34, 211, 238; --fill-b: 59, 130, 246;
+  body.theme-ice, body.theme-cyan {
+    --glow: 56, 189, 248; --glow-2: 34, 211, 238; --fill-b: 14, 165, 233;
+  }
+  body.theme-mint {
+    --glow: 52, 211, 153; --glow-2: 110, 231, 183; --fill-b: 16, 185, 129;
+  }
+  body.theme-crimson {
+    --glow: 244, 63, 94; --glow-2: 253, 164, 175; --fill-b: 225, 29, 72;
+  }
+  body.theme-violet {
+    --glow: 168, 85, 247; --glow-2: 216, 180, 254; --fill-b: 126, 34, 206;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -211,14 +267,27 @@ HTML = u"""<!DOCTYPE html>
 </div>
 <div id="tip">H 显示/隐藏控制条 · 空格 暂停 · R 重播 · 点击进度条跳转</div>
 <script>
-const LAYOUT = %(layout)s, DATA = %(data)s, DUR = %(dur)s, FULL = %(full)s;
+const LAYOUT = %(layout)s, DATA = %(data)s, DUR = %(dur)s;
+const Q = new URLSearchParams(location.search);
+const FULL = Math.max(1.0, Math.min(5.0, parseFloat(Q.get('full')) || %(full)s));
+const THEME = (Q.get('theme') || %(theme)s).toLowerCase();
 const U = %(u)s, GAP = 5;
 const kb = document.getElementById('kb');
-if (new URLSearchParams(location.search).get('bg') === '0')
-  document.body.classList.add('transparent');
-if (new URLSearchParams(location.search).get('theme') === 'amber' ||
-    new URLSearchParams(location.search).get('theme') === 'ice')
-  document.body.classList.add('theme-' + new URLSearchParams(location.search).get('theme'));
+if (Q.get('bg') === '0') document.body.classList.add('transparent');
+if (['amber','ice','cyan','mint','crimson','violet'].includes(THEME))
+  document.body.classList.add('theme-' + THEME);
+function smoothRamp(r) {
+  const stops = [[0,[56,189,248]],[0.36,[52,211,153]],[0.70,[251,191,36]],[1,[244,63,94]]];
+  r = Math.max(0, Math.min(1, r));
+  for (let i = 1; i < stops.length; i++) {
+    if (r <= stops[i][0]) {
+      const f = 0.5 - 0.5 * Math.cos(Math.PI * (r - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]));
+      const a = stops[i-1][1], b = stops[i][1];
+      return [Math.round(a[0]+(b[0]-a[0])*f), Math.round(a[1]+(b[1]-a[1])*f), Math.round(a[2]+(b[2]-a[2])*f)];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
 
 let maxX = 0, maxY = 0;
 for (const k of LAYOUT) { maxX = Math.max(maxX, k.x + k.w); maxY = Math.max(maxY, k.r + 1); }
@@ -272,6 +341,14 @@ function render() {
     const mm = sample(name, t);
     const r = Math.max(0, Math.min(1, mm / FULL));
     el.fill.style.height = (r * 100) + '%%';
+    if (THEME === 'ramp' && r > 0.04) {
+      const [R, G, B] = smoothRamp(r), [R0, G0, B0] = smoothRamp(Math.max(0, r * 0.55));
+      el.fill.style.background = 'linear-gradient(to top, rgba(' + R0 + ',' + G0 + ',' + B0 + ',.80), rgba(' + R + ',' + G + ',' + B + ',.56))';
+      el.fill.style.borderTop = '1.5px solid rgb(' + Math.min(255, R + 36) + ',' + Math.min(255, G + 36) + ',' + Math.min(255, B + 36) + ')';
+    } else {
+      el.fill.style.background = '';
+      el.fill.style.borderTop = '';
+    }
     el.box.classList.toggle('hot', r > 0.04);
     if (r > 0.04) {
       const blur = 10 + r * 26;
@@ -337,11 +414,13 @@ requestAnimationFrame(loop);
 """
 
 
-def build(path, out, title, caption, unit, speed, loop):
+def build(path, out, title, caption, unit, speed, loop, full=None, theme="ramp"):
     data, t0 = read_rows(path)
     if not data:
         print("no samples in %s" % path)
         return 2
+    full_mm = full if full is not None else (detect_full_mm(path) or FULL)
+    full_mm = max(1.0, min(5.0, float(full_mm)))
     clean = {}
     for k, pts in data.items():
         pts.sort()
@@ -353,7 +432,8 @@ def build(path, out, title, caption, unit, speed, loop):
         "title": title, "caption": caption, "u": unit, "speed": speed,
         "layout": json.dumps(layout, ensure_ascii=False),
         "data": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        "dur": "%.3f" % duration, "full": FULL, "hud": "true",
+        "dur": "%.3f" % duration, "full": "%.2f" % full_mm,
+        "theme": json.dumps(theme), "hud": "true",
         "loop": "0" if loop else "dur",
     }
     with io.open(out, "w", encoding="utf-8") as f:
@@ -372,11 +452,16 @@ def main():
     ap.add_argument("--caption", default="")
     ap.add_argument("--u", type=float, default=64, help="key unit in px")
     ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--full", type=float, default=None,
+                    help="full switch travel in mm (default: auto from CSV or 3.50)")
+    ap.add_argument("--theme", default="ramp",
+                    choices=("ramp", "cyan", "mint", "amber", "crimson", "violet", "ice"))
     ap.add_argument("--loop", action="store_true", default=True)
     args = ap.parse_args()
     out = args.out or os.path.splitext(args.csv)[0] + "-viz.html"
     caption = args.caption or ("%s  ·  %s" % (args.title, os.path.basename(args.csv)))
-    return build(args.csv, out, args.title, caption, args.u, args.speed, args.loop)
+    return build(args.csv, out, args.title, caption, args.u, args.speed, args.loop,
+                 full=args.full, theme=args.theme)
 
 
 if __name__ == "__main__":

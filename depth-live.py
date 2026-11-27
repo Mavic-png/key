@@ -55,6 +55,20 @@ def find_kb_frames():
     return None
 
 
+def find_kb_viz():
+    """Locate kb-viz.py alongside kb-frames.py."""
+    here = []
+    if getattr(sys, "frozen", False):
+        here.append(os.path.dirname(os.path.abspath(sys.executable)))
+    here.append(os.getcwd())
+    here.append(os.path.dirname(os.path.abspath(__file__)))
+    for folder in here:
+        path = os.path.join(folder, "kb-viz.py")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _python_has_pillow(exe):
     try:
         out = subprocess.run([exe, "-c", "import PIL;print(PIL.__version__)"],
@@ -78,13 +92,23 @@ def find_python(kb_path=None):
                   os.path.join(root, r".venv\Scripts\python.exe")]
     if not getattr(sys, "frozen", False):
         cands.append(sys.executable)
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if folder:
+            for name in ("python.exe", "python3.exe", "python", "python3"):
+                p = os.path.join(folder, name)
+                if os.path.isfile(p):
+                    cands.append(p)
     for name in ("python", "python3", "py"):
         found = shutil.which(name)
         if found:
             cands.append(found)
+    seen = set()
     for exe in cands:
-        if exe and os.path.isfile(exe) and _python_has_pillow(exe):
-            return exe
+        norm = os.path.normcase(os.path.abspath(exe)) if exe else ""
+        if exe and norm not in seen and os.path.isfile(exe):
+            seen.add(norm)
+            if _python_has_pillow(exe):
+                return exe
     return None
 
 
@@ -103,7 +127,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.13.1"
+VERSION = "1.14.0"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -272,14 +296,20 @@ def decode(report):
 # ------------------------------------------------------------------- engine
 
 KEYNAME = {0x20: "Space", 0x08: "Bksp", 0x09: "Tab", 0x0D: "Enter", 0x1B: "Esc",
+           0x14: "Caps", 0x21: "PgUp", 0x22: "PgDn", 0x23: "End", 0x24: "Home",
+           0x25: "\u2190", 0x26: "\u2191", 0x27: "\u2192", 0x28: "\u2193", 0x2E: "Del",
+           0x5B: "LWin", 0x5C: "RWin",
            0x10: "Shift", 0x11: "Ctrl", 0x12: "Alt", 0xA0: "LShift", 0xA1: "RShift",
            0xA2: "LCtrl", 0xA3: "RCtrl", 0xA4: "LAlt", 0xA5: "RAlt",
            0xBA: ";", 0xBB: "=", 0xBC: ",", 0xBD: "-", 0xBE: ".", 0xBF: "/",
            0xC0: "`", 0xDB: "[", 0xDC: "\\", 0xDD: "]", 0xDE: "'"}
+for _fn in range(1, 13):
+    KEYNAME[0x6F + _fn] = "F%d" % _fn
 
-CAND_VKS = (list(range(0x30, 0x3A)) + list(range(0x41, 0x5B)) +
-            [0x20, 0x08, 0x09, 0x0D, 0x10, 0x11, 0x12, 0x1B,
-             0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+CAND_VKS = (list(range(0x30, 0x3A)) + list(range(0x41, 0x5B)) + list(range(0x70, 0x7C)) +
+            [0x20, 0x08, 0x09, 0x0D, 0x1B, 0x14, 0x21, 0x22, 0x23, 0x24,
+             0x25, 0x26, 0x27, 0x28, 0x2E, 0x5B, 0x5C,
+             0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
              0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xDB, 0xDC, 0xDD, 0xDE])
 
 
@@ -353,7 +383,51 @@ class Engine(object):
         self.mapping_gen = 0         # bumped whenever the index<->vk table changes
         self.suppressed = 0          # firmware switch-zero reports ignored
         self.released_by_watchdog = 0
+        self.strafe_pair = ("A", "D")
+        self._strafe_active = {}     # label -> bool
+        self._strafe_overlap_at = None
+        self._strafe_last_up = None  # (label, t)
+        self._strafe_log = collections.deque(maxlen=24)
+        self.settings_path = os.path.join(data_home, "settings.json")
+        self.full_mm = FULL
+        self.theme = "ramp"
+        self._load_settings()
         self._load_mapping()
+
+    # ---- settings persistence ---------------------------------------
+    def _load_settings(self):
+        try:
+            with io.open(self.settings_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            fm = float(raw.get("full_mm", FULL))
+            if 1.0 <= fm <= 5.0:
+                self.full_mm = round(fm, 2)
+            th = (raw.get("theme") or "").strip().lower()
+            if th in ("ramp", "cyan", "mint", "amber", "crimson", "violet"):
+                self.theme = th
+        except Exception:
+            pass
+
+    def update_settings(self, full_mm=None, theme=None, save=True):
+        with self.lock:
+            if full_mm is not None:
+                try:
+                    fm = float(full_mm)
+                    if 1.0 <= fm <= 5.0:
+                        self.full_mm = round(fm, 2)
+                except (TypeError, ValueError):
+                    pass
+            if theme is not None:
+                th = str(theme).strip().lower()
+                if th in ("ramp", "cyan", "mint", "amber", "crimson", "violet"):
+                    self.theme = th
+            snap = {"full_mm": self.full_mm, "theme": self.theme}
+        if save:
+            try:
+                self._write_atomic(self.settings_path, json.dumps(snap, ensure_ascii=False, indent=1))
+            except Exception:
+                pass
+        return snap
 
     # ---- mapping persistence ----------------------------------------
     def _map_paths(self):
@@ -418,6 +492,97 @@ class Engine(object):
             self.pending_bind = False
             self.bump_mapping(invalidate=True)
         self._save_mapping()
+
+    def unbind_key(self, label):
+        """Remove binding for one logical key label without resetting others."""
+        if not label:
+            return False
+        target = label_to_vk(label)
+        removed = False
+        with self.lock:
+            for idx, st in self.keys.items():
+                name = key_name(st["vk"]) if st.get("vk") else None
+                if (target is not None and st.get("vk") == target) or name == label:
+                    st["vk"] = None
+                    st["mm"] = 0.0
+                    self.press_state.pop(idx, None)
+                    removed = True
+            for idx in [k for k, v in self.mapping.items()
+                        if (target is not None and v == target) or key_name(v) == label]:
+                self.mapping.pop(idx, None)
+                removed = True
+            if target is not None:
+                self.vk_held.pop(target, None)
+                self.key_state.pop(target, None)
+            if self.pending_label == label:
+                self.pending_label = None
+            if removed:
+                self.bump_mapping()
+                self.bind_msg = "已解除 %s 绑定" % label
+        if removed:
+            self._save_mapping()
+        return removed
+
+    def set_strafe_pair(self, a, b):
+        a = (a or "").strip()
+        b = (b or "").strip()
+        if not a or not b or a == b:
+            return False
+        with self.lock:
+            self.strafe_pair = (a, b)
+            self._strafe_active.clear()
+            self._strafe_overlap_at = None
+            self._strafe_last_up = None
+            self._strafe_log.clear()
+        return True
+
+    def _update_strafe_locked(self, t, label, mm):
+        a, b = self.strafe_pair
+        if label not in (a, b):
+            return
+        other = b if label == a else a
+        now_down = mm > 0.30
+        was_down = bool(self._strafe_active.get(label, False))
+        if now_down == was_down:
+            return
+        self._strafe_active[label] = now_down
+        other_down = bool(self._strafe_active.get(other, False))
+        if now_down:
+            if other_down:
+                if self._strafe_overlap_at is None:
+                    self._strafe_overlap_at = t
+            elif self._strafe_last_up and self._strafe_last_up[0] == other:
+                gap_ms = max(0.0, (t - self._strafe_last_up[1]) * 1000.0)
+                if gap_ms <= 1200.0:
+                    self._strafe_log.append({"overlap_ms": 0.0, "gap_ms": gap_ms, "clean": True})
+                self._strafe_last_up = None
+        else:
+            if self._strafe_overlap_at is not None and other_down:
+                ov_ms = max(0.0, (t - self._strafe_overlap_at) * 1000.0)
+                self._strafe_log.append({"overlap_ms": ov_ms, "gap_ms": 0.0, "clean": ov_ms <= 15.0})
+                self._strafe_overlap_at = None
+            elif not other_down:
+                self._strafe_last_up = (label, t)
+                self._strafe_overlap_at = None
+
+    def strafe_stats(self):
+        with self.lock:
+            items = list(self._strafe_log)
+            pair = list(self.strafe_pair)
+        n = len(items)
+        if not n:
+            return {"pair": pair, "n": 0, "clean_pct": None,
+                    "avg_overlap_ms": None, "last_overlap_ms": None, "last_gap_ms": None}
+        clean = sum(1 for x in items if x["clean"])
+        last = items[-1]
+        return {
+            "pair": pair,
+            "n": n,
+            "clean_pct": round(clean * 100.0 / n),
+            "avg_overlap_ms": round(sum(x["overlap_ms"] for x in items) / n, 1),
+            "last_overlap_ms": round(last["overlap_ms"], 1),
+            "last_gap_ms": round(last["gap_ms"], 1),
+        }
 
     def bind_by_press(self):
         """Next physical key press is bound to whichever analog index moves most."""
@@ -604,6 +769,8 @@ class Engine(object):
             if (self.pending_learn is not None and st.get("vk") is None
                     and mm > 0.25 and t <= self.pending_learn[1]):
                 self.bind_index(idx, self.pending_learn[0], t)
+            if st.get("vk") is not None:
+                self._update_strafe_locked(t, key_name(st["vk"]), mm)
             ps = self.press_state.get(idx)
             if mm > 0.15:
                 if ps is None:
@@ -641,15 +808,16 @@ class Engine(object):
         t0 = time.perf_counter()
         while True:
             now = time.perf_counter()
+            full = self.full_mm
             for idx, name, period, phase in plan:
                 el = ((now - t0) + phase) % period
                 hold = period * 0.55
                 if el < 0.16:
-                    mm = FULL * (el / 0.16)
+                    mm = full * (el / 0.16)
                 elif el < hold:
-                    mm = FULL * (0.72 + 0.28 * abs(__import__("math").sin(el * 6.0)))
+                    mm = full * (0.72 + 0.28 * abs(__import__("math").sin(el * 6.0)))
                 elif el < hold + 0.14:
-                    mm = FULL * (1 - (el - hold) / 0.14)
+                    mm = full * (1 - (el - hold) / 0.14)
                 else:
                     mm = 0.0
                 with self.lock:
@@ -658,7 +826,7 @@ class Engine(object):
                         st = self.keys[idx] = {"vk": 0x41, "mm": 0.0, "count": 0, "speeds": []}
                     st["vk"] = 0x41 if name == "A" else (0x53 if name == "S"
                                                          else (0x44 if name == "D" else 0x20))
-                self.on_depth(now, idx, round(max(0.0, min(FULL, mm)), 2))
+                self.on_depth(now, idx, round(max(0.0, min(full, mm)), 2))
             time.sleep(0.01)
 
     def start_recording(self):
@@ -830,6 +998,12 @@ class Engine(object):
                     self.rec_t0 = None
 
     # ---- workbench -------------------------------------------------
+    def _safe_stamp(self, stamp):
+        s = (stamp or "").strip()
+        if not s or "/" in s or "\\" in s or ".." in s:
+            return None
+        return s
+
     def wb_manifest(self):
         base = recordings_dir()
         path = os.path.join(base, "latest.json")
@@ -841,25 +1015,105 @@ class Engine(object):
         except Exception:
             return None, base
 
-    def wb_info(self):
+    def _read_wide_meta(self, wide_path):
+        keys, dur, samples = [], 0.0, 0
+        with io.open(wide_path, encoding="utf-8") as f:
+            header = None
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                if header is None:
+                    header = [h.strip() for h in line.strip().split(",")]
+                    keys = header[2:]
+                    continue
+                samples += 1
+                dur = float(line.split(",")[0])
+        return keys, dur, samples
+
+    def _resolve_wide(self, stamp=None):
+        base = recordings_dir()
+        safe = self._safe_stamp(stamp)
+        if safe:
+            wide = os.path.join(base, safe, "wide.csv")
+            long_p = os.path.join(base, safe, "long.csv")
+            if not os.path.isfile(wide):
+                return None, base, safe, None
+            return {"stamp": safe, "wide": safe + "/wide.csv",
+                    "long": safe + "/long.csv" if os.path.isfile(long_p) else "",
+                    "created": safe}, base, safe, wide
         manifest, base = self.wb_manifest()
         if not manifest:
+            return None, base, None, None
+        wide = os.path.join(base, manifest.get("wide", ""))
+        if not os.path.isfile(wide):
+            return None, base, manifest.get("stamp"), None
+        return manifest, base, manifest.get("stamp"), wide
+
+    def wb_list(self):
+        base = recordings_dir()
+        manifest, _ = self.wb_manifest()
+        latest_stamp = manifest.get("stamp") if manifest else None
+        items = []
+        if os.path.isdir(base):
+            for name in sorted(os.listdir(base), reverse=True):
+                if name in ("exports",) or name.startswith("."):
+                    continue
+                wide = os.path.join(base, name, "wide.csv")
+                if not os.path.isfile(wide):
+                    continue
+                try:
+                    keys, dur, samples = self._read_wide_meta(wide)
+                    items.append({
+                        "stamp": name,
+                        "duration": round(dur, 3),
+                        "samples": samples,
+                        "keys": keys,
+                        "is_latest": name == latest_stamp,
+                    })
+                except Exception:
+                    continue
+        return {"ok": True, "base": base, "latest": latest_stamp, "items": items}
+
+    def wb_delete(self, stamp):
+        safe = self._safe_stamp(stamp)
+        if not safe:
+            return False, "无效的录制标识"
+        base = os.path.abspath(recordings_dir())
+        target = os.path.abspath(os.path.join(base, safe))
+        if not target.startswith(base + os.sep) or not os.path.isdir(target):
+            return False, "录制目录不存在"
+        try:
+            shutil.rmtree(target)
+        except Exception as exc:
+            return False, "删除失败：%s" % exc
+        manifest, _ = self.wb_manifest()
+        if manifest and manifest.get("stamp") == safe:
+            remaining = self.wb_list().get("items") or []
+            latest_path = os.path.join(base, "latest.json")
+            if remaining:
+                top = remaining[0]
+                new_manifest = {
+                    "stamp": top["stamp"],
+                    "samples": top["samples"],
+                    "long": top["stamp"] + "/long.csv",
+                    "wide": top["stamp"] + "/wide.csv",
+                    "created": top["stamp"],
+                }
+                self._write_atomic(latest_path, json.dumps(new_manifest, ensure_ascii=False, indent=1))
+            elif os.path.isfile(latest_path):
+                try:
+                    os.remove(latest_path)
+                except Exception:
+                    pass
+        return True, "已删除 %s" % safe
+
+    def wb_info(self, stamp=None):
+        manifest, base, _, wide = self._resolve_wide(stamp)
+        if not manifest or not wide:
             return {"ok": False, "error": "\u8fd8\u6ca1\u6709\u5f55\u5236",
                     "base": base}
-        wide = os.path.join(base, manifest.get("wide", ""))
-        keys, dur, samples = [], 0.0, 0
         try:
-            with io.open(wide, encoding="utf-8") as f:
-                header = None
-                for line in f:
-                    if line.startswith("#"):
-                        continue
-                    if header is None:
-                        header = [h.strip() for h in line.strip().split(",")]
-                        keys = header[2:]
-                        continue
-                    samples += 1
-                    dur = float(line.split(",")[0])
+            keys, dur, samples = self._read_wide_meta(wide)
         except Exception as exc:
             return {"ok": False, "error": "\u8bfb\u53d6\u5f55\u5236\u5931\u8d25\uff1a%s" % exc,
                     "base": base}
@@ -869,11 +1123,10 @@ class Engine(object):
                 "wide": manifest.get("wide"), "long": manifest.get("long"),
                 "integrity": manifest.get("integrity")}
 
-    def wb_series(self, step=0.02, limit=1600):
-        manifest, base = self.wb_manifest()
-        if not manifest:
+    def wb_series(self, step=0.02, limit=1600, stamp=None):
+        manifest, _, _, wide = self._resolve_wide(stamp)
+        if not manifest or not wide:
             return {"ok": False, "error": "no recording"}
-        wide = os.path.join(base, manifest.get("wide", ""))
         rows = []
         keys = []
         try:
@@ -893,7 +1146,7 @@ class Engine(object):
             return {"ok": False, "error": "empty recording"}
         stride = max(1, int(len(rows) / limit))
         rows = rows[::stride]
-        return {"ok": True, "keys": keys, "duration": rows[-1][0],
+        return {"ok": True, "stamp": manifest.get("stamp"), "keys": keys, "duration": rows[-1][0],
                 "step": round(rows[1][0] - rows[0][0], 4) if len(rows) > 1 else step,
                 "t": [round(r[0], 3) for r in rows],
                 "v": {keys[i]: [round(r[1 + i], 2) for r in rows]
@@ -928,15 +1181,16 @@ class Engine(object):
             return False, ("\u627e\u4e0d\u5230\u6e32\u67d3\u5668\uff1a\u9700\u8981 kb-frames.py \u4e0e "
                            "Pillow\u3002\u8bf7\u628a kb-frames.py \u653e\u5728 exe \u540c\u76ee\u5f55\uff0c"
                            "\u5e76\u5b89\u88c5 python -m pip install pillow")
-        manifest, base = self.wb_manifest()
-        if not manifest:
+        manifest, base, _, wide = self._resolve_wide(params.get("stamp"))
+        if not manifest or not wide:
             return False, "\u8fd8\u6ca1\u6709\u5f55\u5236"
-        wide = os.path.join(base, manifest.get("wide", ""))
         start = float(params.get("start") or 0.0)
         end = float(params.get("end") or 0.0)
         fps = int(params.get("fps") or 60)
         size = params.get("size") or "1920x1080"
         layout = params.get("layout") or "hud"
+        theme = (params.get("theme") or self.theme or "ramp").strip()
+        full_mm = float(params.get("full_mm") or self.full_mm)
         keys = [k for k in (params.get("keys") or []) if k]
         speed = float(params.get("speed") or 1.0)
         bg = (params.get("bg") or "").strip()
@@ -950,7 +1204,8 @@ class Engine(object):
             exports = base
         out_path = os.path.join(exports, out_name)
         argv = [py, kb, wide, "--fps", str(fps), "--size", size,
-                "--layout", layout, "--speed", str(speed), "-o", out_path]
+                "--layout", layout, "--theme", theme, "--full", "%.2f" % full_mm,
+                "--speed", str(speed), "-o", out_path]
         if keys:
             argv += ["--keys"] + keys
         if start > 0:
@@ -1228,6 +1483,7 @@ class Engine(object):
                 "hotkey": self.last_hotkey,
                 "hold_n": self.hold_n,
                 "quality": self.sample_quality(),
+                "strafe": self.strafe_stats(),
                 "key_events": self._key_events[-12:],
                 "suppressed": self.suppressed,
                 "watchdog_releases": self.released_by_watchdog,
@@ -1235,6 +1491,8 @@ class Engine(object):
                 "auto": self.auto,
                 "version": VERSION,
                 "token": self.token,
+                "full_mm": round(self.full_mm, 2),
+                "theme": self.theme,
                 "binding": self.pending_label,
                 "bind_msg": self.bind_msg,
                 "recording": self.recording,
@@ -1274,7 +1532,7 @@ class Engine(object):
             names = {i: (key_name(s["vk"]) if s["vk"] else "k%d" % i)
                      for i, s in self.keys.items()}
         yield "# tool=depth-live  device=ROG FALCHION ACE 75 HE (VID 0B05 PID 1C7D)\n"
-        yield "# unit=0.01mm  full=3.50mm  started=%s\n" % self.started
+        yield "# unit=0.01mm  full=%.2fmm  started=%s\n" % (self.full_mm, self.started)
         yield "t_s,wall,key,index,mm\n"
         if not rows:
             yield "# nothing recorded -- press 开始录制 first\n"
@@ -1365,8 +1623,8 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     STATE_PATHS = ("/rec/start", "/rec/stop", "/rec/clear", "/auto", "/bind",
-                   "/resetmap", "/reset", "/openfolder", "/quit",
-                   "/wb/export", "/wb/cancel")
+                   "/unbind", "/strafe", "/settings", "/resetmap", "/reset",
+                   "/openfolder", "/quit", "/wb/export", "/wb/cancel", "/wb/delete")
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1444,6 +1702,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
         if url.path == "/":
             body = page_html().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif url.path == "/overlay":
+            body = overlay_html().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1562,15 +1827,50 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif url.path == "/wb/list":
+            self._send_json(ENGINE.wb_list())
         elif url.path == "/wb/info":
-            self._send_json(ENGINE.wb_info())
+            q = parse_qs(url.query)
+            stamp = (q.get("stamp") or [None])[0]
+            self._send_json(ENGINE.wb_info(stamp=stamp))
         elif url.path == "/wb/series":
             q = parse_qs(url.query)
             step = float((q.get("step") or ["0.02"])[0] or 0.02)
+            limit = int((q.get("limit") or ["1600"])[0] or 1600)
+            stamp = (q.get("stamp") or [None])[0]
             try:
-                self._send_json(ENGINE.wb_series(step))
+                self._send_json(ENGINE.wb_series(step, limit=limit, stamp=stamp))
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)})
+        elif url.path == "/wb/viz":
+            q = parse_qs(url.query)
+            stamp = (q.get("stamp") or [None])[0]
+            start = float((q.get("start") or ["0"])[0] or 0.0)
+            end = float((q.get("end") or ["0"])[0] or 0.0)
+            theme = (q.get("theme") or ["ramp"])[0]
+            keys_q = [k for k in (q.get("keys") or [""])[0].split(",") if k]
+            html_doc = build_wb_viz_html(ENGINE, stamp=stamp, start=start, end=end,
+                                         theme=theme, keys=keys_q)
+            if html_doc is None:
+                self._send_text(404, "no recording")
+                return
+            body = html_doc.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="depth-replay-%s.html"'
+                             % (stamp or time.strftime("%Y%m%d-%H%M%S")))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif url.path == "/wb/delete":
+            raw = getattr(self, "_body", b"") or b"{}"
+            try:
+                params = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                params = {}
+            ok, msg = ENGINE.wb_delete(params.get("stamp"))
+            self._send_json({"ok": ok, "message": msg})
         elif url.path == "/wb/status":
             self._send_json(ENGINE.export_status())
         elif url.path == "/wb/cancel":
@@ -1603,11 +1903,32 @@ class Handler(BaseHTTPRequestHandler):
                 ENGINE.pending_label = label
                 ENGINE.bind_msg = ""
             body = b"ok"
-            body = b"ok"
             self.send_response(200)
             self.send_header("Content-Length", "2")
             self.end_headers()
             self.wfile.write(body)
+        elif url.path == "/unbind":
+            q = parse_qs(url.query)
+            label = (q.get("key") or [None])[0]
+            ok = ENGINE.unbind_key(label)
+            self._send_json({"ok": ok})
+        elif url.path == "/strafe":
+            q = parse_qs(url.query)
+            a = (q.get("a") or ["A"])[0]
+            b = (q.get("b") or ["D"])[0]
+            ok = ENGINE.set_strafe_pair(a, b)
+            self._send_json({"ok": ok, "pair": list(ENGINE.strafe_pair)})
+        elif url.path == "/settings":
+            q = parse_qs(url.query)
+            raw = getattr(self, "_body", b"") or b""
+            try:
+                body_obj = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:
+                body_obj = {}
+            full_v = body_obj.get("full_mm", (q.get("full_mm") or [None])[0])
+            theme_v = body_obj.get("theme", (q.get("theme") or [None])[0])
+            snap = ENGINE.update_settings(full_mm=full_v, theme=theme_v, save=True)
+            self._send_json({"ok": True, "full_mm": snap["full_mm"], "theme": snap["theme"]})
         elif url.path == "/resetmap":
             ENGINE.reset_mapping()
             body = b"ok"
@@ -1623,6 +1944,10 @@ class Handler(BaseHTTPRequestHandler):
                 ENGINE.recent.clear()
                 ENGINE.presses = 0
                 ENGINE.last_press = None
+                ENGINE._strafe_active.clear()
+                ENGINE._strafe_overlap_at = None
+                ENGINE._strafe_last_up = None
+                ENGINE._strafe_log.clear()
             body = b"ok"
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
@@ -1665,243 +1990,441 @@ class Handler(BaseHTTPRequestHandler):
 
 
 LAYOUT = [
-    ("Esc", 0, 0.0, 1), ("F1", 0, 1.4, 1), ("F2", 0, 2.4, 1), ("F3", 0, 3.4, 1),
-    ("F4", 0, 4.4, 1), ("F5", 0, 5.5, 1), ("F6", 0, 6.5, 1), ("F7", 0, 7.5, 1),
-    ("F8", 0, 8.5, 1), ("F9", 0, 9.6, 1), ("F10", 0, 10.6, 1), ("F11", 0, 11.6, 1),
-    ("F12", 0, 12.6, 1), ("Del", 0, 15.2, 1),
+    ("Esc", 0, 0.0, 1), ("F1", 0, 1.3, 1), ("F2", 0, 2.3, 1), ("F3", 0, 3.3, 1),
+    ("F4", 0, 4.3, 1), ("F5", 0, 5.55, 1), ("F6", 0, 6.55, 1), ("F7", 0, 7.55, 1),
+    ("F8", 0, 8.55, 1), ("F9", 0, 9.8, 1), ("F10", 0, 10.8, 1), ("F11", 0, 11.8, 1),
+    ("F12", 0, 12.8, 1), ("Del", 0, 14.2, 1), ("Home", 0, 15.35, 1),
     ("`", 1, 0.0, 1), ("1", 1, 1, 1), ("2", 1, 2, 1), ("3", 1, 3, 1), ("4", 1, 4, 1),
     ("5", 1, 5, 1), ("6", 1, 6, 1), ("7", 1, 7, 1), ("8", 1, 8, 1), ("9", 1, 9, 1),
-    ("0", 1, 10, 1), ("-", 1, 11, 1), ("=", 1, 12, 1), ("Bksp", 1, 13, 2),
-    ("Home", 1, 15.2, 1),
+    ("0", 1, 10, 1), ("-", 1, 11, 1), ("=", 1, 12, 1), ("Bksp", 1, 13, 2.15), ("PgUp", 1, 15.35, 1),
     ("Tab", 2, 0.0, 1.5), ("Q", 2, 1.5, 1), ("W", 2, 2.5, 1), ("E", 2, 3.5, 1),
     ("R", 2, 4.5, 1), ("T", 2, 5.5, 1), ("Y", 2, 6.5, 1), ("U", 2, 7.5, 1),
     ("I", 2, 8.5, 1), ("O", 2, 9.5, 1), ("P", 2, 10.5, 1), ("[", 2, 11.5, 1),
-    ("]", 2, 12.5, 1), ("\\\\", 2, 13.5, 1.5), ("PgUp", 2, 15.2, 1),
+    ("]", 2, 12.5, 1), ("\\", 2, 13.5, 1.65), ("PgDn", 2, 15.35, 1),
     ("Caps", 3, 0.0, 1.75), ("A", 3, 1.75, 1), ("S", 3, 2.75, 1), ("D", 3, 3.75, 1),
     ("F", 3, 4.75, 1), ("G", 3, 5.75, 1), ("H", 3, 6.75, 1), ("J", 3, 7.75, 1),
     ("K", 3, 8.75, 1), ("L", 3, 9.75, 1), (";", 3, 10.75, 1), ("'", 3, 11.75, 1),
-    ("Enter", 3, 12.75, 2.25), ("PgDn", 3, 15.2, 1),
+    ("Enter", 3, 12.75, 2.4), ("End", 3, 15.35, 1),
     ("LShift", 4, 0.0, 2.25), ("Z", 4, 2.25, 1), ("X", 4, 3.25, 1), ("C", 4, 4.25, 1),
     ("V", 4, 5.25, 1), ("B", 4, 6.25, 1), ("N", 4, 7.25, 1), ("M", 4, 8.25, 1),
-    (",", 4, 9.25, 1), (".", 4, 10.25, 1), ("/", 4, 11.25, 1), ("RShift", 4, 12.25, 2.75),
-    ("End", 4, 15.2, 1),
+    (",", 4, 9.25, 1), (".", 4, 10.25, 1), ("/", 4, 11.25, 1), ("RShift", 4, 12.25, 1.85),
+    ("\u2191", 4, 14.25, 1),
     ("LCtrl", 5, 0.0, 1.25), ("LWin", 5, 1.25, 1.25), ("LAlt", 5, 2.5, 1.25),
-    ("Space", 5, 3.75, 6.5), ("RAlt", 5, 10.25, 1.25), ("Fn", 5, 11.5, 1.25),
-    ("RCtrl", 5, 12.75, 1.25), ("\u2190", 5, 14.2, 0.9), ("\u2193", 5, 15.2, 0.9),
-    ("\u2192", 5, 16.2, 0.9),
+    ("Space", 5, 3.75, 6.25), ("RAlt", 5, 10.0, 1.05), ("Fn", 5, 11.05, 1.05),
+    ("RCtrl", 5, 12.1, 1.05), ("\u2190", 5, 13.25, 1), ("\u2193", 5, 14.25, 1),
+    ("\u2192", 5, 15.25, 1),
 ]
+
+COMMON_THEME_JS = r"""
+let FULL = 3.50;
+function setFullMm(v) {
+  const n = parseFloat(v);
+  if (!isNaN(n) && n >= 1.0 && n <= 5.0) FULL = Math.round(n * 100) / 100;
+  return FULL;
+}
+const DISPLAY = { LCtrl:'Ctrl', RCtrl:'Ctrl', LAlt:'Alt', RAlt:'Alt', LShift:'Shift', RShift:'Shift', LWin:'Win', Bksp:'Back' };
+const ALIAS = { Alt:'LAlt', Ctrl:'LCtrl', Shift:'LShift', Win:'LWin', Meta:'LWin', LMeta:'LWin', RMeta:'RWin', Backspace:'Bksp', Back:'Bksp' };
+function norm(n) { return ALIAS[n] || n; }
+function disp(n) { return DISPLAY[n] || n; }
+function smoothRamp(r) {
+  const stops = [[0.00,[56,189,248]],[0.36,[52,211,153]],[0.70,[251,191,36]],[1.00,[244,63,94]]];
+  r = Math.max(0, Math.min(1, r));
+  for (let i = 1; i < stops.length; i++) {
+    if (r <= stops[i][0]) {
+      const t = (r - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+      const f = 0.5 - 0.5 * Math.cos(Math.PI * t);
+      const a = stops[i-1][1], b = stops[i][1];
+      return [Math.round(a[0]+(b[0]-a[0])*f), Math.round(a[1]+(b[1]-a[1])*f), Math.round(a[2]+(b[2]-a[2])*f)];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+const FILL_PRESETS = {
+  ramp:    { label:'随深度平滑', acc:'#38bdf8', style: r => {
+    const [R,G,B] = smoothRamp(r), [R0,G0,B0] = smoothRamp(Math.max(0, r * 0.55));
+    return { bg:`linear-gradient(to top, rgba(${R0},${G0},${B0},0.80), rgba(${R},${G},${B},0.56))`,
+             line:`rgb(${Math.min(255,R+36)},${Math.min(255,G+36)},${Math.min(255,B+36)})`,
+             acc:`rgb(${R},${G},${B})` };
+  }},
+  cyan:    { label:'冰川青', acc:'#38bdf8', style: () => ({ bg:'linear-gradient(to top, rgba(14,165,233,0.78), rgba(56,189,248,0.52))', line:'#7dd3fc', acc:'#38bdf8' }) },
+  mint:    { label:'薄荷绿', acc:'#34d399', style: () => ({ bg:'linear-gradient(to top, rgba(16,185,129,0.78), rgba(52,211,153,0.50))', line:'#6ee7b7', acc:'#34d399' }) },
+  amber:   { label:'琥珀金', acc:'#fbbf24', style: () => ({ bg:'linear-gradient(to top, rgba(217,119,6,0.80), rgba(251,191,36,0.52))',  line:'#fde68a', acc:'#fbbf24' }) },
+  crimson: { label:'绯红',   acc:'#f43f5e', style: () => ({ bg:'linear-gradient(to top, rgba(225,29,72,0.82), rgba(244,63,94,0.54))',   line:'#fda4af', acc:'#f43f5e' }) },
+  violet:  { label:'紫罗兰', acc:'#a855f7', style: () => ({ bg:'linear-gradient(to top, rgba(126,34,206,0.80), rgba(168,85,247,0.54))', line:'#d8b4fe', acc:'#a855f7' }) }
+};
+"""
+
+
+def _layout_dicts():
+    return [{"k": k, "r": r, "x": x, "w": w} for k, r, x, w in LAYOUT]
 
 
 def page_html():
-    data = [{"k": k, "r": r, "x": x, "w": w} for k, r, x, w in LAYOUT]
-    return PAGE.replace("__LAYOUT__", json.dumps(data, ensure_ascii=False))
+    return (PAGE
+            .replace("__LAYOUT__", json.dumps(_layout_dicts(), ensure_ascii=False))
+            .replace("__THEME_JS__", COMMON_THEME_JS))
+
+
+def overlay_html():
+    return (OVERLAY_PAGE
+            .replace("__LAYOUT__", json.dumps(_layout_dicts(), ensure_ascii=False))
+            .replace("__THEME_JS__", COMMON_THEME_JS))
 
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>磁轴深度监测</title>
 <style>
-  :root { --u: 46px; --bg:#0a0d12; --panel:#111722; --edge:#1f2836;
-          --fg:#e6edf3; --dim:#7d8797; --acc:#38bdf8; }
+  :root { --u: 46px; --bg:#101215; --fg:#f4f4f5; --dim:rgba(255,255,255,0.48); --acc:#38bdf8; }
   * { box-sizing: border-box; }
-  html, body { margin:0; height:100%; background:
-      radial-gradient(1200px 600px at 20% -10%, #16202e 0%, transparent 60%),
-      radial-gradient(900px 500px at 100% 0%, #131a26 0%, transparent 55%), var(--bg);
-    color: var(--fg); font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;
-    overflow:hidden; }
-  header { display:flex; align-items:center; gap:16px; padding:14px 22px 10px; }
-  h1 { font-size:16px; font-weight:600; letter-spacing:1px; margin:0; }
-  h1 small { color:var(--dim); font-weight:400; font-size:11px; margin-left:8px; }
-  .pill { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--dim);
-          background:#0f1520; border:1px solid var(--edge); border-radius:999px;
-          padding:4px 10px; }
-  .dot { width:7px; height:7px; border-radius:50%; background:#3ddc84; }
-  .dot.off { background:#64748b; }
-  .spacer { flex:1; }
-  button { background:#16202e; color:#cbd5e1; border:1px solid var(--edge);
-           border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer;
-           font-family:inherit; }
-  button:hover { background:#1d2a3c; border-color:#2b3a4f; }
-  button.rec { border-color:#7f1d1d; background:#2a1214; color:#fca5a5; }
-  button.rec.on { background:#7f1d1d; color:#fff; border-color:#ef4444; }
-  button.tgl { border-color:#1f4f3a; background:#0f2419; color:#5eead4; }
-  button.tgl.off { border-color:#3b2b16; background:#221a0d; color:#a98a5c; }
-  #kbOff { position:absolute; inset:0; display:none; align-items:center;
-           justify-content:center; color:#3f4b5c; font-size:13px; letter-spacing:1px; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif; overflow:hidden; }
+  .num { font-variant-numeric:tabular-nums; font-family:ui-monospace,"Cascadia Mono",Consolas,monospace; }
+  #app { height:100%; display:flex; flex-direction:column; padding:14px 24px 18px; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:36px; z-index:12; }
+  .hleft, .hright { display:flex; align-items:center; gap:10px; position:relative; }
+  .dot { width:7px; height:7px; border-radius:50%; background:#34d399; transition:background .2s; }
+  .dot.off { background:#52525b; }
+  .brand { font-size:13px; font-weight:600; letter-spacing:.9px; color:rgba(255,255,255,.88); }
+  .meta-btn { background:transparent; border:none; color:var(--dim); font-size:12px; padding:4px 7px;
+              border-radius:6px; cursor:pointer; font-family:inherit; display:inline-flex; align-items:center; gap:5px; }
+  .meta-btn:hover { color:#fff; background:rgba(255,255,255,.06); }
+  .nav-sep { width:1px; height:12px; background:rgba(255,255,255,.12); margin:0 2px; }
+  .nav-link { font-size:12px; color:var(--dim); padding:4px 9px; border-radius:6px; cursor:pointer;
+              text-decoration:none; border:none; background:transparent; font-family:inherit; }
+  .nav-link:hover { color:#fff; background:rgba(255,255,255,.06); }
+  .nav-link.active { color:#fff; background:rgba(255,255,255,.10); }
+  .rec-btn { background:rgba(239,68,68,.12); border:1px solid rgba(239,68,68,.38); color:#fca5a5;
+             border-radius:7px; padding:5px 11px; font-size:12px; cursor:pointer; font-family:inherit; }
+  .rec-btn:hover { background:rgba(239,68,68,.22); }
+  .rec-btn.on { background:#dc2626; border-color:#ef4444; color:#fff; }
+  .rec-btn.pulse { animation:recPulse .8s ease-in-out infinite; }
+  @keyframes recPulse { 0%,100%{ box-shadow:0 0 0 0 rgba(239,68,68,.55); } 50%{ box-shadow:0 0 0 6px rgba(239,68,68,0); } }
+  .auto-btn { background:transparent; border:1px solid rgba(255,255,255,.14); color:var(--dim);
+              border-radius:7px; padding:5px 10px; font-size:12px; cursor:pointer; font-family:inherit; }
+  .auto-btn:hover { color:#fff; border-color:rgba(255,255,255,.28); }
+  .auto-btn.on { border-color:rgba(52,211,153,.55); color:#6ee7b7; background:rgba(16,185,129,.12); }
+
+  .pop { position:absolute; top:38px; right:0; width:276px; background:rgba(18,20,25,.96);
+         border:1px solid rgba(255,255,255,.12); border-radius:10px; padding:10px;
+         backdrop-filter:blur(14px); box-shadow:0 20px 50px rgba(0,0,0,.65); display:none; z-index:40; }
+  .pop.left { right:auto; left:0; width:268px; }
+  .pop.bottom { top:auto; bottom:34px; right:auto; left:0; width:340px; }
+  .pop.open { display:block; }
+  .pop-sec { padding:6px 4px; border-bottom:1px solid rgba(255,255,255,.07); }
+  .pop-sec:last-child { border-bottom:none; }
+  .pop-lbl { font-size:11px; color:var(--dim); margin-bottom:6px; display:flex; justify-content:space-between; align-items:center; }
+  .pop-row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .stat-grid { display:grid; grid-template-columns:1fr 1fr; gap:5px 12px; font-size:11px; color:var(--dim); }
+  .stat-grid b { color:rgba(255,255,255,.90); font-weight:600; float:right; }
+  .chip { background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.11); color:rgba(255,255,255,.78);
+          border-radius:6px; padding:4px 8px; font-size:11px; cursor:pointer; display:inline-flex; align-items:center; gap:5px; font-family:inherit; }
+  .chip:hover { background:rgba(255,255,255,.11); color:#fff; }
+  .chip.on { border-color:rgba(255,255,255,.45); background:rgba(255,255,255,.14); color:#fff; }
+  .chip .sw { width:8px; height:8px; border-radius:50%; }
+  .menu-item { width:100%; text-align:left; background:transparent; border:none; color:rgba(255,255,255,.82);
+               padding:6px 8px; border-radius:6px; font-size:12px; cursor:pointer; font-family:inherit;
+               display:flex; justify-content:space-between; align-items:center; }
+  .menu-item:hover { background:rgba(255,255,255,.08); color:#fff; }
+  .menu-item.danger { color:#fca5a5; }
+  .menu-item.danger:hover { background:rgba(239,68,68,.16); }
+  .mini-sel, .mini-in { background:rgba(255,255,255,.06); color:#fff; border:1px solid rgba(255,255,255,.14);
+                        border-radius:5px; padding:2px 6px; font-size:11px; font-family:inherit; }
+  .mini-sel option { background:#14171f; color:#f4f4f5; }
+
+  #kbc { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; position:relative; }
+  #kb { position:relative; width:calc(16.35 * var(--u)); height:calc(6 * (var(--u) + 5px) - 5px); }
+  #kbOff { position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+           color:var(--dim); font-size:13px; cursor:pointer; }
   #kbc.off #kb { display:none; }
   #kbc.off #kbOff { display:flex; }
-  #wrap { display:flex; gap:18px; padding:6px 22px 18px; height:calc(100% - 58px); }
-  #left { flex:1; display:flex; flex-direction:column; gap:14px; min-width:0; min-height:0; }
-  .card { background:linear-gradient(180deg,#121a26,#0f151f); border:1px solid var(--edge);
-          border-radius:14px; }
-  #kbc { padding:16px; display:flex; align-items:center; justify-content:center;
-         flex:1; min-height:0; overflow:hidden; }
-  #kb { position:relative; width:calc(17.1 * var(--u)); height:calc(6 * var(--u) + 40px); }
-  .k { position:absolute; border-radius:calc(var(--u) * 0.14); overflow:hidden;
-       background:linear-gradient(#1a2230,#141a25); border:1px solid #2a3444;
-       box-shadow:inset 0 1px 0 #303c50, 0 2px 8px rgba(0,0,0,.5);
-       transition:box-shadow .05s linear; }
-  .k .fill { position:absolute; left:0; right:0; bottom:0; height:0%;
-             background:#38bdf8; opacity:.88; }
-  .k .lbl { position:absolute; inset:0; display:flex; align-items:center;
-            justify-content:center; font-size:calc(var(--u) * 0.27); color:#8d99ac;
-            text-shadow:0 1px 2px #000; }
-  .k.hot .lbl { color:#fff; }
-  .k.held { border-color:#3b82f6; box-shadow: inset 0 2px 0 #3b82f6, 0 0 10px #1d4ed866; }
-  .k.held .lbl { color:#cfe4ff; }
-  #right { width:352px; display:flex; flex-direction:column; gap:12px; }
-  .card.pad { padding:14px 16px; }
-  .big { display:flex; align-items:baseline; justify-content:space-between; }
-  /* fixed height: the list grows while several keys are held, and a growing
-     card would shrink the keyboard card and move the keys up and down */
-  #livecard { flex:0 0 196px; height:196px; overflow:hidden; }
-  #livecard #bars { min-height:0; }
-  #curkey { font-size:30px; font-weight:700; letter-spacing:1px; }
-  #curmm { font-size:34px; font-weight:700; color:var(--acc); font-variant-numeric:tabular-nums; }
-  #curmm.idle { color:#48566b; }
-  .sub { font-size:11px; color:var(--dim); margin-top:2px; }
-  #bars { margin-top:8px; display:flex; flex-direction:column; gap:4px; min-height:0; }
-  .bar { display:grid; grid-template-columns:44px 1fr 62px; align-items:center; gap:8px;
-         font-size:11px; }
-  .bar b { color:#cbd5e1; font-weight:600; }
-  .bar .track { height:7px; border-radius:4px; background:#0b1017; overflow:hidden; }
-  .bar .track i { display:block; height:100%; width:0%; background:#3fb6ff; }
-  .bar span { text-align:right; color:#9aa6b6; font-variant-numeric:tabular-nums; }
-  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; font-size:12px; }
-  .grid2 div { display:flex; justify-content:space-between; color:var(--dim); }
-  .grid2 b { color:var(--fg); font-weight:600; font-variant-numeric:tabular-nums; }
-  table { width:100%; border-collapse:collapse; font-size:11px; }
-  th { text-align:left; color:#5f6b7c; font-weight:500; padding:3px 4px; }
-  td { padding:3px 4px; color:#b6c2d2; font-variant-numeric:tabular-nums; }
-  tbody tr:nth-child(odd) { background:#0e141d; }
-  #bigtip { position:fixed; left:50%%; top:50%%; transform:translate(-50%%,-50%%);
-            background:#2a1113f2; border:1px solid #7f1d1d; color:#fecaca;
-            padding:22px 34px; border-radius:16px; font-size:16px; line-height:1.6;
-            display:none; z-index:20; box-shadow:0 20px 60px #000a; text-align:center;
-            max-width:520px; }
-  #bigtip b { color:#fff; font-size:18px; }
-  button.rec.pulse { animation: recpulse .9s ease-in-out 3; }
-  @keyframes recpulse {
-    0%%,100%% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
-    50%% { box-shadow: 0 0 0 6px rgba(239,68,68,.35); }
-  }
+
+  .k { position:absolute; border-radius:calc(var(--u) * 0.125); overflow:hidden;
+       background:rgba(14,16,20,.68); border:1px solid rgba(255,255,255,.13);
+       backdrop-filter:blur(8px); cursor:pointer; user-select:none;
+       transition:transform .05s linear, border-color .08s linear; }
+  .k .fill { position:absolute; left:0; right:0; bottom:0; height:0%; pointer-events:none; }
+  .k .lbl { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+            font-size:calc(var(--u) * 0.24); font-weight:600; color:rgba(255,255,255,.72);
+            text-shadow:0 1px 2px rgba(0,0,0,.65); pointer-events:none; }
+  .k.hot .lbl { color:#fff; text-shadow:0 1px 3px rgba(0,0,0,.8); }
+  .k .mm { position:absolute; right:4px; bottom:3px; z-index:2; font-size:calc(var(--u) * 0.17);
+           color:rgba(255,255,255,.9); text-shadow:0 1px 2px rgba(0,0,0,.75);
+           opacity:0; pointer-events:none; }
+  .k.hot .mm { opacity:1; }
+  body.hide-mm .k .mm { display:none; }
+  .k.dim { opacity:.42; }
+  .k.held { border-bottom:2px solid rgba(255,255,255,.48); }
+  .k.held .lbl { color:rgba(255,255,255,.92); }
+  .k.binding { border-style:dashed; border-color:rgba(251,191,36,.95); opacity:1; }
+
+  #hudBarWrap { display:flex; flex-wrap:wrap; align-items:flex-end; justify-content:space-between; gap:20px; padding-top:8px; }
+  .hud-left { display:flex; align-items:flex-end; gap:22px; flex-wrap:wrap; }
+  .cur-read { min-width:190px; }
+  .cur-top { display:flex; align-items:baseline; gap:10px; }
+  #curkey { font-size:24px; font-weight:700; min-width:30px; }
+  #curmm { font-size:30px; font-weight:600; color:var(--acc); line-height:1; }
+  #curmm.idle { color:rgba(255,255,255,.28); }
+  .ruler { margin-top:8px; width:190px; height:3px; background:rgba(255,255,255,.10); position:relative; overflow:hidden; }
+  .ruler .trig { position:absolute; top:0; bottom:0; width:1px; background:rgba(251,191,36,.75); left:11.4%; z-index:2; }
+  .ruler .bar { height:100%; width:0%; background:var(--acc); transition:width .05s linear; }
+  .metrics { display:flex; align-items:center; gap:16px; padding-left:20px; border-left:1px solid rgba(255,255,255,.10);
+             font-size:12px; color:var(--dim); position:relative; flex-wrap:wrap; }
+  .metrics b { color:rgba(255,255,255,.92); font-weight:600; margin-left:4px; }
+  .scope-wrap { position:relative; background:rgba(255,255,255,.025); border:1px solid rgba(255,255,255,.08);
+                border-radius:8px; padding:4px 6px; }
+  #scope { display:block; width:340px; height:56px; }
+
+  body.pure header, body.pure #hudBarWrap { opacity:0; pointer-events:none; }
+  body.pure #pureExit { display:inline-flex; }
+  #pureExit { position:fixed; right:16px; top:12px; display:none; z-index:30; opacity:.35; }
+  #pureExit:hover { opacity:1; }
+
   #toast { position:fixed; left:50%; top:14px; transform:translateX(-50%);
-           background:#1b2432ee; border:1px solid #33415a; color:#e6edf3;
-           padding:8px 16px; border-radius:999px; font-size:13px; display:none;
-           z-index:9; }
-  .k.binding { border-color:#fbbf24 !important; box-shadow:0 0 0 2px #fbbf2488, inset 0 1px 0 #303c50; }
+           background:rgba(20,23,29,.94); border:1px solid rgba(255,255,255,.15); color:#f4f4f5;
+           padding:7px 14px; border-radius:999px; font-size:12px; display:none; align-items:center; gap:10px; z-index:50;
+           backdrop-filter:blur(10px); }
+  #bigtip { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+            background:rgba(36,16,18,.95); border:1px solid rgba(239,68,68,.45); color:#fecaca;
+            padding:20px 30px; border-radius:14px; font-size:14px; line-height:1.6;
+            display:none; z-index:60; box-shadow:0 20px 60px rgba(0,0,0,.7); text-align:center; max-width:480px; }
+  #bigtip b { color:#fff; font-size:16px; }
   #staleTip { display:none; position:fixed; left:50%; top:14px; transform:translateX(-50%);
-              background:#2a1113f2; border:1px solid #7f1d1d; color:#fecaca;
-              padding:10px 16px; border-radius:10px; font-size:13px; z-index:30; }
-  #hint { position:fixed; right:20px; bottom:12px; font-size:11px; color:#3c4a5d; }
+              background:rgba(42,17,19,.95); border:1px solid #7f1d1d; color:#fecaca;
+              padding:9px 16px; border-radius:10px; font-size:12px; z-index:55; }
+  table { width:100%; border-collapse:collapse; font-size:11px; }
+  th { text-align:left; color:var(--dim); font-weight:500; padding:4px; border-bottom:1px solid rgba(255,255,255,.08); }
+  td { padding:4px; color:rgba(255,255,255,.86); }
 </style></head>
 <body>
-<header>
-  <h1>ROG FALCHION ACE 75 HE<small data-v="1">磁轴深度实时监测</small></h1>
-  <div class="pill"><span class="dot" id="dot"></span><span id="conn">连接中</span></div>
-  <div class="pill">深度 <b id="dr" style="color:#cbd5e1">0</b>/s</div>
-  <div class="pill">事件 <b id="er" style="color:#cbd5e1">0</b>/s</div>
-  <div class="pill">按压 <b id="pc" style="color:#cbd5e1">0</b> 次</div>
-  <div class="pill">按住 <b id="heldList" style="color:#7dd3fc">—</b></div>
-  <div class="spacer"></div>
-  <button id="kbToggle" class="tgl" onclick="toggleKb()">键盘渲染 ●</button>
-  <button id="autoBtn" onclick="toggleAuto(); this.blur()">自动录制</button>
-  <button id="recBtn" class="rec" onclick="toggleRec(); this.blur()">● 开始录制</button>
-  <div class="pill" id="recPill" style="display:none">已录 <b id="recInfo" style="color:#fca5a5">0</b></div>
-  <button onclick="downloadIfRecorded('/export/long')">导出长表</button>
-  <button onclick="showTip('点击键盘上的某个键，再按一下对应的物理键，即可建立映射')">绑定说明</button>
-  <button onclick="api('/resetmap').then(()=>location.reload())">重新识别</button>
-  <select id="rate" title="宽表采样率" style="background:#16202e;color:#cbd5e1;border:1px solid #1f2836;border-radius:8px;padding:6px 8px;font-size:12px">
-    <option value="100">100 Hz</option><option value="50">50 Hz</option><option value="25">25 Hz</option>
-  </select>
-  <button onclick="downloadIfRecorded('/export/wide?rate=' + document.getElementById('rate').value)">导出宽表</button>
-  <button onclick="window.open('/wb','_blank')" style="border-color:#1f6f4a;color:#7ee2b8">素材选段</button>
-  <button id="quitBtn" onclick="quitApp()">退出程序</button>
-  <button onclick="api('/openfolder')">打开记录文件夹</button>
-  <button onclick="api('/reset').then(()=>location.reload())">清空重录</button>
-</header>
+<div id="app">
+  <header>
+    <div class="hleft">
+      <span class="dot off" id="dot"></span>
+      <span class="brand">FALCHION ACE 75 HE</span>
+      <button class="meta-btn" id="statusBtn" type="button" onclick="togglePop('popStatus', event)">
+        <span id="conn">连接中</span><span class="num" id="drMini">0/s</span><span>▾</span>
+      </button>
+      <div class="pop left" id="popStatus">
+        <div class="pop-sec">
+          <div class="pop-lbl"><span>采样质量</span><span class="num" id="ver">—</span></div>
+          <div class="stat-grid">
+            <div>实际<b class="num" id="q_rate">—</b></div>
+            <div>平均<b class="num" id="q_mean">—</b></div>
+            <div>P99<b class="num" id="q_p99">—</b></div>
+            <div>最大<b class="num" id="q_max">—</b></div>
+            <div>异常<b class="num" id="q_anom">0</b></div>
+            <div>中断<b class="num" id="q_drop">0</b></div>
+          </div>
+        </div>
+        <div class="pop-sec">
+          <div class="pop-lbl"><span>数据流统计</span></div>
+          <div class="stat-grid">
+            <div>深度<b class="num" id="dr">0/s</b></div>
+            <div>事件<b class="num" id="er">0/s</b></div>
+            <div>按压<b class="num" id="pc">0</b></div>
+            <div>按住<b class="num" id="heldList">—</b></div>
+          </div>
+        </div>
+      </div>
+      <span class="nav-sep"></span>
+      <span class="nav-link active">监测</span>
+      <a class="nav-link" href="/wb" target="_blank">素材工作台</a>
+      <a class="nav-link" href="/overlay?panel=1" target="_blank">OBS 覆盖层</a>
+    </div>
 
-<div id="wrap">
-  <div id="left">
-    <div class="card" id="kbc"><div id="kb"></div>
-      <div id="kbOff" onclick="toggleKb()" style="cursor:pointer">键盘渲染已关闭·点这里或右上角“键盘渲染”恢复</div></div>
-    <div class="card pad" id="livecard">
-      <div class="sub" style="margin:0 0 6px">同时按下</div>
-      <div id="bars"></div>
+    <div class="hright">
+      <button id="recBtn" class="rec-btn" type="button" onclick="toggleRec(); this.blur()">● 录制</button>
+      <button id="autoBtn" class="auto-btn" type="button" onclick="toggleAuto(); this.blur()">自动</button>
+      <button class="meta-btn" id="lookBtn" type="button" onclick="togglePop('popLook', event)">外观 ▾</button>
+      <button class="meta-btn" id="moreBtn" type="button" onclick="togglePop('popMore', event)">更多 ▾</button>
+
+      <div class="pop" id="popLook">
+        <div class="pop-sec">
+          <div class="pop-lbl"><span>深度配色</span></div>
+          <div class="pop-row" id="themeChips"></div>
+        </div>
+        <div class="pop-sec">
+          <div class="pop-lbl"><span>满程行程 (mm)</span><span class="num" id="fullLbl">3.50 mm</span></div>
+          <div class="pop-row">
+            <button class="chip full-chip" data-full="3.5" type="button" onclick="applyFullMm(3.5)">3.50</button>
+            <button class="chip full-chip" data-full="3.8" type="button" onclick="applyFullMm(3.8)">3.80</button>
+            <button class="chip full-chip" data-full="4.0" type="button" onclick="applyFullMm(4.0)">4.00</button>
+            <input id="fullIn" class="mini-in num" type="number" min="1.0" max="5.0" step="0.05" value="3.50" style="width:62px">
+            <button class="chip" type="button" onclick="applyFullMm(document.getElementById('fullIn').value)">应用</button>
+          </div>
+        </div>
+        <div class="pop-sec">
+          <div class="pop-lbl"><span>显示开关</span></div>
+          <div class="pop-row">
+            <button id="kbToggle" class="chip on" type="button" onclick="toggleKb()">键盘渲染 (K)</button>
+            <button id="mmToggle" class="chip on" type="button" onclick="toggleMm()">键帽 mm</button>
+            <button id="pureBtn" class="chip" type="button" onclick="togglePure()">纯净 (P)</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="pop" id="popMore">
+        <div class="pop-sec">
+          <div class="pop-lbl">
+            <span>导出录制</span>
+            <select id="rate" class="mini-sel" title="宽表采样率">
+              <option value="100">100 Hz</option>
+              <option value="50">50 Hz</option>
+              <option value="25">25 Hz</option>
+            </select>
+          </div>
+          <button class="menu-item" type="button" onclick="closePops(); downloadIfRecorded('/export/wide?rate=' + document.getElementById('rate').value)"><span>导出宽表 CSV</span><span style="color:var(--dim)">矩阵</span></button>
+          <button class="menu-item" type="button" onclick="closePops(); downloadIfRecorded('/export/long')"><span>导出长表 CSV</span><span style="color:var(--dim)">原始</span></button>
+          <button class="menu-item" type="button" onclick="closePops(); api('/openfolder')"><span>打开记录文件夹</span></button>
+        </div>
+        <div class="pop-sec">
+          <div class="pop-lbl"><span>急停键对</span><span class="num" id="strafeDetail">—</span></div>
+          <div class="pop-row">
+            <input id="strafeA" class="mini-in" value="A" size="3" maxlength="8">
+            <span style="color:var(--dim)">/</span>
+            <input id="strafeB" class="mini-in" value="D" size="3" maxlength="8">
+            <button class="chip" type="button" onclick="applyStrafe()">应用</button>
+          </div>
+        </div>
+        <div class="pop-sec">
+          <button class="menu-item" type="button" onclick="closePops(); showTip('左键点击键帽再按物理键绑定；右键点击键帽解除单个绑定', 3600)"><span>键位绑定说明</span></button>
+          <button class="menu-item" type="button" onclick="closePops(); api('/resetmap').then(()=>location.reload())"><span>重新识别全部键位</span></button>
+          <button class="menu-item" type="button" onclick="closePops(); api('/reset').then(()=>location.reload())"><span>清空统计与重录</span></button>
+        </div>
+        <div class="pop-sec">
+          <button class="menu-item danger" type="button" onclick="closePops(); quitApp()"><span>退出程序</span><span style="font-size:11px">自动存盘</span></button>
+        </div>
+      </div>
     </div>
+  </header>
+
+  <div id="kbc">
+    <div id="kb"></div>
+    <div id="kbOff" onclick="toggleKb()">键盘渲染已关闭 · 点这里或按 K 键恢复</div>
   </div>
-  <div id="right">
-    <div class="card pad">
-      <div class="big"><div id="curkey">—</div><div id="curmm" class="idle">0.00</div></div>
-      <div class="sub">当前最深按键 / 深度（mm）</div>
-    </div>
-    <div class="card pad">
-      <div class="sub" style="margin:0 0 8px">本次按压</div>
-      <div class="grid2">
-        <div>触发点 <b id="s_down">—</b></div><div>复位点 <b id="s_up">—</b></div>
-        <div>RT 距离 <b id="s_rt">—</b></div><div>峰值 <b id="s_peak">—</b></div>
-        <div>上升 <b id="s_rise">—</b></div><div>下降 <b id="s_fall">—</b></div>
+
+  <div id="hudBarWrap">
+    <div class="hud-left">
+      <div class="cur-read">
+        <div class="cur-top">
+          <div id="curkey">—</div>
+          <div id="curmm" class="num idle">0.00</div>
+        </div>
+        <div class="ruler"><div class="trig"></div><div class="bar" id="curbar"></div></div>
+      </div>
+      <div class="metrics">
+        <span>触发<b class="num" id="s_down">—</b></span>
+        <span>复位<b class="num" id="s_up">—</b></span>
+        <span>RT<b class="num" id="s_rt">—</b></span>
+        <span>峰值<b class="num" id="s_peak">—</b></span>
+        <span>上升<b class="num" id="s_rise">—</b></span>
+        <span>急停<b class="num" id="s_strafe">—</b></span>
+        <button class="meta-btn" type="button" onclick="togglePop('popRecent', event)">最近 ▾</button>
+        <div class="pop bottom" id="popRecent">
+          <div class="pop-lbl"><span>最近按压</span><span style="font-size:10px">Ctrl+Alt+R 录制 · S 存盘</span></div>
+          <table>
+            <thead><tr><th>键</th><th>峰值</th><th>上升</th><th>速度</th><th>RT</th></tr></thead>
+            <tbody id="rec"></tbody>
+          </table>
+        </div>
       </div>
     </div>
-    <div class="card pad">
-      <div class="sub" style="margin:0 0 8px">采样质量</div>
-      <div class="grid2">
-        <div>实际 <b id="q_rate">—</b></div><div>平均间隔 <b id="q_mean">—</b></div>
-        <div>P99 <b id="q_p99">—</b></div><div>最大 <b id="q_max">—</b></div>
-        <div>异常间隔 <b id="q_anom">—</b></div><div>中断 <b id="q_drop">—</b></div>
-      </div>
-    </div>
-    <div class="card pad" style="flex:1; overflow:hidden">
-      <div class="sub" style="margin:0 0 6px">最近按压</div>
-      <table><thead><tr><th>键</th><th>峰值</th><th>上升</th><th>速度</th><th>RT</th></tr></thead>
-        <tbody id="rec"></tbody></table>
+    <div class="scope-wrap">
+      <canvas id="scope"></canvas>
     </div>
   </div>
 </div>
+
+<button id="pureExit" class="chip" type="button" onclick="togglePure(false)">退出纯净 (P)</button>
 <div id="bigtip"></div>
 <div id="toast"></div>
 <div id="staleTip">数据流已断开（服务端没在推快照），按住状态已重置 —— 刷新页面或检查程序是否还在运行</div>
-<div id="hint">Ctrl+Alt+R 开始/停止录制 · Ctrl+Alt+S 保存到「文档\depth-recordings」 · 数据约 100 帧/秒</div>
 
 <script>
 const LAYOUT = __LAYOUT__;
+__THEME_JS__
+
+let themeId = 'ramp';
+let srvSynced = false;
+try {
+  const savedTheme = localStorage.getItem('depthTheme');
+  if (savedTheme && FILL_PRESETS[savedTheme]) themeId = savedTheme;
+  const savedFull = localStorage.getItem('depthFullMm');
+  if (savedFull) setFullMm(savedFull);
+} catch (e) {}
+function activePreset() { return FILL_PRESETS[themeId] || FILL_PRESETS.ramp; }
+function syncFullUI() {
+  const lbl = document.getElementById('fullLbl');
+  if (lbl) lbl.textContent = FULL.toFixed(2) + ' mm';
+  const inp = document.getElementById('fullIn');
+  if (inp && document.activeElement !== inp) inp.value = FULL.toFixed(2);
+  document.querySelectorAll('.full-chip').forEach(b => {
+    b.classList.toggle('on', Math.abs(parseFloat(b.dataset.full) - FULL) < 0.01);
+  });
+  const trig = document.querySelector('.ruler .trig');
+  if (trig) trig.style.left = Math.min(95, (0.4 / FULL) * 100).toFixed(1) + '%';
+}
+function saveSettings(patch) {
+  if (typeof api !== 'function') return;
+  fetch('/settings', {
+    method: 'POST',
+    headers: { 'X-Depth-Token': window.__token || '' },
+    body: JSON.stringify(patch)
+  }).catch(() => {});
+}
+function applyFullMm(v, persist) {
+  const prev = FULL;
+  setFullMm(v);
+  try { localStorage.setItem('depthFullMm', FULL.toFixed(2)); } catch (e) {}
+  syncFullUI();
+  if (typeof lastRatio === 'object') Object.keys(lastRatio).forEach(k => delete lastRatio[k]);
+  if (persist !== false && Math.abs(FULL - prev) > 0.001) {
+    saveSettings({ full_mm: FULL });
+    if (typeof showTip === 'function') showTip('满程已设为 ' + FULL.toFixed(2) + ' mm');
+  }
+}
+function setTheme(id, persist) {
+  if (!FILL_PRESETS[id]) return;
+  themeId = id;
+  try { localStorage.setItem('depthTheme', id); } catch (e) {}
+  document.documentElement.style.setProperty('--acc', activePreset().acc);
+  const tc = document.getElementById('themeChips');
+  if (tc) {
+    for (const ch of tc.children) ch.classList.toggle('on', ch.dataset.theme === themeId);
+  }
+  if (typeof lastRatio === 'object') Object.keys(lastRatio).forEach(k => delete lastRatio[k]);
+  if (persist !== false) saveSettings({ theme: id });
+}
+document.documentElement.style.setProperty('--acc', activePreset().acc);
+
 const kb = document.getElementById('kb');
 const els = {};
 for (const k of LAYOUT) {
   const d = document.createElement('div');
   d.className = 'k';
   d.style.left = 'calc(' + k.x + ' * var(--u))';
-  d.style.top = 'calc(' + k.r + ' * (var(--u) + 6px))';
+  d.style.top = 'calc(' + k.r + ' * (var(--u) + 5px))';
   d.style.width = 'calc(' + k.w + ' * var(--u) - 5px)';
   d.style.height = 'calc(var(--u) - 5px)';
-  d.innerHTML = '<div class="fill"></div><div class="lbl">' + k.k + '</div>';
-  d.style.cursor = 'pointer';
-  d.title = '点击后按一下对应的物理键';
+  d.innerHTML = '<div class="fill"></div><div class="lbl">' + disp(k.k) + '</div><div class="mm num"></div>';
+  d.title = '左键点击绑定物理键 · 右键解除绑定';
   d.addEventListener('click', () => {
     api('/bind?key=' + encodeURIComponent(k.k));
     showTip('请按一下物理键：' + k.k);
   });
+  d.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    api('/unbind?key=' + encodeURIComponent(k.k))
+      .then(r => r.json())
+      .then(j => showTip(j.ok ? ('已解除绑定：' + k.k) : (k.k + ' 当前未绑定')));
+  });
   kb.appendChild(d);
-  els[k.k] = { box: d, fill: d.firstChild };
+  els[k.k] = { box: d, fill: d.children[0], mm: d.children[2] };
 }
-const FULL = 3.50;
-const ALIAS = { Alt: 'LAlt', Ctrl: 'LCtrl', Shift: 'LShift', Win: 'LWin', Meta: 'LWin',
-                LMeta: 'LWin', RMeta: 'RWin' };
-function norm(n) { return ALIAS[n] || n; }
 let live = {}, idxName = {}, nameIdx = {}, shown = {}, stats = null, recent = [];
 let rate = [0, 0], presses = 0, connected = false;
-
-function color(r) {
-  const stops = [[0,56,189,248],[.35,52,211,153],[.7,250,204,21],[1,248,113,113]];
-  for (let i = 1; i < stops.length; i++) {
-    if (r <= stops[i][0]) {
-      const a = stops[i-1], b = stops[i], f = (r - a[0]) / (b[0] - a[0]);
-      return 'rgb(' + Math.round(a[1]+(b[1]-a[1])*f) + ',' + Math.round(a[2]+(b[2]-a[2])*f) +
-             ',' + Math.round(a[3]+(b[3]-a[3])*f) + ')';
-    }
-  }
-  return 'rgb(248,113,113)';
-}
+function color(r) { return activePreset().style(r).acc; }
 
 let rec = { on: false, n: 0, dur: 0 };
 let autoMode = false;
@@ -1927,15 +2450,77 @@ function startDraw() {
   drawing = true;
   requestAnimationFrame(draw);
 }
+let mmOn = true;
+try { mmOn = localStorage.getItem('depthMmOn') !== '0'; } catch (e) {}
+let pureMode = false;
+
 function applyKbState() {
   const btn = document.getElementById('kbToggle');
-  btn.textContent = '\u952e\u76d8\u6e32\u67d3 ' + (kbOn ? '\u25cf' : '\u25cb');
-  btn.classList.toggle('off', !kbOn);
-  document.getElementById('kbc').classList.toggle('off', !kbOn);
+  if (btn) btn.classList.toggle('on', kbOn);
+  const kbc = document.getElementById('kbc');
+  if (kbc) kbc.classList.toggle('off', !kbOn);
+}
+function applyMmState() {
+  document.body.classList.toggle('hide-mm', !mmOn);
+  const btn = document.getElementById('mmToggle');
+  if (btn) btn.classList.toggle('on', mmOn);
+}
+function toggleMm() {
+  mmOn = !mmOn;
+  try { localStorage.setItem('depthMmOn', mmOn ? '1' : '0'); } catch (e) {}
+  applyMmState();
+}
+function togglePure(force) {
+  pureMode = (typeof force === 'boolean') ? force : !pureMode;
+  document.body.classList.toggle('pure', pureMode);
+  const btn = document.getElementById('pureBtn');
+  if (btn) btn.classList.toggle('on', pureMode);
+  closePops();
+  fitUnits();
+}
+function closePops() {
+  document.querySelectorAll('.pop.open').forEach(p => p.classList.remove('open'));
+}
+function togglePop(id, ev) {
+  if (ev) ev.stopPropagation();
+  const target = document.getElementById(id);
+  if (!target) return;
+  const wasOpen = target.classList.contains('open');
+  closePops();
+  if (!wasOpen) target.classList.add('open');
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('.pop')) closePops();
+});
+function initLookControls() {
+  const tc = document.getElementById('themeChips');
+  if (tc && !tc.children.length) {
+    for (const id in FILL_PRESETS) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chip' + (id === themeId ? ' on' : '');
+      b.dataset.theme = id;
+      b.innerHTML = '<span class="sw" style="background:' + FILL_PRESETS[id].acc + '"></span>' + FILL_PRESETS[id].label;
+      b.addEventListener('click', () => setTheme(id));
+      tc.appendChild(b);
+    }
+  }
+  applyMmState();
+}
+function applyStrafe() {
+  const a = (document.getElementById('strafeA').value || '').trim();
+  const b = (document.getElementById('strafeB').value || '').trim();
+  if (!a || !b || a === b) { showTip('请输入两个不同的按键名'); return; }
+  api('/strafe?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b))
+    .then(r => r.json())
+    .then(j => {
+      if (j.ok) showTip('急停键对已切换：' + j.pair.join(' / '));
+      else showTip('无效的急停键对');
+    });
 }
 function showTip(text, ms) {
   const t = document.getElementById('toast');
-  t.textContent = text; t.style.display = 'block';
+  t.textContent = text; t.style.display = 'flex';
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { t.style.display = 'none'; }, ms || 2600);
 }
@@ -1994,22 +2579,35 @@ function bindNow() {
     document.getElementById('conn').textContent = '请按下想绑定的物理按键…';
   });
 }
+let strafe = null;
 const es = new EventSource('/events');
 es.onmessage = ev => {
   lastMsg = Date.now();
   const m = JSON.parse(ev.data);
-  if (m.s) for (const p of m.s) live[p[1]] = p[2];
+  if (m.live) for (const i in m.live) live[i] = m.live[i];
+  if (m.s) {
+    for (const p of m.s) live[p[1]] = p[2];
+    if (typeof pushScopeSamples === 'function') pushScopeSamples(m.s);
+  }
   if (m.k) {
     idxName = m.k; nameIdx = {};
     for (const i in m.k) if (m.k[i]) nameIdx[norm(m.k[i])] = i;
   }
-  rate = m.rate; presses = m.presses; connected = m.conn;
+  rate = m.rate || [0, 0]; presses = m.presses || 0; connected = !!m.conn;
   if (m.st) stats = m.st;
   if (m.rec) recent = m.rec;
+  if (m.strafe) {
+    strafe = m.strafe;
+    const aEl = document.getElementById('strafeA'), bEl = document.getElementById('strafeB');
+    if (strafe.pair && aEl && bEl && document.activeElement !== aEl && document.activeElement !== bEl) {
+      aEl.value = strafe.pair[0] || 'A';
+      bEl.value = strafe.pair[1] || 'D';
+    }
+  }
   if (m.held) {
     held = new Set(m.held.map(norm));
     const hl = document.getElementById('heldList');
-    if (hl) hl.textContent = held.size ? Array.from(held).join(' ') : '—';
+    if (hl) hl.textContent = held.size ? Array.from(held).map(disp).join(' ') : '—';
   }
   if (m.binding !== undefined) {
     if (m.binding && m.binding !== binding) showTip('\u8bf7\u6309\u4e00\u4e0b\u7269\u7406\u952e：' + m.binding);
@@ -2022,6 +2620,14 @@ es.onmessage = ev => {
     bigTip(m.notice, 3500);
   }
   if (m.token) window.__token = m.token;
+  if (!srvSynced) {
+    srvSynced = true;
+    if (m.full_mm) applyFullMm(m.full_mm, false);
+    if (m.theme && FILL_PRESETS[m.theme]) setTheme(m.theme, false);
+  } else {
+    if (m.full_mm && Math.abs(m.full_mm - FULL) > 0.005) applyFullMm(m.full_mm, false);
+    if (m.theme && m.theme !== themeId && FILL_PRESETS[m.theme]) setTheme(m.theme, false);
+  }
   if (m.quality) {
     const q = m.quality;
     const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
@@ -2033,8 +2639,8 @@ es.onmessage = ev => {
     set('q_drop', q.dropouts);
   }
   if (m.version) {
-    const small = document.querySelector('h1 small');
-    if (small) small.textContent = '\u78c1\u8f74\u6df1\u5ea6\u5b9e\u65f6\u76d1\u6d4b v' + m.version;
+    const vEl = document.getElementById('ver');
+    if (vEl) vEl.textContent = 'v' + m.version;
   }
   autoMode = !!m.auto;
   const ab = document.getElementById('autoBtn');
@@ -2042,71 +2648,65 @@ es.onmessage = ev => {
   rec.on = !!m.recording; rec.n = m.rec_n || 0; rec.dur = m.rec_dur || 0;
 };
 
-const bars = document.getElementById('bars');
-function renderBars() {
-  const active = Object.keys(live).map(i => [i, live[i]]).filter(x => x[1] > 0.03)
-    .sort((a, b) => b[1] - a[1]).slice(0, 4);
-  const seen = new Set(active.map(a => idxName[a[0]]));
-  for (const name of held) {
-    if (!seen.has(name) && active.length < 5 && els[name]) active.push([null, 0, name]);
-  }
-  bars.innerHTML = active.map(([i, mm, nmName]) => {
-    const nm = nmName || norm(idxName[i]) || ('#' + i);
-    if (i === null) {
-      return '<div class="bar"><b>' + nm + '</b><div class="track"><i style="width:0%"></i></div>' +
-             '<span>\u6309\u4e0b</span></div>';
-    }
-    const pct = Math.min(100, mm / FULL * 100);
-    const c = color(mm / FULL);
-    return '<div class="bar"><b>' + nm + '</b><div class="track"><i style="width:' +
-      pct.toFixed(1) + '%;background:' + c + '"></i></div><span>' + mm.toFixed(2) +
-      ' mm</span></div>';
-  }).join('') || '<div class="sub">按下按键开始测量</div>';
-}
-
 function fmt(v, unit) { return v === null || v === undefined ? '—' : (v + unit); }
 
 function renderPanel() {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
   let best = 0, bestName = '—';
   for (const i in live) if (live[i] > best) { best = live[i]; bestName = idxName[i] || ('#' + i); }
-  document.getElementById('curkey').textContent = bestName;
+  set('curkey', bestName === '—' ? '—' : disp(norm(bestName)));
   const cm = document.getElementById('curmm');
-  cm.textContent = best.toFixed(2);
-  cm.className = best > 0.03 ? '' : 'idle';
-  document.getElementById('dot').className = connected ? 'dot' : 'dot off';
-  document.getElementById('conn').textContent = connected ? '已连接' : '等待设备';
+  const cb = document.getElementById('curbar');
+  const rBest = Math.max(0, Math.min(1, best / FULL));
+  const stBest = activePreset().style(rBest);
+  if (cm) {
+    cm.textContent = best.toFixed(2);
+    cm.className = best > 0.03 ? 'num' : 'num idle';
+    cm.style.color = best > 0.03 ? stBest.acc : '';
+  }
+  if (cb) {
+    cb.style.width = (rBest * 100).toFixed(1) + '%';
+    cb.style.background = stBest.acc;
+  }
+  const dot = document.getElementById('dot');
+  if (dot) dot.className = connected ? 'dot' : 'dot off';
+  set('conn', connected ? '已连接' : '等待设备');
+  set('drMini', Math.round(rate[0]) + '/s');
+  set('dr', rate[0] + '/s');
+  set('er', rate[1] + '/s');
+  set('pc', presses);
+
   const rb = document.getElementById('recBtn');
-  const pill = document.getElementById('recPill');
-  const info = document.getElementById('recInfo');
-  if (rec.on) {
-    rb.textContent = '■ 停止录制';
-    rb.classList.add('on');
-    pill.style.display = '';
-    info.textContent = rec.dur.toFixed(1) + ' s · ' + rec.n + ' 点';
-  } else {
-    rb.textContent = '● 开始录制';
-    rb.classList.remove('on');
-    if (rec.n > 0) {
-      pill.style.display = '';
-      info.textContent = rec.n + ' 点（已停止）';
+  if (rb) {
+    if (rec.on) {
+      rb.textContent = '■ 停止 ' + rec.dur.toFixed(1) + 's · ' + rec.n;
+      rb.classList.add('on');
     } else {
-      pill.style.display = 'none';
+      rb.textContent = rec.n > 0 ? ('● 录制 (' + rec.n + ')') : '● 录制';
+      rb.classList.remove('on');
     }
   }
-  document.getElementById('dr').textContent = rate[0];
-  document.getElementById('er').textContent = rate[1];
-  document.getElementById('pc').textContent = presses;
+
   const s = stats || {};
-  document.getElementById('s_down').textContent = fmt(s.down, ' mm');
-  document.getElementById('s_up').textContent = fmt(s.up, ' mm');
-  document.getElementById('s_rt').textContent = fmt(s.rt, ' mm');
-  document.getElementById('s_peak').textContent = fmt(s.peak, ' mm');
-  document.getElementById('s_rise').textContent = fmt(s.rise, ' ms');
-  document.getElementById('s_fall').textContent = fmt(s.fall, ' ms');
-  document.getElementById('rec').innerHTML = recent.map(r =>
-    '<tr><td>' + r[0] + '</td><td>' + r[1].toFixed(2) + '</td><td>' + r[2] + ' ms</td><td>' +
-    r[3] + ' mm/s</td><td>' + (r[4] === null ? '—' : r[4].toFixed(2)) + '</td></tr>').join('');
-  renderBars();
+  set('s_down', fmt(s.down, ' mm'));
+  set('s_up', fmt(s.up, ' mm'));
+  set('s_rt', fmt(s.rt, ' mm'));
+  set('s_peak', fmt(s.peak, ' mm'));
+  set('s_rise', fmt(s.rise, ' ms'));
+  if (strafe && strafe.n > 0 && strafe.clean_pct !== null) {
+    set('s_strafe', strafe.clean_pct + '%');
+    set('strafeDetail', strafe.pair.join('/') + ' · 均值 ' + strafe.avg_overlap_ms + 'ms');
+  } else {
+    set('s_strafe', '—');
+    set('strafeDetail', strafe && strafe.pair ? strafe.pair.join('/') : '—');
+  }
+  const recEl = document.getElementById('rec');
+  if (recEl) {
+    recEl.innerHTML = recent.map(r =>
+      '<tr><td>' + disp(norm(r[0])) + '</td><td class="num">' + r[1].toFixed(2) + '</td><td class="num">' + r[2] +
+      ' ms</td><td class="num">' + r[3] + '</td><td class="num">' + (r[4] === null ? '—' : r[4].toFixed(2)) + '</td></tr>'
+    ).join('') || '<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:8px">暂无按压记录</td></tr>';
+  }
 }
 
 function draw() {
@@ -2118,29 +2718,36 @@ function draw() {
     if (tipEl) tipEl.style.display = stale ? 'block' : 'none';
   }
   const heldNow = stale ? EMPTY_SET : held;
+  const preset = activePreset();
+  const hasMapped = Object.keys(nameIdx).length > 0;
 
   for (const name in els) {
     const idx = nameIdx[name];
-    const mm = (idx !== undefined) ? (live[idx] || 0) : 0;
+    const mm = (!stale && idx !== undefined) ? (live[idx] || 0) : 0;
     const r = Math.max(0, Math.min(1, mm / FULL));
     const prev = lastRatio[name];
     const isHeld = heldNow.has(name);
     const wasHeld = lastHeld[name] === true;
-    if (prev !== undefined && Math.abs(prev - r) < 0.004 &&
-        !isHeld && !wasHeld && binding !== name) {
-      continue;                          // nothing visibly changed
+    const isBind = binding === name;
+    const el = els[name];
+    el.box.classList.toggle('dim', hasMapped && idx === undefined && !isBind);
+    if (prev !== undefined && Math.abs(prev - r) < 0.003 &&
+        isHeld === wasHeld && !isBind && !el.box.classList.contains('binding')) {
+      continue;
     }
     lastRatio[name] = r;
-    lastHeld[name] = isHeld;             // a released key must repaint once
-    const el = els[name];
-    el.fill.style.height = (r * 100) + '%';
-    el.fill.style.background = color(r);
-    el.box.classList.toggle('hot', r > 0.05);
-    el.box.classList.toggle('held', isHeld && r < 0.06);
-    el.box.classList.toggle('binding', binding === name);
-    el.box.style.boxShadow = r > 0.02
-      ? '0 0 ' + (5 + r * 24).toFixed(0) + 'px ' + color(r) + ', inset 0 1px 0 #303c50'
-      : 'inset 0 1px 0 #303c50, 0 2px 8px rgba(0,0,0,.5)';
+    lastHeld[name] = isHeld;
+    const hot = r > 0.06;
+    const active = r > 0.04;
+    const st = preset.style(r);
+    el.fill.style.height = (r * 100).toFixed(1) + '%';
+    el.fill.style.background = active ? st.bg : 'transparent';
+    el.fill.style.borderTop = active ? ('1.5px solid ' + st.line) : 'none';
+    el.box.classList.toggle('hot', hot);
+    el.box.classList.toggle('held', isHeld && !hot);
+    el.box.classList.toggle('binding', isBind);
+    el.box.style.transform = active ? ('scale(' + (1 - r * 0.035).toFixed(3) + ')') : '';
+    if (el.mm) el.mm.textContent = r > 0.08 ? mm.toFixed(1) : '';
   }
   requestAnimationFrame(draw);
 }
@@ -2151,21 +2758,627 @@ setInterval(renderPanel, 90);
 // being recorded as a key. Swallow those activations on the page.
 addEventListener('keydown', e => {
   const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (e.code === 'Escape') {
+    if (document.querySelector('.pop.open')) closePops();
+    else if (pureMode) togglePure(false);
+    return;
+  }
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
   if ((e.code === 'Space' || e.code === 'Enter') &&
-      (tag === 'BUTTON' || tag === 'SELECT' || tag === 'INPUT')) {
+      (tag === 'BUTTON' || tag === 'SELECT')) {
     e.preventDefault();
   }
-  if (e.code === 'KeyK' && !e.ctrlKey && !e.altKey && !e.metaKey) toggleKb();
+  if (!e.ctrlKey && !e.altKey && !e.metaKey) {
+    if (e.code === 'KeyK') toggleKb();
+    else if (e.code === 'KeyP') togglePure();
+  }
 }, true);
+
+const SCOPE_WIN = 4.0;
+const SCOPE_COLORS = ['#38bdf8', '#34d399', '#fbbf24', '#f472b6'];
+const scopeCv = document.getElementById('scope');
+const scopeCtx = scopeCv ? scopeCv.getContext('2d') : null;
+const scopeSeries = {};
+let scopeW = 340, scopeH = 56, scopeOff = null, scopeRunning = false;
+
+function fitScope() {
+  if (!scopeCv || !scopeCtx) return;
+  const dpr = window.devicePixelRatio || 1;
+  const r = scopeCv.getBoundingClientRect();
+  scopeW = Math.max(160, Math.round(r.width || 340));
+  scopeH = Math.max(40, Math.round(r.height || 56));
+  scopeCv.width = Math.round(scopeW * dpr);
+  scopeCv.height = Math.round(scopeH * dpr);
+  scopeCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  renderScopeFrame();
+}
+
+function pushScopeSamples(batch) {
+  if (!batch || !batch.length) return;
+  const nowS = performance.now() / 1000;
+  for (const p of batch) {
+    const st = p[0], idx = String(p[1]), mm = p[2];
+    if (scopeOff === null || Math.abs((st + scopeOff) - nowS) > 0.25) scopeOff = nowS - st;
+    const t = st + scopeOff;
+    let arr = scopeSeries[idx];
+    if (!arr) arr = scopeSeries[idx] = [];
+    arr.push([t, mm]);
+  }
+  if (!scopeRunning) {
+    scopeRunning = true;
+    requestAnimationFrame(scopeLoop);
+  }
+}
+
+function renderScopeFrame() {
+  if (!scopeCtx) return false;
+  const w = scopeW, h = scopeH, padT = 11, padB = 4, plotH = h - padT - padB;
+  const nowS = performance.now() / 1000, t0 = nowS - SCOPE_WIN;
+  scopeCtx.clearRect(0, 0, w, h);
+
+  scopeCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+  scopeCtx.lineWidth = 1;
+  for (const f of [0, 0.5, 1]) {
+    const y = Math.round(padT + plotH * (1 - f)) + 0.5;
+    scopeCtx.beginPath(); scopeCtx.moveTo(0, y); scopeCtx.lineTo(w, y); scopeCtx.stroke();
+  }
+  const yTrig = Math.round(padT + plotH * (1 - 0.4 / FULL)) + 0.5;
+  scopeCtx.save();
+  scopeCtx.setLineDash([3, 3]);
+  scopeCtx.strokeStyle = 'rgba(251,191,36,0.32)';
+  scopeCtx.beginPath(); scopeCtx.moveTo(0, yTrig); scopeCtx.lineTo(w, yTrig); scopeCtx.stroke();
+  scopeCtx.restore();
+
+  const active = [];
+  for (const idx in scopeSeries) {
+    const arr = scopeSeries[idx];
+    while (arr.length > 1 && arr[1][0] < t0 - 0.2) arr.shift();
+    if (!arr.length || (arr[arr.length - 1][0] < t0 && (live[idx] || 0) <= 0.02)) {
+      delete scopeSeries[idx];
+      continue;
+    }
+    active.push([arr[arr.length - 1][0], idx, arr]);
+  }
+  active.sort((a, b) => b[0] - a[0]);
+  const top = active.slice(0, 4);
+
+  let lx = 4;
+  scopeCtx.font = '10px ui-monospace, Consolas, monospace';
+  top.forEach((entry, ci) => {
+    const idx = entry[1], arr = entry[2], col = SCOPE_COLORS[ci % SCOPE_COLORS.length];
+    scopeCtx.strokeStyle = col;
+    scopeCtx.lineWidth = 1.6;
+    scopeCtx.beginPath();
+    let started = false, lastY = padT + plotH;
+    for (let i = 0; i < arr.length; i++) {
+      const x = ((arr[i][0] - t0) / SCOPE_WIN) * w;
+      const y = padT + plotH * (1 - Math.max(0, Math.min(1, arr[i][1] / FULL)));
+      if (!started) { scopeCtx.moveTo(x, y); started = true; } else scopeCtx.lineTo(x, y);
+      lastY = y;
+    }
+    const curMm = live[idx] || 0;
+    if (started && curMm > 0.02) {
+      const cy = padT + plotH * (1 - Math.max(0, Math.min(1, curMm / FULL)));
+      scopeCtx.lineTo(w, cy);
+      lastY = cy;
+    }
+    scopeCtx.stroke();
+    if (curMm > 0.02) {
+      scopeCtx.fillStyle = col;
+      scopeCtx.beginPath(); scopeCtx.arc(w - 2, lastY, 2.3, 0, Math.PI * 2); scopeCtx.fill();
+    }
+    const nm = idxName[idx] ? disp(norm(idxName[idx])) : ('#' + idx);
+    scopeCtx.fillStyle = col;
+    scopeCtx.fillText(nm, lx, 9);
+    lx += scopeCtx.measureText(nm).width + 8;
+  });
+
+  scopeCtx.fillStyle = 'rgba(255,255,255,0.32)';
+  scopeCtx.fillText('4s', w - 16, 9);
+  return top.length > 0;
+}
+
+function scopeLoop() {
+  if (renderScopeFrame()) requestAnimationFrame(scopeLoop);
+  else scopeRunning = false;
+}
 
 function fitUnits() {
   const box = document.getElementById('kbc');
-  const u = Math.max(24, Math.min(66, Math.floor((box.clientWidth - 40) / 17.4)));
+  if (!box) return;
+  const uW = (box.clientWidth - 28) / 16.4;
+  const uH = (box.clientHeight - 20) / 6.6;
+  const u = Math.max(24, Math.min(72, Math.floor(Math.min(uW, uH))));
   document.documentElement.style.setProperty('--u', u + 'px');
 }
-addEventListener('resize', fitUnits);
+addEventListener('resize', () => { fitUnits(); fitScope(); });
+initLookControls();
+syncFullUI();
 applyKbState();
 fitUnits();
+fitScope();
+</script>
+</body></html>
+"""
+
+
+OVERLAY_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>磁轴深度 OBS 覆盖层</title>
+<style>
+  :root { --u: 58px; --gap: 6px; --op: 0.85; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent !important; overflow: hidden;
+    color: #f4f4f5;
+    font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  }
+  body.checker {
+    background:
+      linear-gradient(45deg, #1b1e26 25%, transparent 25%, transparent 75%, #1b1e26 75%),
+      linear-gradient(45deg, #1b1e26 25%, #12141a 25%, #12141a 75%, #1b1e26 75%) !important;
+    background-size: 24px 24px !important;
+    background-position: 0 0, 12px 12px !important;
+  }
+  #stage {
+    width: 100%; height: 100%; padding: 18px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #stage.align-tl { align-items: flex-start; justify-content: flex-start; }
+  #stage.align-tr { align-items: flex-start; justify-content: flex-end; }
+  #stage.align-bl { align-items: flex-end; justify-content: flex-start; }
+  #stage.align-br { align-items: flex-end; justify-content: flex-end; }
+
+  #kb { position: relative; }
+  .k {
+    position: absolute;
+    border-radius: calc(var(--u) * 0.125);
+    overflow: hidden;
+    background: rgba(14, 16, 20, var(--op));
+    border: 1px solid rgba(255, 255, 255, 0.13);
+    backdrop-filter: blur(8px);
+    user-select: none;
+    will-change: transform;
+    transition: transform 0.05s linear, border-color 0.08s linear;
+  }
+  .k .fill {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 0%;
+    pointer-events: none;
+  }
+  .k .lbl {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: calc(var(--u) * 0.24); font-weight: 600;
+    color: rgba(255, 255, 255, 0.72);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+    pointer-events: none;
+  }
+  .k.hot .lbl { color: #ffffff; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8); }
+  .k.held { border-bottom: 2px solid rgba(255, 255, 255, 0.48); }
+  .k.held .lbl { color: rgba(255, 255, 255, 0.92); }
+  .k .mm {
+    position: absolute; right: 5px; bottom: 4px; z-index: 2;
+    font-size: calc(var(--u) * 0.17); font-weight: 600; line-height: 1;
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    color: rgba(255, 255, 255, 0.9);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.75);
+    opacity: 0; pointer-events: none;
+  }
+  body.mm-0 .k .mm { display: none; }
+  body.mm-1 .k.hot .mm { opacity: 1; }
+  body.mm-always .k .mm { opacity: 0.62; }
+  body.mm-always .k.hot .mm { opacity: 1; }
+
+  #panel {
+    position: fixed; top: 14px; right: 14px; width: 296px;
+    background: rgba(16, 18, 24, 0.94);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 12px; padding: 12px 14px;
+    backdrop-filter: blur(12px);
+    box-shadow: 0 18px 46px rgba(0, 0, 0, 0.65);
+    font-size: 12px; display: none; z-index: 30;
+  }
+  #panel.open { display: block; }
+  .p-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .p-head b { font-size: 13px; letter-spacing: 0.5px; }
+  .p-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  .p-row label { color: rgba(255, 255, 255, 0.62); flex-shrink: 0; }
+  .p-row select, .p-row input[type=text] {
+    flex: 1; min-width: 0;
+    background: rgba(255, 255, 255, 0.07); color: #f4f4f5;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px; padding: 4px 7px; font-size: 12px; font-family: inherit;
+  }
+  .p-row select option { background: #14171f; color: #f4f4f5; }
+  .p-row input[type=range] { flex: 1; accent-color: #38bdf8; }
+  .p-val { width: 38px; text-align: right; color: rgba(255, 255, 255, 0.85);
+           font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 4px 0 10px; }
+  .chip {
+    background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12);
+    color: rgba(255, 255, 255, 0.80); border-radius: 6px; padding: 3px 8px;
+    font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+    font-family: inherit;
+  }
+  .chip:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
+  .chip.on { border-color: rgba(255, 255, 255, 0.55); background: rgba(255, 255, 255, 0.16); color: #fff; }
+  .chip .sw { width: 8px; height: 8px; border-radius: 50%; }
+  .p-url {
+    width: 100%; background: rgba(0, 0, 0, 0.35); color: #93c5fd;
+    border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 6px;
+    padding: 5px 7px; font-size: 11px; font-family: ui-monospace, Consolas, monospace;
+    margin-bottom: 8px;
+  }
+  .p-actions { display: flex; gap: 6px; }
+  .p-btn {
+    flex: 1; background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15);
+    color: #f4f4f5; border-radius: 7px; padding: 6px 8px; font-size: 12px; cursor: pointer;
+    font-family: inherit;
+  }
+  .p-btn:hover { background: rgba(255, 255, 255, 0.15); }
+  .p-btn.primary { background: rgba(56, 189, 248, 0.22); border-color: rgba(56, 189, 248, 0.55); color: #e0f2fe; }
+  .p-btn.primary:hover { background: rgba(56, 189, 248, 0.34); }
+  .p-hint { color: rgba(255, 255, 255, 0.42); font-size: 11px; margin-top: 8px; line-height: 1.4; }
+</style></head>
+<body>
+<div id="stage"><div id="kb"></div></div>
+
+<div id="panel">
+  <div class="p-head">
+    <b>OBS 覆盖层配置</b>
+    <button class="chip" id="pClose" type="button">关闭 (C)</button>
+  </div>
+  <div class="p-row">
+    <label for="pCluster">键簇</label>
+    <select id="pCluster">
+      <option value="hud">HUD 紧凑键簇</option>
+      <option value="wasd">WASD 极简</option>
+      <option value="full">75% 整键盘</option>
+    </select>
+  </div>
+  <div class="p-row">
+    <label for="pKeys">自定义键</label>
+    <input id="pKeys" type="text" placeholder="留空用预设，如 W,A,S,D,Space">
+  </div>
+  <div class="p-row" style="margin-bottom:4px"><label>主题</label></div>
+  <div class="chips" id="pThemes"></div>
+  <div class="p-row">
+    <label for="pScale">缩放</label>
+    <input id="pScale" type="range" min="0.4" max="3.0" step="0.05" value="1">
+    <span class="p-val" id="pScaleVal">1.00</span>
+  </div>
+  <div class="p-row">
+    <label for="pOpacity">透明度</label>
+    <input id="pOpacity" type="range" min="0.1" max="1.0" step="0.05" value="0.85">
+    <span class="p-val" id="pOpacityVal">0.85</span>
+  </div>
+  <div class="p-row">
+    <label for="pFull">满程 mm</label>
+    <input id="pFull" type="range" min="1.5" max="4.5" step="0.05" value="3.5">
+    <span class="p-val" id="pFullVal">3.50</span>
+  </div>
+  <div class="p-row">
+    <label for="pMm">mm 读数</label>
+    <select id="pMm">
+      <option value="1">按下显示</option>
+      <option value="always">常驻显示</option>
+      <option value="0">隐藏</option>
+    </select>
+  </div>
+  <div class="p-row">
+    <label for="pAlign">对齐</label>
+    <select id="pAlign">
+      <option value="center">居中</option>
+      <option value="tl">左上</option>
+      <option value="tr">右上</option>
+      <option value="bl">左下</option>
+      <option value="br">右下</option>
+    </select>
+  </div>
+  <div class="p-row">
+    <label for="pChecker">预览透明格</label>
+    <input id="pChecker" type="checkbox">
+  </div>
+  <input id="pUrl" class="p-url" type="text" readonly>
+  <div class="p-actions">
+    <button id="pCopy" class="p-btn primary" type="button">复制 OBS 链接</button>
+    <button id="pReset" class="p-btn" type="button">恢复默认</button>
+  </div>
+  <div class="p-hint">OBS 添加「浏览器」源并粘贴上方链接即可透明叠加；浏览器中按 C 键可切换此面板。</div>
+</div>
+
+<script>
+const FULL_LAYOUT = __LAYOUT__;
+__THEME_JS__
+
+const CLUSTERS = {
+  hud: [
+    {k:'Q', r:0, x:0.0, w:1.0}, {k:'W', r:0, x:1.0, w:1.0}, {k:'E', r:0, x:2.0, w:1.0}, {k:'R', r:0, x:3.0, w:1.0},
+    {k:'A', r:1, x:0.0, w:1.0}, {k:'S', r:1, x:1.0, w:1.0}, {k:'D', r:1, x:2.0, w:1.0},
+    {k:'LShift', r:2, x:0.0, w:1.35}, {k:'LCtrl', r:2, x:1.35, w:1.2}, {k:'LAlt', r:2, x:2.55, w:1.15}, {k:'Space', r:2, x:3.7, w:2.6}
+  ],
+  wasd: [
+    {k:'W', r:0, x:1.0, w:1.0},
+    {k:'A', r:1, x:0.0, w:1.0}, {k:'S', r:1, x:1.0, w:1.0}, {k:'D', r:1, x:2.0, w:1.0},
+    {k:'LAlt', r:2, x:0.0, w:1.25}, {k:'Space', r:2, x:1.25, w:2.75}
+  ],
+  full: FULL_LAYOUT
+};
+
+const LOWER_KEY_MAP = {};
+for (const item of FULL_LAYOUT) LOWER_KEY_MAP[item.k.toLowerCase()] = item.k;
+for (const alias in ALIAS) LOWER_KEY_MAP[alias.toLowerCase()] = ALIAS[alias];
+
+function clamp(v, lo, hi, def) {
+  const n = parseFloat(v);
+  return isNaN(n) ? def : Math.max(lo, Math.min(hi, n));
+}
+
+function readConfig() {
+  const q = new URLSearchParams(location.search);
+  const rawCluster = (q.get('cluster') || q.get('layout') || 'hud').toLowerCase();
+  const cluster = CLUSTERS[rawCluster] ? rawCluster : 'hud';
+  const hasThemeQ = q.has('theme');
+  const rawTheme = (q.get('theme') || 'ramp').toLowerCase();
+  const theme = FILL_PRESETS[rawTheme] ? rawTheme : 'ramp';
+  const hasFullQ = q.has('full');
+  const full = clamp(q.get('full'), 1.0, 5.0, FULL);
+  const rawMm = (q.get('mm') || '1').toLowerCase();
+  const mm = (rawMm === '0' || rawMm === 'false' || rawMm === 'off') ? '0'
+           : (rawMm === 'always' || rawMm === '2') ? 'always' : '1';
+  const rawAlign = (q.get('align') || 'center').toLowerCase();
+  const align = ['center','tl','tr','bl','br'].indexOf(rawAlign) >= 0 ? rawAlign : 'center';
+  return {
+    cluster,
+    keys: (q.get('keys') || '').trim(),
+    theme,
+    full,
+    hasThemeQ,
+    hasFullQ,
+    scale: clamp(q.get('scale'), 0.4, 3.0, 1.0),
+    opacity: clamp(q.get('opacity') !== null ? q.get('opacity') : q.get('alpha'), 0.1, 1.0, 0.85),
+    mm,
+    align,
+    panel: q.get('panel') === '1'
+  };
+}
+
+let cfg = readConfig();
+const kb = document.getElementById('kb');
+const stage = document.getElementById('stage');
+let els = {}, lastRatio = {}, lastHeld = {};
+
+function resolveItems() {
+  if (cfg.keys) {
+    const wanted = new Set();
+    for (const part of cfg.keys.split(',')) {
+      const s = part.trim();
+      if (!s) continue;
+      const mapped = LOWER_KEY_MAP[s.toLowerCase()] || norm(s);
+      wanted.add(mapped);
+    }
+    const picked = FULL_LAYOUT.filter(item => wanted.has(item.k));
+    if (picked.length) {
+      let minX = Infinity, minR = Infinity;
+      for (const it of picked) {
+        if (it.x < minX) minX = it.x;
+        if (it.r < minR) minR = it.r;
+      }
+      return picked.map(it => ({ k: it.k, r: it.r - minR, x: it.x - minX, w: it.w }));
+    }
+  }
+  return CLUSTERS[cfg.cluster] || CLUSTERS.hud;
+}
+
+function buildLayout() {
+  const items = resolveItems();
+  const baseU = cfg.cluster === 'full' && !cfg.keys ? 44 : 58;
+  const u = Math.round(baseU * cfg.scale);
+  const gap = Math.max(4, Math.round(u * 0.11));
+  document.documentElement.style.setProperty('--u', u + 'px');
+  document.documentElement.style.setProperty('--gap', gap + 'px');
+  document.documentElement.style.setProperty('--op', cfg.opacity.toFixed(2));
+
+  let maxX = 0, maxR = 0;
+  for (const it of items) {
+    if (it.x + it.w > maxX) maxX = it.x + it.w;
+    if (it.r > maxR) maxR = it.r;
+  }
+  kb.style.width = Math.max(1, Math.round(maxX * u - gap)) + 'px';
+  kb.style.height = Math.max(1, Math.round((maxR + 1) * (u + gap) - gap)) + 'px';
+
+  stage.className = 'align-' + cfg.align;
+  document.body.classList.remove('mm-0', 'mm-1', 'mm-always');
+  document.body.classList.add('mm-' + cfg.mm);
+
+  kb.innerHTML = '';
+  els = {}; lastRatio = {}; lastHeld = {};
+  for (const it of items) {
+    const d = document.createElement('div');
+    d.className = 'k';
+    d.style.left = Math.round(it.x * u) + 'px';
+    d.style.top = Math.round(it.r * (u + gap)) + 'px';
+    d.style.width = Math.max(12, Math.round(it.w * u - gap)) + 'px';
+    d.style.height = Math.max(12, Math.round(u - gap)) + 'px';
+    const fill = document.createElement('div');
+    fill.className = 'fill';
+    const lbl = document.createElement('div');
+    lbl.className = 'lbl';
+    lbl.textContent = disp(it.k);
+    const mm = document.createElement('div');
+    mm.className = 'mm';
+    mm.textContent = '0.00';
+    d.appendChild(fill);
+    d.appendChild(lbl);
+    d.appendChild(mm);
+    kb.appendChild(d);
+    els[it.k] = { box: d, fill, mm };
+  }
+}
+
+function buildObsUrl(includePanel) {
+  const p = new URLSearchParams();
+  if (cfg.cluster !== 'hud') p.set('cluster', cfg.cluster);
+  if (cfg.keys) p.set('keys', cfg.keys);
+  if (cfg.theme !== 'ramp') p.set('theme', cfg.theme);
+  if (Math.abs(cfg.full - 3.5) > 0.005) p.set('full', cfg.full.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
+  if (Math.abs(cfg.scale - 1.0) > 0.001) p.set('scale', cfg.scale.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
+  if (Math.abs(cfg.opacity - 0.85) > 0.001) p.set('opacity', cfg.opacity.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
+  if (cfg.mm !== '1') p.set('mm', cfg.mm);
+  if (cfg.align !== 'center') p.set('align', cfg.align);
+  if (includePanel) p.set('panel', '1');
+  const qs = p.toString();
+  return location.origin + '/overlay' + (qs ? ('?' + qs) : '');
+}
+
+const panelEl = document.getElementById('panel');
+const pThemes = document.getElementById('pThemes');
+for (const id in FILL_PRESETS) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'chip';
+  b.dataset.theme = id;
+  b.innerHTML = '<span class="sw" style="background:' + FILL_PRESETS[id].acc + '"></span>' + FILL_PRESETS[id].label;
+  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(); });
+  pThemes.appendChild(b);
+}
+
+function syncPanelUI() {
+  setFullMm(cfg.full);
+  document.getElementById('pCluster').value = cfg.cluster;
+  document.getElementById('pKeys').value = cfg.keys;
+  document.getElementById('pScale').value = cfg.scale;
+  document.getElementById('pScaleVal').textContent = cfg.scale.toFixed(2);
+  document.getElementById('pOpacity').value = cfg.opacity;
+  document.getElementById('pOpacityVal').textContent = cfg.opacity.toFixed(2);
+  document.getElementById('pFull').value = cfg.full;
+  document.getElementById('pFullVal').textContent = cfg.full.toFixed(2);
+  document.getElementById('pMm').value = cfg.mm;
+  document.getElementById('pAlign').value = cfg.align;
+  for (const ch of pThemes.children) ch.classList.toggle('on', ch.dataset.theme === cfg.theme);
+  document.getElementById('pUrl').value = buildObsUrl(false);
+  panelEl.classList.toggle('open', cfg.panel);
+}
+
+function applyConfig() {
+  buildLayout();
+  syncPanelUI();
+  try { history.replaceState(null, '', buildObsUrl(cfg.panel)); } catch (e) {}
+}
+
+document.getElementById('pCluster').addEventListener('change', e => { cfg.cluster = e.target.value; applyConfig(); });
+document.getElementById('pKeys').addEventListener('input', e => { cfg.keys = e.target.value.trim(); applyConfig(); });
+document.getElementById('pScale').addEventListener('input', e => { cfg.scale = parseFloat(e.target.value); applyConfig(); });
+document.getElementById('pOpacity').addEventListener('input', e => { cfg.opacity = parseFloat(e.target.value); applyConfig(); });
+document.getElementById('pFull').addEventListener('input', e => { cfg.full = parseFloat(e.target.value); cfg.hasFullQ = true; applyConfig(); });
+document.getElementById('pMm').addEventListener('change', e => { cfg.mm = e.target.value; applyConfig(); });
+document.getElementById('pAlign').addEventListener('change', e => { cfg.align = e.target.value; applyConfig(); });
+document.getElementById('pChecker').addEventListener('change', e => { document.body.classList.toggle('checker', e.target.checked); });
+document.getElementById('pClose').addEventListener('click', () => {
+  cfg.panel = false;
+  document.body.classList.remove('checker');
+  document.getElementById('pChecker').checked = false;
+  syncPanelUI();
+  try { history.replaceState(null, '', buildObsUrl(false)); } catch (e) {}
+});
+document.getElementById('pReset').addEventListener('click', () => {
+  cfg = { cluster:'hud', keys:'', theme:'ramp', full:3.5, hasThemeQ:false, hasFullQ:false, scale:1.0, opacity:0.85, mm:'1', align:'center', panel:cfg.panel };
+  applyConfig();
+});
+document.getElementById('pCopy').addEventListener('click', () => {
+  const url = buildObsUrl(false);
+  const btn = document.getElementById('pCopy');
+  const done = () => { btn.textContent = '已复制 ✓'; setTimeout(() => { btn.textContent = '复制 OBS 链接'; }, 1600); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(done, () => {
+      const inp = document.getElementById('pUrl'); inp.select(); document.execCommand('copy'); done();
+    });
+  } else {
+    const inp = document.getElementById('pUrl'); inp.select(); document.execCommand('copy'); done();
+  }
+});
+addEventListener('keydown', e => {
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+  if (e.code === 'KeyC' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+    cfg.panel = !cfg.panel;
+    if (!cfg.panel) {
+      document.body.classList.remove('checker');
+      document.getElementById('pChecker').checked = false;
+    }
+    syncPanelUI();
+    try { history.replaceState(null, '', buildObsUrl(cfg.panel)); } catch (e2) {}
+  }
+});
+
+let live = {}, nameIdx = {}, held = new Set();
+let lastMsg = Date.now();
+const EMPTY_SET = new Set();
+
+const es = new EventSource('/events');
+es.onmessage = ev => {
+  lastMsg = Date.now();
+  const m = JSON.parse(ev.data);
+  if (m.live) {
+    for (const i in m.live) live[i] = m.live[i];
+  }
+  if (m.s) {
+    for (const p of m.s) live[p[1]] = p[2];
+  }
+  if (m.k) {
+    nameIdx = {};
+    for (const i in m.k) if (m.k[i]) nameIdx[norm(m.k[i])] = i;
+  }
+  if (m.held) held = new Set(m.held.map(norm));
+  if (!cfg.hasFullQ && m.full_mm && Math.abs(m.full_mm - cfg.full) > 0.005) {
+    cfg.full = clamp(m.full_mm, 1.0, 5.0, FULL);
+    setFullMm(cfg.full);
+    lastRatio = {};
+    syncPanelUI();
+  }
+  if (!cfg.hasThemeQ && m.theme && FILL_PRESETS[m.theme] && m.theme !== cfg.theme) {
+    cfg.theme = m.theme;
+    lastRatio = {};
+    syncPanelUI();
+  }
+};
+
+function draw() {
+  const stale = Date.now() - lastMsg > 2000;
+  const heldNow = stale ? EMPTY_SET : held;
+  const preset = FILL_PRESETS[cfg.theme] || FILL_PRESETS.ramp;
+
+  for (const name in els) {
+    const idx = nameIdx[name];
+    const mm = (!stale && idx !== undefined) ? (live[idx] || 0) : 0;
+    const r = Math.max(0, Math.min(1, mm / FULL));
+    const prev = lastRatio[name];
+    const isHeld = heldNow.has(name);
+    const wasHeld = lastHeld[name] === true;
+    if (prev !== undefined && Math.abs(prev - r) < 0.003 && isHeld === wasHeld) continue;
+
+    lastRatio[name] = r;
+    lastHeld[name] = isHeld;
+    const el = els[name];
+    const st = preset.style(r);
+    const hot = r > 0.06;
+    const active = r > 0.04;
+
+    el.fill.style.height = (r * 100).toFixed(1) + '%';
+    el.fill.style.background = active ? st.bg : 'transparent';
+    el.fill.style.borderTop = active ? ('1.5px solid ' + st.line) : 'none';
+    el.box.classList.toggle('hot', hot);
+    el.box.classList.toggle('held', isHeld && !hot);
+    el.box.style.transform = active ? ('scale(' + (1 - r * 0.035).toFixed(3) + ')') : '';
+    el.mm.textContent = (cfg.mm === 'always' || r > 0.08) ? mm.toFixed(1) : '';
+  }
+  requestAnimationFrame(draw);
+}
+
+applyConfig();
+requestAnimationFrame(draw);
 </script>
 </body></html>
 """
@@ -2193,110 +3406,228 @@ def single_instance():
 
 def workbench_html():
     """Segment picker + export workbench for recorded depth data."""
-    return """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>素材选段</title>
+    return (r"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>素材工作台</title>
 <style>
-  :root { --bg:#0b1017; --card:#121a26; --edge:#1f2836; --fg:#e6edf3; --dim:#7d8797;
-          --acc:#38bdf8; --hot:#f87171; }
+  :root { --u:44px; --bg:#101215; --card:rgba(255,255,255,.03); --edge:rgba(255,255,255,.10);
+          --fg:#f4f4f5; --dim:rgba(255,255,255,.52); --acc:#38bdf8; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
-         font-family:"Microsoft YaHei UI",system-ui,sans-serif; font-size:13px; }
-  header { display:flex; align-items:center; gap:14px; padding:12px 20px; }
-  h1 { font-size:15px; margin:0; letter-spacing:1px; }
-  a { color:var(--acc); text-decoration:none; }
-  .card { background:var(--card); border:1px solid var(--edge); border-radius:12px;
-          padding:12px 14px; margin:0 16px 12px; }
+         font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif; font-size:13px; }
+  .num { font-variant-numeric:tabular-nums; font-family:ui-monospace,"Cascadia Mono",Consolas,monospace; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 20px; border-bottom:1px solid var(--edge); }
+  h1 { font-size:14px; margin:0; letter-spacing:.8px; font-weight:600; }
+  a.nav { color:var(--dim); text-decoration:none; font-size:12px; padding:4px 9px; border-radius:6px; }
+  a.nav:hover { color:#fff; background:rgba(255,255,255,.07); }
+  .wrap { max-width:1280px; margin:0 auto; padding:12px 18px 20px; display:flex; flex-direction:column; gap:12px; }
+  .card { background:var(--card); border:1px solid var(--edge); border-radius:10px; padding:12px 14px; }
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  .sub { color:var(--dim); font-size:11px; letter-spacing:1px; margin-bottom:6px; }
-  canvas { width:100%; height:260px; display:block; background:#0d141d; border-radius:8px;
-           cursor:crosshair; }
-  input, select, button { background:#16202e; color:var(--fg); border:1px solid var(--edge);
-          border-radius:7px; padding:5px 8px; font-size:12px; }
+  .sub { color:var(--dim); font-size:11px; letter-spacing:.6px; }
+  .pill { color:var(--dim); font-size:12px; }
+  .pill b { color:#e4e4e7; font-weight:600; margin-left:4px; }
+  input, select, button { background:rgba(255,255,255,.06); color:var(--fg); border:1px solid rgba(255,255,255,.14);
+          border-radius:6px; padding:5px 9px; font-size:12px; font-family:inherit; }
+  select option { background:#14171f; color:#f4f4f5; }
   button { cursor:pointer; }
-  button:hover { background:#1d2a3b; }
-  button.primary { background:#0f3d2e; border-color:#1f6f4a; color:#7ee2b8; }
-  .pill { color:var(--dim); }
-  .pill b { color:#cbd5e1; font-weight:600; }
-  #tracks { position:relative; }
-  #hint { color:#4b5563; font-size:11px; margin-top:6px; }
-  #prog { height:6px; background:#16202e; border-radius:4px; overflow:hidden; margin-top:8px; }
-  #prog i { display:block; height:100%; width:0%; background:linear-gradient(90deg,#38bdf8,#f472b6); }
+  button:hover { background:rgba(255,255,255,.12); }
+  button.primary { background:rgba(16,185,129,.18); border-color:rgba(52,211,153,.5); color:#6ee7b7; }
+  button.primary:hover { background:rgba(16,185,129,.28); }
+  button.play { background:rgba(56,189,248,.16); border-color:rgba(56,189,248,.45); color:#bae6fd; min-width:96px; }
+  button.play.on { background:rgba(244,63,94,.22); border-color:rgba(244,63,94,.55); color:#fecdd3; }
+
+  #prevStage { display:flex; align-items:center; justify-content:center; min-height:140px; padding:10px 4px; overflow:hidden; }
+  #kbPrev { position:relative; }
+  .k { position:absolute; border-radius:calc(var(--u) * 0.125); overflow:hidden;
+       background:rgba(14,16,20,.68); border:1px solid rgba(255,255,255,.13);
+       backdrop-filter:blur(8px); user-select:none; transition:transform .04s linear; }
+  .k .fill { position:absolute; left:0; right:0; bottom:0; height:0%; pointer-events:none; }
+  .k .lbl { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+            font-size:calc(var(--u) * 0.24); font-weight:600; color:rgba(255,255,255,.72);
+            text-shadow:0 1px 2px rgba(0,0,0,.65); pointer-events:none; }
+  .k.hot .lbl { color:#fff; }
+  .k .mm { position:absolute; right:4px; bottom:3px; z-index:2; font-size:calc(var(--u) * 0.17);
+           color:rgba(255,255,255,.9); text-shadow:0 1px 2px rgba(0,0,0,.75); opacity:0; pointer-events:none; }
+  .k.hot .mm { opacity:1; }
+  .k.dim { opacity:.32; }
+
+  #hoverRead { font-size:12px; color:#cbd5e1; min-height:18px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  #hoverRead .hk { background:rgba(56,189,248,.12); border:1px solid rgba(56,189,248,.3); color:#bae6fd;
+                   padding:1px 6px; border-radius:5px; font-size:11px; }
+  #tracks { position:relative; margin-top:8px; }
+  canvas { width:100%; height:264px; display:block; background:#0b0e13; border:1px solid rgba(255,255,255,.07);
+           border-radius:8px; cursor:crosshair; }
+  #hint { color:var(--dim); font-size:11px; margin-top:6px; display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+  .key-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  .kchip { display:inline-flex; align-items:center; gap:5px; padding:3px 8px; border-radius:6px; font-size:12px;
+           background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.12); color:var(--dim); cursor:pointer; user-select:none; }
+  .kchip.on { background:rgba(56,189,248,.16); border-color:rgba(56,189,248,.48); color:#e0f2fe; }
+  .kchip input { margin:0; accent-color:#38bdf8; }
+  #prog { height:5px; background:rgba(255,255,255,.07); border-radius:4px; overflow:hidden; margin-top:10px; }
+  #prog i { display:block; height:100%; width:0%; background:linear-gradient(90deg,#38bdf8,#34d399); transition:width .15s; }
   #log { color:var(--dim); font-size:11px; margin-top:6px; white-space:pre-wrap; }
+  #histDrawer { display:none; }
+  #histDrawer.open { display:block; }
+  .hist-list { display:flex; flex-direction:column; gap:6px; max-height:220px; overflow-y:auto; margin-top:8px; }
+  .hist-item { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 10px;
+               border-radius:7px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08);
+               cursor:pointer; }
+  .hist-item:hover { background:rgba(255,255,255,.07); }
+  .hist-item.on { background:rgba(56,189,248,.13); border-color:rgba(56,189,248,.48); }
+  .hist-meta { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:12px; }
+  .hist-tag { font-size:10px; padding:1px 6px; border-radius:999px; background:rgba(52,211,153,.16);
+              color:#6ee7b7; border:1px solid rgba(52,211,153,.35); }
+  .hist-keys { font-size:11px; color:var(--dim); max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  button.danger { color:#fca5a5; border-color:rgba(239,68,68,.32); background:rgba(239,68,68,.10); padding:3px 8px; font-size:11px; }
+  button.danger:hover { background:rgba(239,68,68,.22); }
 </style></head><body>
 <header>
-  <h1>素材选段</h1>
-  <span class="pill">录制 <b id="r_stamp">—</b></span>
-  <span class="pill">时长 <b id="r_dur">—</b></span>
-  <span class="pill">采样 <b id="r_n">—</b></span>
-  <span class="pill" id="r_keys">—</span>
+  <h1>素材工作台</h1>
+  <select id="recSel" class="num" title="切换历史录制" onchange="onSelectRec(this.value)">
+    <option value="">加载中…</option>
+  </select>
+  <button id="histBtn" type="button" onclick="toggleHist()">历史列表 ▾</button>
+  <button type="button" onclick="loadList(currentStamp)">刷新</button>
+  <span class="pill">时长<b id="r_dur" class="num">—</b></span>
+  <span class="pill">采样<b id="r_n" class="num">—</b></span>
+  <span id="r_stamp" style="display:none"></span>
   <span style="flex:1"></span>
-  <a href="/">← 返回监控</a>
+  <a class="nav" href="/">← 返回监测</a>
+  <a class="nav" href="/overlay?panel=1" target="_blank">OBS 覆盖层</a>
 </header>
 
-<div class="card">
-  <div class="row" style="justify-content:space-between">
-    <div class="sub" style="margin:0">磁通量时间轴（拖拽选择区间，滚轮缩放）</div>
-    <div class="row">
-      <button onclick="zoom(0.5)">放大</button>
-      <button onclick="zoom(2)">缩小</button>
-      <button onclick="resetView()">全览</button>
+<div class="wrap">
+  <div id="histDrawer" class="card">
+    <div class="row" style="justify-content:space-between">
+      <span class="sub">历史录制列表（<span id="histCount" class="num">0</span> 条）</span>
+      <button type="button" onclick="toggleHist(false)">收起</button>
+    </div>
+    <div id="histList" class="hist-list"><span class="sub">暂无录制</span></div>
+  </div>
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <button id="playBtn" class="play" type="button" onclick="togglePlay()">▶ 试播选区</button>
+        <span class="pill">当前时刻<b id="cur_t" class="num">0.000 s</b></span>
+        <div id="hoverRead" class="num"><span style="color:var(--dim)">移动鼠标到时间轴查看实时按键深度</span></div>
+      </div>
+      <div class="row">
+        <span class="sub">布局</span>
+        <select id="layout" onchange="buildPreviewKb()">
+          <option value="hud">HUD 键簇</option>
+          <option value="wasd">WASD 极简</option>
+          <option value="full">75% 整键盘</option>
+        </select>
+        <span class="sub">主题</span>
+        <select id="theme" onchange="renderPreviewAt(activeTime())">
+          <option value="ramp">随深度平滑</option>
+          <option value="cyan">冰川青</option>
+          <option value="mint">薄荷绿</option>
+          <option value="amber">琥珀金</option>
+          <option value="crimson">绯红</option>
+          <option value="violet">紫罗兰</option>
+        </select>
+        <span class="sub">满程</span>
+        <input id="wbFull" class="num" type="number" min="1.0" max="5.0" step="0.05" value="3.50" style="width:66px" onchange="onWbFullChange(this.value)">
+      </div>
+    </div>
+    <div id="prevStage"><div id="kbPrev"></div></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <span class="sub">起点</span>
+        <input id="sel_start" class="num" size="7" value="0.000">
+        <span class="sub">终点</span>
+        <input id="sel_end" class="num" size="7" value="0.000">
+        <span class="pill">选中<b id="sel_len" class="num">0.000</b> 秒</span>
+      </div>
+      <div class="row">
+        <button type="button" onclick="zoom(0.5)">放大</button>
+        <button type="button" onclick="zoom(2)">缩小</button>
+        <button type="button" onclick="resetView()">全览</button>
+      </div>
+    </div>
+    <div id="tracks"><canvas id="cv"></canvas></div>
+    <div id="hint">
+      <span>拖拽选择区间 · 滚轮缩放时间轴 · 悬停实时预览键盘深度 · 双击清除选区</span>
+      <span id="viewSpan" class="num">0.000s — 0.000s</span>
     </div>
   </div>
-  <div id="tracks"><canvas id="cv"></canvas></div>
-  <div id="hint">拖动选择区间 · 双击清除选择</div>
-</div>
 
-<div class="card">
-  <div class="row">
-    <span class="sub" style="margin:0">起点</span>
-    <input id="sel_start" size="7" value="0.000">
-    <span class="sub" style="margin:0">终点</span>
-    <input id="sel_end" size="7" value="0.000">
-    <span class="pill">选中 <b id="sel_len">0.000</b> 秒</span>
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <span class="sub">导出键位（勾选控制导出与波形高亮）</span>
+      <div class="row" style="gap:6px">
+        <button type="button" onclick="selectKeysPreset('all')">全选</button>
+        <button type="button" onclick="selectKeysPreset('hud')">常用 HUD</button>
+        <button type="button" onclick="selectKeysPreset('none')">清空</button>
+      </div>
+    </div>
+    <div id="keyChips" class="key-chips"><span class="sub">加载录制后显示可选键位…</span></div>
   </div>
-</div>
 
-<div class="card">
-  <div class="row">
-    <span class="sub" style="margin:0">布局</span>
-    <select id="layout"><option value="hud">HUD 键簇</option><option value="wasd">整键盘</option></select>
-    <span class="sub" style="margin:0">分辨率</span>
-    <select id="size">
-      <option value="1920x1080">1080p</option>
-      <option value="2560x1440">1440p</option>
-      <option value="3840x2160">4K</option>
-    </select>
-    <span class="sub" style="margin:0">帧率</span>
-    <select id="fps"><option>30</option><option selected>60</option><option>120</option></select>
-    <span class="sub" style="margin:0">速度</span>
-    <select id="speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
+  <div class="card">
+    <div class="row">
+      <span class="sub">分辨率</span>
+      <select id="size">
+        <option value="1920x1080">1080p</option>
+        <option value="2560x1440">1440p</option>
+        <option value="3840x2160">4K</option>
+      </select>
+      <span class="sub">帧率</span>
+      <select id="fps"><option>30</option><option selected>60</option><option>120</option></select>
+      <span class="sub">倍速</span>
+      <select id="speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
+      <span class="sub">格式</span>
+      <select id="fmt">
+        <option value="prores">ProRes 4444（透明）</option>
+        <option value="png">PNG 序列（透明）</option>
+      </select>
+      <span class="sub">背景</span>
+      <select id="bg"><option value="">透明</option><option value="#101014">深色 #101014</option><option value="#ffffff">白色</option></select>
+      <span style="flex:1"></span>
+      <button class="primary" type="button" onclick="startExport()">开始导出</button>
+      <button type="button" onclick="cancelExport()">取消</button>
+    </div>
+    <div id="prog"><i></i></div>
+    <div id="log">—</div>
   </div>
-  <div class="row" style="margin-top:10px">
-    <span class="sub" style="margin:0">格式</span>
-    <select id="fmt">
-      <option value="prores">ProRes 4444（透明）</option>
-      <option value="png">PNG 序列（透明）</option>
-    </select>
-    <span class="sub" style="margin:0">背景</span>
-    <select id="bg"><option value="">透明</option><option value="#101014">深色 #101014</option><option value="#ffffff">白色</option></select>
-    <button class="primary" onclick="startExport()">开始导出</button>
-    <button onclick="cancelExport()">取消</button>
-  </div>
-  <div id="prog"><i></i></div>
-  <div id="log">—</div>
 </div>
 
 <script>
+const FULL_LAYOUT = __LAYOUT__;
+__THEME_JS__
+
+const CLUSTERS = {
+  hud: [
+    {k:'Q', r:0, x:0.0, w:1.0}, {k:'W', r:0, x:1.0, w:1.0}, {k:'E', r:0, x:2.0, w:1.0}, {k:'R', r:0, x:3.0, w:1.0},
+    {k:'A', r:1, x:0.0, w:1.0}, {k:'S', r:1, x:1.0, w:1.0}, {k:'D', r:1, x:2.0, w:1.0},
+    {k:'LShift', r:2, x:0.0, w:1.35}, {k:'LCtrl', r:2, x:1.35, w:1.2}, {k:'LAlt', r:2, x:2.55, w:1.15}, {k:'Space', r:2, x:3.7, w:2.6}
+  ],
+  wasd: [
+    {k:'W', r:0, x:1.0, w:1.0},
+    {k:'A', r:1, x:0.0, w:1.0}, {k:'S', r:1, x:1.0, w:1.0}, {k:'D', r:1, x:2.0, w:1.0},
+    {k:'LAlt', r:2, x:0.0, w:1.25}, {k:'Space', r:2, x:1.25, w:2.75}
+  ],
+  full: FULL_LAYOUT
+};
+const HUD_DEFAULT_KEYS = new Set(['Q','W','E','R','A','S','D','LShift','LCtrl','LAlt','Space']);
+
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const RULER_H = 22, CV_H = 264;
 let info = null, data = null, view = [0, 1], sel = [0, 0], dragging = false, dragFrom = 0;
+let hoverT = null, playT = 0, playing = false, playLastMs = 0;
+let selectedKeys = new Set(), prevEls = {};
 
 function fmt(t) { return (t || 0).toFixed(3); }
+function activeTime() { return hoverT !== null ? hoverT : playT; }
 
 function fit() {
   const dpr = window.devicePixelRatio || 1;
   const r = cv.getBoundingClientRect();
-  cv.width = Math.max(200, r.width * dpr);
-  cv.height = 260 * dpr;
+  cv.width = Math.max(200, Math.round(r.width * dpr));
+  cv.height = Math.round(CV_H * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   draw();
 }
@@ -2310,30 +3641,91 @@ function tOf(x) {
   return view[0] + x / Math.max(1, w) * (view[1] - view[0]);
 }
 
+function sampleAt(t) {
+  const out = {};
+  if (!data || !data.ok || !data.t || !data.t.length) return out;
+  const ts = data.t, n = ts.length;
+  let lo = 0, hi = n - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ts[mid] <= t) lo = mid + 1; else hi = mid - 1;
+  }
+  const i = Math.max(0, Math.min(n - 1, hi));
+  const j = Math.min(n - 1, i + 1);
+  const dt = ts[j] - ts[i];
+  const f = (dt > 1e-6 && dt <= 0.12 && t >= ts[i]) ? Math.max(0, Math.min(1, (t - ts[i]) / dt)) : 0;
+  for (const k of data.keys) {
+    const arr = data.v[k];
+    if (!arr) continue;
+    const v = (f > 0) ? (arr[i] + (arr[j] - arr[i]) * f) : arr[i];
+    out[k] = v;
+    out[norm(k)] = v;
+  }
+  return out;
+}
+
+function chooseTickStep(span, pxW) {
+  const target = Math.max(4, Math.floor(pxW / 90));
+  const raw = span / target;
+  const steps = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60];
+  for (const s of steps) if (s >= raw) return s;
+  return 60;
+}
+
 function draw() {
-  const w = cv.getBoundingClientRect().width, h = 260;
+  const w = cv.getBoundingClientRect().width, h = CV_H;
   ctx.clearRect(0, 0, w, h);
   if (!data || !data.ok) {
-    ctx.fillStyle = '#7d8797'; ctx.font = '13px sans-serif';
-    ctx.fillText(data && data.error ? ('读取失败：' + data.error) : '没有录制数据', 16, 40);
+    ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.font = '13px sans-serif';
+    ctx.fillText(data && data.error ? ('读取失败：' + data.error) : '没有录制数据（请先在主监测页录制并停止）', 16, 44);
     return;
   }
-  const keys = data.keys, n = keys.length;
-  const rowH = (h - 10) / Math.max(1, n);
+  const span = Math.max(1e-3, view[1] - view[0]);
+  const vs = document.getElementById('viewSpan');
+  if (vs) vs.textContent = fmt(view[0]) + 's — ' + fmt(view[1]) + 's';
+
+  // Top adaptive time ruler + vertical grid
+  ctx.fillStyle = 'rgba(255,255,255,0.03)';
+  ctx.fillRect(0, 0, w, RULER_H);
+  ctx.strokeStyle = 'rgba(255,255,255,0.09)';
+  ctx.beginPath(); ctx.moveTo(0, RULER_H + 0.5); ctx.lineTo(w, RULER_H + 0.5); ctx.stroke();
+
+  const step = chooseTickStep(span, w);
+  const firstTick = Math.ceil(view[0] / step) * step;
+  const dec = step < 0.1 ? 2 : (step < 1 ? 1 : 0);
+  ctx.font = '10px ui-monospace, Consolas, monospace';
+  for (let t = firstTick; t <= view[1] + 1e-6; t += step) {
+    const x = Math.round(xOf(t)) + 0.5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.beginPath(); ctx.moveTo(x, RULER_H); ctx.lineTo(x, h); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+    ctx.beginPath(); ctx.moveTo(x, RULER_H - 6); ctx.lineTo(x, RULER_H); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.52)';
+    ctx.fillText(t.toFixed(dec) + 's', x + 3, 13);
+  }
+
+  // Selection band
   const x0 = xOf(sel[0]), x1 = xOf(sel[1]);
   if (sel[1] > sel[0]) {
-    ctx.fillStyle = 'rgba(56,189,248,.12)';
-    ctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
-    ctx.strokeStyle = 'rgba(56,189,248,.8)';
-    ctx.beginPath(); ctx.moveTo(x0, 0); ctx.lineTo(x0, h);
-    ctx.moveTo(x1, 0); ctx.lineTo(x1, h); ctx.stroke();
+    ctx.fillStyle = 'rgba(56,189,248,0.13)';
+    ctx.fillRect(x0, RULER_H, Math.max(1, x1 - x0), h - RULER_H);
+    ctx.strokeStyle = 'rgba(56,189,248,0.85)';
+    ctx.beginPath();
+    ctx.moveTo(x0, RULER_H); ctx.lineTo(x0, h);
+    ctx.moveTo(x1, RULER_H); ctx.lineTo(x1, h);
+    ctx.stroke();
   }
-  ctx.font = '10px monospace';
+
+  // Per-key tracks
+  const keys = data.keys, n = keys.length;
+  const rowH = (h - RULER_H - 6) / Math.max(1, n);
+  const trackCols = ['#38bdf8', '#34d399', '#fbbf24', '#f472b6', '#a78bfa', '#fb7185'];
   keys.forEach((k, row) => {
-    const y = row * rowH + 5, base = y + rowH - 4;
-    ctx.fillStyle = '#7d8797';
-    ctx.fillText(k, 3, y + 9);
-    ctx.strokeStyle = 'rgba(255,255,255,.04)';
+    const on = selectedKeys.has(k);
+    const y = RULER_H + 3 + row * rowH, base = y + rowH - 3;
+    ctx.fillStyle = on ? 'rgba(255,255,255,0.78)' : 'rgba(255,255,255,0.24)';
+    ctx.fillText(disp(norm(k)), 5, y + 10);
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
     ctx.beginPath(); ctx.moveTo(0, base); ctx.lineTo(w, base); ctx.stroke();
     const vals = data.v[k] || [];
     ctx.beginPath();
@@ -2342,77 +3734,391 @@ function draw() {
       const t = data.t[i];
       if (t < view[0] || t > view[1]) continue;
       const x = xOf(t);
-      const yv = base - Math.min(1, vals[i] / 3.5) * (rowH - 12);
+      const yv = base - Math.min(1, vals[i] / FULL) * Math.max(6, rowH - 11);
       if (!started) { ctx.moveTo(x, yv); started = true; } else ctx.lineTo(x, yv);
     }
-    ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.strokeStyle = on ? trackCols[row % trackCols.length] : 'rgba(255,255,255,0.16)';
+    ctx.lineWidth = on ? 1.35 : 0.8;
+    ctx.stroke();
   });
-  ctx.fillStyle = '#4b5563';
-  ctx.fillText(fmt(view[0]) + 's', 4, h - 2);
-  ctx.fillText(fmt(view[1]) + 's', w - 60, h - 2);
+
+  // Playhead + Hover cursor
+  if (playT >= view[0] && playT <= view[1]) {
+    const px = Math.round(xOf(playT)) + 0.5;
+    ctx.strokeStyle = playing ? '#f43f5e' : 'rgba(244,63,94,0.55)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, h); ctx.stroke();
+  }
+  if (hoverT !== null && hoverT >= view[0] && hoverT <= view[1]) {
+    const hx = Math.round(xOf(hoverT)) + 0.5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.65)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(hx, RULER_H); ctx.lineTo(hx, h); ctx.stroke();
+    ctx.setLineDash([]);
+  }
 }
 
-function setSel(a, b) {
-  sel = [Math.max(0, Math.min(a, b)), Math.max(a, b)];
-  document.getElementById('sel_start').value = fmt(sel[0]);
-  document.getElementById('sel_end').value = fmt(sel[1]);
+function setSel(a, b, skipInputs) {
+  const dur = (data && data.ok) ? data.duration : Math.max(a, b, 0);
+  const lo = Math.max(0, Math.min(dur, Math.min(a, b)));
+  const hi = Math.max(0, Math.min(dur, Math.max(a, b)));
+  sel = [lo, hi];
+  if (!skipInputs) {
+    document.getElementById('sel_start').value = fmt(sel[0]);
+    document.getElementById('sel_end').value = fmt(sel[1]);
+  }
   document.getElementById('sel_len').textContent = fmt(sel[1] - sel[0]);
+  if (playT < sel[0] || playT > sel[1]) playT = sel[0];
   draw();
+  renderPreviewAt(activeTime());
 }
+
+function syncSelFromInputs(normalizeFields) {
+  const aEl = document.getElementById('sel_start'), bEl = document.getElementById('sel_end');
+  const a = parseFloat(aEl.value), b = parseFloat(bEl.value);
+  if (isNaN(a) || isNaN(b)) return;
+  setSel(a, b, !normalizeFields);
+}
+['sel_start', 'sel_end'].forEach(id => {
+  const el = document.getElementById(id);
+  el.addEventListener('input', () => syncSelFromInputs(false));
+  el.addEventListener('change', () => syncSelFromInputs(true));
+  el.addEventListener('keydown', e => { if (e.key === 'Enter') { syncSelFromInputs(true); el.blur(); } });
+});
 
 cv.addEventListener('mousedown', e => {
   dragging = true;
   dragFrom = Math.max(0, tOf(e.offsetX));
+  playT = dragFrom;
   setSel(dragFrom, dragFrom);
 });
 cv.addEventListener('mousemove', e => {
-  if (dragging) setSel(dragFrom, Math.max(0, tOf(e.offsetX)));
+  const t = Math.max(0, Math.min(data && data.ok ? data.duration : 0, tOf(e.offsetX)));
+  hoverT = t;
+  if (dragging) setSel(dragFrom, t);
+  else { draw(); renderPreviewAt(t); }
+});
+cv.addEventListener('mouseleave', () => {
+  hoverT = null;
+  draw();
+  renderPreviewAt(playT);
 });
 window.addEventListener('mouseup', () => { dragging = false; });
 cv.addEventListener('dblclick', () => setSel(0, 0));
 cv.addEventListener('wheel', e => {
   e.preventDefault();
+  const dur = (data && data.ok) ? data.duration : 1;
   const z = e.deltaY > 0 ? 1.25 : 0.8;
-  const pivot = Math.max(0, tOf(e.offsetX));
-  view = [pivot - (pivot - view[0]) * z, pivot + (view[1] - pivot) * z];
+  const pivot = Math.max(0, Math.min(dur, tOf(e.offsetX)));
+  const a = Math.max(0, pivot - (pivot - view[0]) * z);
+  const b = Math.min(dur, pivot + (view[1] - pivot) * z);
+  if (b - a >= 0.05) view = [a, b];
   draw();
 }, { passive: false });
 
 function zoom(f) {
-  const mid = (view[0] + view[1]) / 2, half = (view[1] - view[0]) / 2 * f;
-  view = [Math.max(0, mid - half), mid + half];
+  const dur = (data && data.ok) ? data.duration : 1;
+  const mid = (view[0] + view[1]) / 2, half = Math.max(0.05, (view[1] - view[0]) / 2 * f);
+  view = [Math.max(0, mid - half), Math.min(dur, mid + half)];
   draw();
 }
-function resetView() { view = [0, data ? data.duration : 1]; draw(); }
+function resetView() { view = [0, data && data.ok ? data.duration : 1]; draw(); }
 
-function load() {
-  fetch('/wb/info').then(r => r.json()).then(j => {
+function buildPreviewKb() {
+  const lay = document.getElementById('layout').value || 'hud';
+  const items = CLUSTERS[lay] || CLUSTERS.hud;
+  const host = document.getElementById('kbPrev');
+  const stage = document.getElementById('prevStage');
+  let maxX = 0, maxR = 0;
+  for (const it of items) {
+    if (it.x + it.w > maxX) maxX = it.x + it.w;
+    if (it.r > maxR) maxR = it.r;
+  }
+  const availW = Math.max(260, (stage ? stage.clientWidth : 800) - 24);
+  const baseU = lay === 'full' ? 38 : 50;
+  const u = Math.max(24, Math.min(baseU, Math.floor(availW / (maxX + 0.2))));
+  const gap = Math.max(4, Math.round(u * 0.11));
+  document.documentElement.style.setProperty('--u', u + 'px');
+  host.style.width = Math.max(1, Math.round(maxX * u - gap)) + 'px';
+  host.style.height = Math.max(1, Math.round((maxR + 1) * (u + gap) - gap)) + 'px';
+  host.innerHTML = '';
+  prevEls = {};
+  for (const it of items) {
+    const d = document.createElement('div');
+    d.className = 'k';
+    d.style.left = Math.round(it.x * u) + 'px';
+    d.style.top = Math.round(it.r * (u + gap)) + 'px';
+    d.style.width = Math.max(12, Math.round(it.w * u - gap)) + 'px';
+    d.style.height = Math.max(12, Math.round(u - gap)) + 'px';
+    d.innerHTML = '<div class="fill"></div><div class="lbl">' + disp(it.k) + '</div><div class="mm num"></div>';
+    host.appendChild(d);
+    prevEls[it.k] = { box: d, fill: d.children[0], mm: d.children[2] };
+  }
+  renderPreviewAt(activeTime());
+}
+
+function renderPreviewAt(t) {
+  const curEl = document.getElementById('cur_t');
+  if (curEl) curEl.textContent = fmt(t) + ' s';
+  const vals = sampleAt(t);
+  const preset = FILL_PRESETS[document.getElementById('theme').value] || FILL_PRESETS.ramp;
+  const selectedNorm = new Set(Array.from(selectedKeys).map(norm));
+  const hasSel = selectedKeys.size > 0;
+
+  for (const name in prevEls) {
+    const el = prevEls[name];
+    const inSel = !hasSel || selectedNorm.has(name);
+    const mm = inSel ? (vals[name] || 0) : 0;
+    const r = Math.max(0, Math.min(1, mm / FULL));
+    const hot = r > 0.06, active = r > 0.04;
+    const st = preset.style(r);
+    el.box.classList.toggle('dim', hasSel && !inSel);
+    el.box.classList.toggle('hot', hot);
+    el.fill.style.height = (r * 100).toFixed(1) + '%';
+    el.fill.style.background = active ? st.bg : 'transparent';
+    el.fill.style.borderTop = active ? ('1.5px solid ' + st.line) : 'none';
+    el.box.style.transform = active ? ('scale(' + (1 - r * 0.035).toFixed(3) + ')') : '';
+    el.mm.textContent = r > 0.08 ? mm.toFixed(1) : '';
+  }
+
+  const hr = document.getElementById('hoverRead');
+  if (hr && data && data.ok) {
+    const activeList = data.keys
+      .filter(k => selectedKeys.has(k) && (vals[k] || 0) > 0.03)
+      .sort((a, b) => (vals[b] || 0) - (vals[a] || 0));
+    hr.innerHTML = activeList.length
+      ? activeList.map(k => '<span class="hk">' + disp(norm(k)) + ' ' + (vals[k] || 0).toFixed(2) + 'mm</span>').join('')
+      : '<span style="color:var(--dim)">当前时刻无按下键</span>';
+  }
+}
+
+function togglePlay() {
+  if (!data || !data.ok) return;
+  playing = !playing;
+  const btn = document.getElementById('playBtn');
+  if (btn) {
+    btn.classList.toggle('on', playing);
+    btn.textContent = playing ? '⏸ 暂停试播' : '▶ 试播选区';
+  }
+  if (playing) {
+    const lo = sel[1] > sel[0] ? sel[0] : 0;
+    const hi = sel[1] > sel[0] ? sel[1] : data.duration;
+    if (playT < lo || playT >= hi) playT = lo;
+    playLastMs = performance.now();
+    requestAnimationFrame(playLoop);
+  }
+}
+
+function playLoop(now) {
+  if (!playing || !data || !data.ok) return;
+  const dt = Math.min(0.1, (now - playLastMs) / 1000);
+  playLastMs = now;
+  const spd = Number(document.getElementById('speed').value) || 1;
+  const lo = sel[1] > sel[0] ? sel[0] : 0;
+  const hi = sel[1] > sel[0] ? sel[1] : data.duration;
+  playT += dt * spd;
+  if (playT > hi) playT = lo;
+  draw();
+  if (hoverT === null) renderPreviewAt(playT);
+  requestAnimationFrame(playLoop);
+}
+
+function renderKeyChips() {
+  const box = document.getElementById('keyChips');
+  if (!box) return;
+  if (!info || !info.ok || !(info.keys || []).length) {
+    box.innerHTML = '<span class="sub">无可用键位</span>';
+    return;
+  }
+  box.innerHTML = '';
+  for (const k of info.keys) {
+    const lbl = document.createElement('label');
+    const checked = selectedKeys.has(k);
+    lbl.className = 'kchip' + (checked ? ' on' : '');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = checked;
+    cb.addEventListener('change', () => {
+      if (cb.checked) selectedKeys.add(k); else selectedKeys.delete(k);
+      lbl.classList.toggle('on', cb.checked);
+      draw();
+      renderPreviewAt(activeTime());
+    });
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(disp(norm(k))));
+    box.appendChild(lbl);
+  }
+}
+
+function selectKeysPreset(mode) {
+  if (!info || !info.ok) return;
+  selectedKeys.clear();
+  if (mode === 'all') {
+    for (const k of info.keys) selectedKeys.add(k);
+  } else if (mode === 'hud') {
+    for (const k of info.keys) if (HUD_DEFAULT_KEYS.has(norm(k))) selectedKeys.add(k);
+    if (!selectedKeys.size) for (const k of info.keys) selectedKeys.add(k);
+  }
+  renderKeyChips();
+  draw();
+  renderPreviewAt(activeTime());
+}
+
+let historyItems = [];
+let currentStamp = new URLSearchParams(location.search).get('stamp') || '';
+
+function toggleHist(force) {
+  const d = document.getElementById('histDrawer');
+  if (!d) return;
+  const open = typeof force === 'boolean' ? force : !d.classList.contains('open');
+  d.classList.toggle('open', open);
+}
+
+function renderHistoryUI() {
+  const selEl = document.getElementById('recSel');
+  const listEl = document.getElementById('histList');
+  const cntEl = document.getElementById('histCount');
+  if (cntEl) cntEl.textContent = String(historyItems.length);
+  if (selEl) {
+    selEl.innerHTML = '';
+    if (!historyItems.length) {
+      const opt = document.createElement('option');
+      opt.value = ''; opt.textContent = '暂无录制';
+      selEl.appendChild(opt);
+    } else {
+      for (const it of historyItems) {
+        const opt = document.createElement('option');
+        opt.value = it.stamp;
+        opt.textContent = it.stamp + ' · ' + (it.duration || 0).toFixed(1) + 's' + (it.is_latest ? ' [最新]' : '');
+        if (it.stamp === currentStamp) opt.selected = true;
+        selEl.appendChild(opt);
+      }
+    }
+  }
+  if (listEl) {
+    listEl.innerHTML = '';
+    if (!historyItems.length) {
+      listEl.innerHTML = '<span class="sub">暂无历史录制</span>';
+      return;
+    }
+    for (const it of historyItems) {
+      const row = document.createElement('div');
+      row.className = 'hist-item' + (it.stamp === currentStamp ? ' on' : '');
+      row.addEventListener('click', () => { onSelectRec(it.stamp); });
+      const meta = document.createElement('div');
+      meta.className = 'hist-meta';
+      const ks = (it.keys || []).map(k => disp(norm(k))).join(' ');
+      meta.innerHTML = '<b class="num">' + it.stamp + '</b>' +
+        (it.is_latest ? '<span class="hist-tag">最新</span>' : '') +
+        '<span class="num" style="color:var(--dim)">' + (it.duration || 0).toFixed(2) + 's · ' + it.samples + ' 点</span>' +
+        '<span class="hist-keys">' + (ks || '—') + '</span>';
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'danger';
+      del.textContent = '删除';
+      del.addEventListener('click', ev => { ev.stopPropagation(); deleteRecording(it.stamp); });
+      row.appendChild(meta);
+      row.appendChild(del);
+      listEl.appendChild(row);
+    }
+  }
+}
+
+function onSelectRec(stamp) {
+  if (!stamp) return;
+  currentStamp = stamp;
+  try { history.replaceState(null, '', '/wb?stamp=' + encodeURIComponent(stamp)); } catch (e) {}
+  renderHistoryUI();
+  load(stamp);
+}
+
+function deleteRecording(stamp) {
+  if (!confirm('确认永久删除录制 ' + stamp + '？')) return;
+  fetch('/wb/delete', {
+    method: 'POST',
+    headers: { 'X-Depth-Token': window.__token || '' },
+    body: JSON.stringify({ stamp })
+  }).then(r => r.json()).then(j => {
+    document.getElementById('log').textContent = j.message || '';
+    if (j.ok) {
+      if (currentStamp === stamp) currentStamp = '';
+      loadList(currentStamp);
+    }
+  });
+}
+
+function loadList(preferredStamp) {
+  fetch('/wb/list').then(r => r.json()).then(j => {
+    historyItems = (j && j.ok && j.items) ? j.items : [];
+    const exists = s => historyItems.some(it => it.stamp === s);
+    if (preferredStamp && exists(preferredStamp)) currentStamp = preferredStamp;
+    else if (currentStamp && exists(currentStamp)) { /* keep */ }
+    else currentStamp = historyItems.length ? historyItems[0].stamp : '';
+    renderHistoryUI();
+    load(currentStamp);
+  }).catch(() => { load(currentStamp); });
+}
+
+function load(stamp) {
+  if (playing) togglePlay();
+  const qs = stamp ? ('?stamp=' + encodeURIComponent(stamp)) : '';
+  fetch('/wb/info' + qs).then(r => r.json()).then(j => {
     info = j;
-    if (!j.ok) { document.getElementById('log').textContent = j.error || '没有录制'; data = j; draw(); return; }
-    document.getElementById('r_stamp').textContent = j.stamp || '—';
+    if (!j.ok) {
+      document.getElementById('r_stamp').textContent = '—';
+      document.getElementById('r_dur').textContent = '—';
+      document.getElementById('r_n').textContent = '—';
+      document.getElementById('log').textContent = j.error || '没有录制';
+      data = j; selectedKeys.clear(); renderKeyChips(); draw(); buildPreviewKb(); return;
+    }
+    currentStamp = j.stamp || stamp || '';
+    document.getElementById('r_stamp').textContent = currentStamp || '—';
     document.getElementById('r_dur').textContent = (j.duration || 0).toFixed(2) + ' s';
     document.getElementById('r_n').textContent = j.samples;
-    document.getElementById('r_keys').textContent = (j.keys || []).join(' ');
-    fetch('/wb/series?step=0.02').then(r => r.json()).then(k => {
+    renderHistoryUI();
+    selectedKeys = new Set(j.keys || []);
+    renderKeyChips();
+    const sq = '?step=0.02' + (currentStamp ? ('&stamp=' + encodeURIComponent(currentStamp)) : '');
+    fetch('/wb/series' + sq).then(r => r.json()).then(k => {
       data = k;
-      if (k.ok) { view = [0, k.duration]; setSel(0, Math.min(k.duration, 5)); }
+      if (k.ok) {
+        view = [0, k.duration];
+        playT = 0;
+        hoverT = null;
+        setSel(0, Math.min(k.duration, 5));
+      }
+      buildPreviewKb();
       draw();
     });
   });
 }
 
+function onWbFullChange(v) {
+  setFullMm(v);
+  const el = document.getElementById('wbFull');
+  if (el) el.value = FULL.toFixed(2);
+  draw();
+  renderPreviewAt(activeTime());
+}
+
 function startExport() {
   if (!data || !data.ok) { alert('还没有可导出的录制'); return; }
   if (!(sel[1] > sel[0])) { alert('请先在时间轴上拖出一段区间'); return; }
+  const picked = (info.keys || []).filter(k => selectedKeys.has(k));
+  if (!picked.length) { alert('请至少勾选一个导出键位'); return; }
   const params = {
+    stamp: currentStamp || undefined,
     start: sel[0], end: sel[1],
     layout: document.getElementById('layout').value,
+    theme: document.getElementById('theme').value,
+    full_mm: FULL,
     size: document.getElementById('size').value,
     fps: Number(document.getElementById('fps').value),
     speed: Number(document.getElementById('speed').value),
     bg: document.getElementById('bg').value,
     png: document.getElementById('fmt').value === 'png',
-    keys: info.keys.filter(k => ['W','A','S','D','Space','LCtrl','LAlt','LShift'].includes(k))
+    keys: picked
   };
   const tok = window.__token || '';
   fetch('/wb/export', { method:'POST', headers:{'X-Depth-Token': tok}, body: JSON.stringify(params) })
@@ -2430,13 +4136,26 @@ function poll() {
   });
 }
 
-function cancelExport() { fetch('/wb/cancel', { method:'POST' }).then(() => poll()); }
+function cancelExport() {
+  fetch('/wb/cancel', { method:'POST', headers:{'X-Depth-Token': window.__token || ''} }).then(() => poll());
+}
 
-fetch('/snapshot').then(r => r.json()).then(j => { window.__token = j.token || ''; });
-addEventListener('resize', fit);
-load();
+fetch('/snapshot').then(r => r.json()).then(j => {
+  window.__token = j.token || '';
+  if (j.full_mm) onWbFullChange(j.full_mm);
+  if (j.theme && FILL_PRESETS[j.theme]) {
+    const tEl = document.getElementById('theme');
+    if (tEl) tEl.value = j.theme;
+    renderPreviewAt(activeTime());
+  }
+});
+addEventListener('resize', () => { fit(); buildPreviewKb(); });
+buildPreviewKb();
+loadList(currentStamp);
 fit();
 </script></body></html>"""
+            .replace("__LAYOUT__", json.dumps(_layout_dicts(), ensure_ascii=False))
+            .replace("__THEME_JS__", COMMON_THEME_JS))
 
 
 srv_ref = [None]
@@ -2448,9 +4167,13 @@ def main():
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--auto", action="store_true", help="start recording immediately")
+    ap.add_argument("--full", type=float, default=None,
+                    help="full switch travel in mm (default 3.50, range 1.0-5.0)")
     ap.add_argument("--idle-exit", type=int, default=90,
                     help="exit after N seconds with no page open (0 = never)")
     args = ap.parse_args()
+    if args.full is not None:
+        ENGINE.update_settings(full_mm=args.full, save=False)
 
     try:
         kernel32.timeBeginPeriod(1)
