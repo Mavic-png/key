@@ -102,7 +102,7 @@ and Premiere imports it as an image sequence with alpha intact.
 python test_pipeline.py
 ```
 
-Thirty-nine headless checks, including the ones static reviews asked for:
+Forty-four headless checks, including the ones static reviews asked for:
 
 * firmware switch-zero vs. real release (both orders)
 * hold re-emission when the mapping table is empty
@@ -134,6 +134,9 @@ Thirty-nine headless checks, including the ones static reviews asked for:
   even with a token, and a local script must present the process token
 * the HID reader survives `stop()` landing before `ReadFile` is issued
   (tested through an injected pseudo kernel32)
+* sample-quality statistics (mean / P95 / P99 / max inter-arrival, anomalies)
+  match a synthetic packet train
+* the saved manifest records per-file line counts and an integrity flag
 * long+wide are committed as one versioned directory plus an atomic
   `latest.json` manifest
 

@@ -424,6 +424,38 @@ def t_empty_exports():
     assert "t_s" in long
 
 
+def t_sample_quality():
+    """Gap statistics must reflect real inter-arrival times and anomalies."""
+    e = dl.Engine()
+    t = 0.0
+    for k in range(100):
+        t += 0.06 if k in (30, 70) else 0.01
+        e.on_depth(t, 31, 1.0)
+    q = e.sample_quality()
+    assert q["n"] == 99, q["n"]
+    assert 10.0 <= q["mean_ms"] <= 12.0, q["mean_ms"]
+    assert q["max_ms"] >= 55, q["max_ms"]
+    assert q["anomalies"] == 2, q["anomalies"]
+    assert q["dropouts"] == 0, q["dropouts"]
+
+
+def t_manifest_integrity():
+    """The manifest must record line counts and a validity flag."""
+    e = make_engine()
+    e.recording = True
+    now = time.perf_counter()
+    for k in range(50):
+        e.on_depth(now + k * 0.01, 31, (k % 5) * 0.6)
+    path = e.save_recording()
+    assert path
+    base = dl.recordings_dir()
+    with io.open(os.path.join(base, "latest.json"), encoding="utf-8") as f:
+        manifest = json.load(f)
+    integ = manifest.get("integrity")
+    assert integ and integ["ok"] is True, integ
+    assert integ["long"]["lines"] > 5 and integ["wide"]["lines"] > 5, integ
+
+
 def t_save_is_isolated_and_manifested():
     """Saved recordings go under the temp home and are committed by a manifest."""
     base = dl.recordings_dir()
@@ -881,6 +913,8 @@ def main():
         ("ffmpeg start failure cleans up", t_ffmpeg_start_failure),
         ("render alpha + multiprocess match", t_render_alpha_and_multiprocess_match),
         ("empty exports", t_empty_exports),
+        ("sample quality stats", t_sample_quality),
+        ("manifest integrity", t_manifest_integrity),
         ("save is isolated + manifest", t_save_is_isolated_and_manifested),
         ("save recording to disk", t_save_recording),
         ("http endpoints", t_http_endpoints),

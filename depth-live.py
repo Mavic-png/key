@@ -53,7 +53,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.10.5"
+VERSION = "1.11.0"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -288,6 +288,10 @@ class Engine(object):
         self.last_hotkey = None
         self.last_client = time.time()
         self.stop_io = threading.Event()
+        self._key_events = []
+        self.gaps = collections.deque(maxlen=8000)   # inter-arrival seconds
+        self._last_depth_t = None
+        self._gap_anomalies = 0
         self.token = secrets.token_hex(8)
         self.hold_n = 0
         self.auto = False
@@ -524,6 +528,13 @@ class Engine(object):
                 self.suppressed += 1
                 return
             self.n_depth += 1
+            if self._last_depth_t is not None:
+                gap = t - self._last_depth_t
+                if gap >= 0:
+                    self.gaps.append(gap)
+                    if gap > 0.05:                 # > 50 ms: suspicious
+                        self._gap_anomalies += 1
+            self._last_depth_t = t
             self.samples.append((t, idx, mm))
             if len(self.samples) > 4000:
                 del self.samples[:1000]
@@ -638,12 +649,22 @@ class Engine(object):
                         f.write(chunk)
                     f.flush()
                     os.fsync(f.fileno())
+            integrity = {}
+            for key, path in (("long", long_path), ("wide", wide_path)):
+                with io.open(path, encoding="utf-8", errors="replace") as f:
+                    lines = 0
+                    for _ in f:
+                        lines += 1
+                integrity[key] = {"lines": lines, "bytes": os.path.getsize(path)}
+            integrity["ok"] = all(v["lines"] > 1 and v["bytes"] > 0
+                                  for k, v in integrity.items() if k in ("long", "wide"))
             manifest = {
                 "stamp": stamp,
                 "samples": n,
                 "long": os.path.relpath(long_path, base).replace("\\", "/"),
                 "wide": os.path.relpath(wide_path, base).replace("\\", "/"),
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "integrity": integrity,
             }
             tmp = os.path.join(base, ".latest.tmp")
             with io.open(tmp, "w", encoding="utf-8") as f:
@@ -756,6 +777,30 @@ class Engine(object):
                     self.rec = []
                     self.rec_t0 = None
 
+    def sample_quality(self):
+        """How healthy is the HID stream right now (or during the last N packets)."""
+        with self.lock:
+            gaps = sorted(self.gaps)
+            n = len(gaps)
+            if not n:
+                return {"n": 0, "rate": round(self.depth_rate, 1), "mean_ms": 0.0,
+                        "p95_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0,
+                        "anomalies": self._gap_anomalies, "dropouts": 0}
+            def pct(q):
+                idx = min(n - 1, max(0, int(round(q * (n - 1)))))
+                return gaps[idx] * 1000.0
+            mean = sum(gaps) / n
+            return {
+                "n": n,
+                "rate": round(1.0 / mean, 1) if mean > 0 else 0.0,
+                "mean_ms": round(mean * 1000.0, 2),
+                "p95_ms": round(pct(0.95), 2),
+                "p99_ms": round(pct(0.99), 2),
+                "max_ms": round(gaps[-1] * 1000.0, 2),
+                "anomalies": self._gap_anomalies,
+                "dropouts": sum(1 for g in gaps if g > 0.5),
+            }
+
     def rate_tick(self):
         while True:
             time.sleep(1.0)
@@ -818,10 +863,30 @@ class Engine(object):
                 hk_prev[hk] = down
             time.sleep(0.004)
 
+    def _log_key(self, vk, down):
+        """Every OS-level transition, timestamped: used to tell a real release
+        from a synthetic key-up sent by the keyboard firmware."""
+        line = "%s vk=%-3d %-4s %s\n" % (
+            time.strftime("%H:%M:%S") + (".%03d" % (int(time.time() * 1000) % 1000)),
+            vk, "down" if down else "up",
+            key_name(vk) if "key_name" in globals() else vk)
+        try:
+            path = os.path.join(data_home(), "keyevents.log")
+            if not os.path.isdir(data_home()):
+                os.makedirs(data_home())
+            with io.open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+            self._key_events.append(line.strip())
+            if len(self._key_events) > 40:
+                del self._key_events[:10]
+        except Exception:
+            pass
+
     def apply_key_state(self, vk, down, now):
         """Apply one physical key transition. Shared by the edge detector and the
         watchdog so a missed edge cannot leave a key stuck as held."""
         try:
+            self._log_key(vk, down)
             with self.lock:
                 self.mark_key(vk, down, now)
                 if not down:
@@ -933,6 +998,8 @@ class Engine(object):
                 "notice": self.notice,
                 "hotkey": self.last_hotkey,
                 "hold_n": self.hold_n,
+                "quality": self.sample_quality(),
+                "key_events": self._key_events[-12:],
                 "suppressed": self.suppressed,
                 "watchdog_releases": self.released_by_watchdog,
                 "mapping_gen": self.mapping_gen,
@@ -1508,6 +1575,14 @@ PAGE = r"""<!DOCTYPE html>
         <div>上升 <b id="s_rise">—</b></div><div>下降 <b id="s_fall">—</b></div>
       </div>
     </div>
+    <div class="card pad">
+      <div class="sub" style="margin:0 0 8px">采样质量</div>
+      <div class="grid2">
+        <div>实际 <b id="q_rate">—</b></div><div>平均间隔 <b id="q_mean">—</b></div>
+        <div>P99 <b id="q_p99">—</b></div><div>最大 <b id="q_max">—</b></div>
+        <div>异常间隔 <b id="q_anom">—</b></div><div>中断 <b id="q_drop">—</b></div>
+      </div>
+    </div>
     <div class="card pad" style="flex:1; overflow:hidden">
       <div class="sub" style="margin:0 0 6px">最近按压</div>
       <table><thead><tr><th>键</th><th>峰值</th><th>上升</th><th>速度</th><th>RT</th></tr></thead>
@@ -1679,6 +1754,16 @@ es.onmessage = ev => {
     bigTip(m.notice, 3500);
   }
   if (m.token) window.__token = m.token;
+  if (m.quality) {
+    const q = m.quality;
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set('q_rate', q.rate ? q.rate.toFixed(1) + '/s' : '—');
+    set('q_mean', q.mean_ms ? q.mean_ms.toFixed(1) + ' ms' : '—');
+    set('q_p99', q.p99_ms ? q.p99_ms.toFixed(1) + ' ms' : '—');
+    set('q_max', q.max_ms ? q.max_ms.toFixed(1) + ' ms' : '—');
+    set('q_anom', q.anomalies);
+    set('q_drop', q.dropouts);
+  }
   if (m.version) {
     const small = document.querySelector('h1 small');
     if (small) small.textContent = '\u78c1\u8f74\u6df1\u5ea6\u5b9e\u65f6\u76d1\u6d4b v' + m.version;
