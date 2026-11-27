@@ -127,7 +127,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -153,6 +153,60 @@ kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
 kernel32.CloseHandle.restype = wt.BOOL
 user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+
+WM_INPUT = 0x00FF
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+RIDEV_INPUTSINK = 0x00000100
+HWND_MESSAGE = ctypes.c_void_p(-3)
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [("usUsagePage", wt.USHORT), ("usUsage", wt.USHORT),
+                ("dwFlags", wt.DWORD), ("hwndTarget", wt.HWND)]
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [("dwType", wt.DWORD), ("dwSize", wt.DWORD),
+                ("hDevice", wt.HANDLE), ("wParam", wt.WPARAM)]
+
+
+class _RAWMOUSE_BTN_PARTS(ctypes.Structure):
+    _fields_ = [("usButtonFlags", wt.USHORT), ("usButtonData", wt.USHORT)]
+
+
+class _RAWMOUSE_BTNS(ctypes.Union):
+    _fields_ = [("ulButtons", wt.ULONG), ("parts", _RAWMOUSE_BTN_PARTS)]
+
+
+class RAWMOUSE(ctypes.Structure):
+    _anonymous_ = ("btns",)
+    _fields_ = [("usFlags", wt.USHORT), ("btns", _RAWMOUSE_BTNS),
+                ("ulRawButtons", wt.ULONG), ("lLastX", wt.LONG),
+                ("lLastY", wt.LONG), ("ulExtraInformation", wt.ULONG)]
+
+
+class RAWINPUT_MOUSE(ctypes.Structure):
+    _fields_ = [("header", RAWINPUTHEADER), ("mouse", RAWMOUSE)]
+
+
+user32.CreateWindowExW.restype = wt.HWND
+user32.CreateWindowExW.argtypes = [
+    wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID,
+]
+user32.DestroyWindow.argtypes = [wt.HWND]
+user32.RegisterRawInputDevices.restype = wt.BOOL
+user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), wt.UINT, wt.UINT]
+user32.GetRawInputData.restype = wt.UINT
+user32.GetRawInputData.argtypes = [wt.HANDLE, wt.UINT, ctypes.c_void_p, ctypes.POINTER(wt.UINT), wt.UINT]
+user32.GetMessageW.restype = wt.BOOL
+user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+user32.PostThreadMessageW.restype = wt.BOOL
+user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
+kernel32.GetCurrentThreadId.restype = wt.DWORD
 
 
 # ------------------------------------------------------------------ HID layer
@@ -391,6 +445,9 @@ class Engine(object):
         self.settings_path = os.path.join(data_home, "settings.json")
         self.full_mm = FULL
         self.theme = "ramp"
+        self.mouse_events = []       # (dx, dy, wheel) live ring for SSE cursors
+        self._mouse_abs = 0
+        self.mouse_btns = {"l": False, "r": False, "m": False, "x1": False, "x2": False}
         self._load_settings()
         self._load_mapping()
 
@@ -801,21 +858,94 @@ class Engine(object):
                 self.last_press = press
                 self.recent.appendleft(press)
 
+    def on_mouse(self, dx, dy, btns=None, wheel=0):
+        with self.lock:
+            if btns:
+                self.mouse_btns.update(btns)
+            if dx or dy or wheel:
+                self.mouse_events.append((int(dx), int(dy), int(wheel)))
+                if len(self.mouse_events) > 4000:
+                    del self.mouse_events[:1000]
+                self._mouse_abs += 1
+
+    def run_mouse(self):
+        """Passive read-only Windows Raw Input mouse listener (works in locked-cursor FPS games)."""
+        hwnd = user32.CreateWindowExW(
+            0, "STATIC", "depth-mouse-sink", 0, 0, 0, 0, 0,
+            HWND_MESSAGE, None, None, None,
+        )
+        if not hwnd:
+            return
+        try:
+            rid = RAWINPUTDEVICE(0x01, 0x02, RIDEV_INPUTSINK, hwnd)
+            if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                return
+            msg = wt.MSG()
+            buf = (ctypes.c_ubyte * 128)()
+            sz = wt.UINT(0)
+            hdr_sz = ctypes.sizeof(RAWINPUTHEADER)
+            while not self.stop_io.is_set():
+                r = user32.GetMessageW(ctypes.byref(msg), hwnd, 0, 0)
+                if r <= 0:
+                    break
+                if msg.message == WM_INPUT:
+                    sz.value = ctypes.sizeof(buf)
+                    got = user32.GetRawInputData(
+                        ctypes.c_void_p(msg.lParam), RID_INPUT,
+                        buf, ctypes.byref(sz), hdr_sz,
+                    )
+                    if got and got >= ctypes.sizeof(RAWINPUT_MOUSE):
+                        ri = ctypes.cast(buf, ctypes.POINTER(RAWINPUT_MOUSE)).contents
+                        if ri.header.dwType == RIM_TYPEMOUSE:
+                            rm = ri.mouse
+                            dx = rm.lLastX if not (rm.usFlags & 0x01) else 0
+                            dy = rm.lLastY if not (rm.usFlags & 0x01) else 0
+                            bf = rm.parts.usButtonFlags
+                            btns = {}
+                            if bf & 0x0001: btns["l"] = True
+                            if bf & 0x0002: btns["l"] = False
+                            if bf & 0x0004: btns["r"] = True
+                            if bf & 0x0008: btns["r"] = False
+                            if bf & 0x0010: btns["m"] = True
+                            if bf & 0x0020: btns["m"] = False
+                            if bf & 0x0040: btns["x1"] = True
+                            if bf & 0x0080: btns["x1"] = False
+                            if bf & 0x0100: btns["x2"] = True
+                            if bf & 0x0200: btns["x2"] = False
+                            wheel = 0
+                            if bf & 0x0400:
+                                wd = ctypes.c_short(rm.parts.usButtonData).value
+                                wheel = 1 if wd > 0 else (-1 if wd < 0 else 0)
+                            if dx or dy or btns or wheel:
+                                self.on_mouse(dx, dy, btns, wheel)
+                else:
+                    user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception:
+            _log_exc("run_mouse")
+        finally:
+            try:
+                user32.DestroyWindow(hwnd)
+            except Exception:
+                pass
+
     def run_demo(self):
-        """Synthetic presses, only used with --demo."""
+        """Synthetic presses + smooth mouse figure-8, only used with --demo."""
+        import math
         plan = ((31, "A", 1.40, 0.0), (32, "S", 1.90, 0.45),
                 (33, "D", 1.10, 0.80), (61, "Space", 2.60, 1.30))
         t0 = time.perf_counter()
+        prev_mx, prev_my = 0.0, 0.0
         while True:
             now = time.perf_counter()
+            dt_t = now - t0
             full = self.full_mm
             for idx, name, period, phase in plan:
-                el = ((now - t0) + phase) % period
+                el = (dt_t + phase) % period
                 hold = period * 0.55
                 if el < 0.16:
                     mm = full * (el / 0.16)
                 elif el < hold:
-                    mm = full * (0.72 + 0.28 * abs(__import__("math").sin(el * 6.0)))
+                    mm = full * (0.72 + 0.28 * abs(math.sin(el * 6.0)))
                 elif el < hold + 0.14:
                     mm = full * (1 - (el - hold) / 0.14)
                 else:
@@ -827,6 +957,16 @@ class Engine(object):
                     st["vk"] = 0x41 if name == "A" else (0x53 if name == "S"
                                                          else (0x44 if name == "D" else 0x20))
                 self.on_depth(now, idx, round(max(0.0, min(full, mm)), 2))
+            # Synthetic mouse figure-8 + burst clicks
+            mx = math.sin(dt_t * 1.35) * 260.0
+            my = math.sin(dt_t * 2.70) * 140.0
+            dx, dy = int(round(mx - prev_mx)), int(round(my - prev_my))
+            prev_mx += dx
+            prev_my += dy
+            l_down = (dt_t % 1.6) < 0.22
+            r_down = 0.85 < (dt_t % 2.4) < 1.35
+            x1_down = 2.0 < (dt_t % 3.2) < 2.25
+            self.on_mouse(dx, dy, {"l": l_down, "r": r_down, "m": False, "x1": x1_down, "x2": False}, 0)
             time.sleep(0.01)
 
     def start_recording(self):
@@ -1460,7 +1600,7 @@ class Engine(object):
         return best[1] if best else None
 
     # ---- snapshots ---------------------------------------------------
-    def snapshot(self, cursor):
+    def snapshot(self, cursor, mcursor=None):
         with self.lock:
             total = self._abs
             dropped = self._abs - len(self.samples)
@@ -1469,9 +1609,25 @@ class Engine(object):
             if cursor > self._abs:
                 cursor = self._abs
             batch = self.samples[cursor - dropped:]
+            mtotal = self._mouse_abs
+            mdx = mdy = mw = 0
+            if mcursor is not None:
+                mdropped = mtotal - len(self.mouse_events)
+                mc = max(mdropped, min(mtotal, mcursor))
+                for dx, dy, w in self.mouse_events[mc - mdropped:]:
+                    mdx += dx
+                    mdy += dy
+                    mw += w
+            mstate = {
+                "n": mtotal, "dx": mdx, "dy": mdy, "w": mw,
+                "l": self.mouse_btns["l"], "r": self.mouse_btns["r"],
+                "m": self.mouse_btns["m"], "x1": self.mouse_btns["x1"],
+                "x2": self.mouse_btns["x2"],
+            }
             out = {
                 "s": [[round(t, 4), i, mm] for t, i, mm in batch],
                 "n": total,
+                "m": mstate,
                 "k": {str(i): (key_name(s["vk"]) if s["vk"] else None)
                       for i, s in self.keys.items()},
                 "live": {str(i): round(s["mm"], 2) for i, s in self.keys.items()},
@@ -1709,6 +1865,13 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif url.path == "/overlay":
             body = overlay_html().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif url.path == "/overlay/mouse":
+            body = mouse_overlay_html().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1976,10 +2139,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
         cursor = 0
+        mcursor = ENGINE._mouse_abs
         try:
             while True:
-                snap = ENGINE.snapshot(cursor)
+                snap = ENGINE.snapshot(cursor, mcursor)
                 cursor = snap["n"]
+                mcursor = snap["m"]["n"]
                 ENGINE.last_client = time.time()   # the page is still watching
                 self.wfile.write(("data: " + json.dumps(snap, separators=(",", ":")) +
                                   "\n\n").encode("utf-8"))
@@ -2069,6 +2234,10 @@ def overlay_html():
     return (OVERLAY_PAGE
             .replace("__LAYOUT__", json.dumps(_layout_dicts(), ensure_ascii=False))
             .replace("__THEME_JS__", COMMON_THEME_JS))
+
+
+def mouse_overlay_html():
+    return MOUSE_OVERLAY_PAGE.replace("__THEME_JS__", COMMON_THEME_JS)
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -2230,7 +2399,7 @@ PAGE = r"""<!DOCTYPE html>
       <span class="nav-sep"></span>
       <span class="nav-link active">监测</span>
       <a class="nav-link" href="/wb" target="_blank">素材工作台</a>
-      <a class="nav-link" href="/overlay?panel=1" target="_blank">OBS 覆盖层</a>
+      <a class="nav-link" href="/overlay?panel=1" target="_blank">直播设备</a>
     </div>
 
     <div class="hright">
@@ -3020,6 +3189,12 @@ OVERLAY_PAGE = r"""<!DOCTYPE html>
   .p-btn:hover { background: rgba(255, 255, 255, 0.15); }
   .p-btn.primary { background: rgba(56, 189, 248, 0.22); border-color: rgba(56, 189, 248, 0.55); color: #e0f2fe; }
   .p-btn.primary:hover { background: rgba(56, 189, 248, 0.34); }
+  .p-tabs { display: flex; gap: 6px; margin-bottom: 10px; padding: 3px;
+            background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; }
+  .p-tab { flex: 1; text-align: center; text-decoration: none; padding: 5px 8px; border-radius: 6px;
+           font-size: 12px; color: rgba(255, 255, 255, 0.62); transition: background .15s, color .15s; }
+  .p-tab:hover { color: #fff; background: rgba(255, 255, 255, 0.06); }
+  .p-tab.on { color: #fff; background: rgba(56, 189, 248, 0.22); font-weight: 600; }
   .p-hint { color: rgba(255, 255, 255, 0.42); font-size: 11px; margin-top: 8px; line-height: 1.4; }
 </style></head>
 <body>
@@ -3027,8 +3202,12 @@ OVERLAY_PAGE = r"""<!DOCTYPE html>
 
 <div id="panel">
   <div class="p-head">
-    <b>OBS 覆盖层配置</b>
+    <b>直播设备配置</b>
     <button class="chip" id="pClose" type="button">关闭 (C)</button>
+  </div>
+  <div class="p-tabs">
+    <a class="p-tab on" href="/overlay?panel=1">键盘 HUD</a>
+    <a class="p-tab" href="/overlay/mouse?panel=1">鼠标垫追踪</a>
   </div>
   <div class="p-row">
     <label for="pCluster">键簇</label>
@@ -3384,6 +3563,471 @@ requestAnimationFrame(draw);
 """
 
 
+MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>直播设备 · 鼠标垫追踪</title>
+<style>
+  :root { --op: 0.62; --mop: 0.90; --acc: #38bdf8; --padw: 306px; --padh: 254px; --sc: 1; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent !important; overflow: hidden;
+    color: #f4f4f5;
+    font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  }
+  body.checker {
+    background:
+      linear-gradient(45deg, #1b1e26 25%, transparent 25%, transparent 75%, #1b1e26 75%),
+      linear-gradient(45deg, #1b1e26 25%, #12141a 25%, #12141a 75%, #1b1e26 75%) !important;
+    background-size: 24px 24px !important;
+    background-position: 0 0, 12px 12px !important;
+  }
+  #stage {
+    width: 100%; height: 100%; padding: 18px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #stage.align-tl { align-items: flex-start; justify-content: flex-start; }
+  #stage.align-tr { align-items: flex-start; justify-content: flex-end; }
+  #stage.align-bl { align-items: flex-end; justify-content: flex-start; }
+  #stage.align-br { align-items: flex-end; justify-content: flex-end; }
+
+  #pad {
+    position: relative;
+    width: var(--padw); height: var(--padh);
+    border-radius: 14px;
+    background: rgba(14, 16, 20, var(--op));
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(8px);
+    overflow: hidden;
+    user-select: none;
+  }
+  #pad::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background:
+      linear-gradient(to right, transparent calc(50% - 0.5px), rgba(255,255,255,0.06) 50%, transparent calc(50% + 0.5px)),
+      linear-gradient(to bottom, transparent calc(50% - 0.5px), rgba(255,255,255,0.06) 50%, transparent calc(50% + 0.5px));
+  }
+  .corner { position: absolute; width: 10px; height: 10px; pointer-events: none;
+            border-color: rgba(255,255,255,0.22); border-style: solid; }
+  .c-tl { top: 6px; left: 6px; border-width: 1.5px 0 0 1.5px; border-radius: 3px 0 0 0; }
+  .c-tr { top: 6px; right: 6px; border-width: 1.5px 1.5px 0 0; border-radius: 0 3px 0 0; }
+  .c-bl { bottom: 6px; left: 6px; border-width: 0 0 1.5px 1.5px; border-radius: 0 0 0 3px; }
+  .c-br { bottom: 6px; right: 6px; border-width: 0 1.5px 1.5px 0; border-radius: 0 0 3px 0; }
+  #trailCv { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  #mouse {
+    position: absolute; left: 0; top: 0;
+    width: 44px; height: 84px;
+    opacity: var(--mop);
+    pointer-events: none;
+    will-change: transform;
+    filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.55));
+  }
+  #mouse svg { width: 100%; height: 100%; display: block; overflow: visible; }
+  .m-shell { fill: url(#viperGrad); stroke: rgba(255, 255, 255, 0.50); stroke-width: 18; stroke-linejoin: round; }
+  .m-seam { fill: none; stroke: rgba(255, 255, 255, 0.22); stroke-width: 12; stroke-linecap: round; }
+  .m-btn { fill: rgba(255, 255, 255, 0.03); transition: fill 0.05s linear; }
+  .m-btn.on { fill: var(--acc); fill-opacity: 0.78; }
+  .m-wheel { fill: rgba(255, 255, 255, 0.16); stroke: rgba(255, 255, 255, 0.48); stroke-width: 12; transition: fill 0.06s linear; }
+  .m-wheel.on { fill: var(--acc); stroke: #ffffff; }
+  .m-side { fill: rgba(255, 255, 255, 0.16); stroke: rgba(255, 255, 255, 0.42); stroke-width: 10; transition: fill 0.05s linear; }
+  .m-side.on { fill: var(--acc); stroke: #ffffff; }
+  .m-led { fill: var(--acc); opacity: 0.50; transition: opacity 0.12s linear; }
+  .m-led.hot { opacity: 1; }
+
+  #panel {
+    position: fixed; top: 14px; right: 14px; width: 296px;
+    background: rgba(16, 18, 24, 0.94);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 12px; padding: 12px 14px;
+    backdrop-filter: blur(12px);
+    box-shadow: 0 18px 46px rgba(0, 0, 0, 0.65);
+    font-size: 12px; display: none; z-index: 30;
+  }
+  #panel.open { display: block; }
+  .p-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .p-head b { font-size: 13px; letter-spacing: 0.5px; }
+  .p-tabs { display: flex; gap: 6px; margin-bottom: 10px; padding: 3px;
+            background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; }
+  .p-tab { flex: 1; text-align: center; text-decoration: none; padding: 5px 8px; border-radius: 6px;
+           font-size: 12px; color: rgba(255, 255, 255, 0.62); transition: background .15s, color .15s; }
+  .p-tab:hover { color: #fff; background: rgba(255, 255, 255, 0.06); }
+  .p-tab.on { color: #fff; background: rgba(56, 189, 248, 0.22); font-weight: 600; }
+  .p-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  .p-row label { color: rgba(255, 255, 255, 0.62); flex-shrink: 0; }
+  .p-row select { flex: 1; min-width: 0; background: rgba(255, 255, 255, 0.07); color: #f4f4f5;
+                  border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 6px; padding: 4px 7px; font-size: 12px; font-family: inherit; }
+  .p-row select option { background: #14171f; color: #f4f4f5; }
+  .p-row input[type=range] { flex: 1; accent-color: #38bdf8; }
+  .p-val { width: 38px; text-align: right; color: rgba(255, 255, 255, 0.85);
+           font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 4px 0 10px; }
+  .chip { background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12);
+          color: rgba(255, 255, 255, 0.80); border-radius: 6px; padding: 3px 8px; font-size: 11px;
+          cursor: pointer; display: inline-flex; align-items: center; gap: 5px; font-family: inherit; }
+  .chip:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
+  .chip.on { border-color: rgba(255, 255, 255, 0.55); background: rgba(255, 255, 255, 0.16); color: #fff; }
+  .chip .sw { width: 8px; height: 8px; border-radius: 50%; }
+  .p-url { width: 100%; background: rgba(0, 0, 0, 0.35); color: #93c5fd;
+           border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 6px;
+           padding: 5px 7px; font-size: 11px; font-family: ui-monospace, Consolas, monospace; margin-bottom: 8px; }
+  .p-actions { display: flex; gap: 6px; }
+  .p-btn { flex: 1; background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15);
+           color: #f4f4f5; border-radius: 7px; padding: 6px 8px; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .p-btn:hover { background: rgba(255, 255, 255, 0.15); }
+  .p-btn.primary { background: rgba(56, 189, 248, 0.22); border-color: rgba(56, 189, 248, 0.55); color: #e0f2fe; }
+  .p-btn.primary:hover { background: rgba(56, 189, 248, 0.34); }
+  .p-hint { color: rgba(255, 255, 255, 0.42); font-size: 11px; margin-top: 8px; line-height: 1.4; }
+</style></head>
+<body>
+<div id="stage">
+  <div id="pad">
+    <div class="corner c-tl"></div><div class="corner c-tr"></div>
+    <div class="corner c-bl"></div><div class="corner c-br"></div>
+    <canvas id="trailCv"></canvas>
+    <div id="mouse" title="Razer Viper V4 Pro (127.1×63.9mm)">
+      <svg viewBox="-22 -18 682 1307" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="viperGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#222631" stop-opacity="0.92"/>
+            <stop offset="55%" stop-color="#151820" stop-opacity="0.92"/>
+            <stop offset="100%" stop-color="#0f1117" stop-opacity="0.94"/>
+          </linearGradient>
+          <path id="viperOutline" d="M268.5 1268c-66.5-11-128.7-41.4-173.3-85-75-73.3-104.2-175-92.9-323.1 2.1-27 3.9-69.3 4.1-93.9 1.1-144.3.9-138.4 6.9-144.4 6.6-6.6 7.8-28.3 1.8-33.3-2.9-2.4-4.2-20-5.7-74.5-1.8-63.7-1.5-72.4 2.7-80.5 3.7-7.2 4.3-13.6 3-31.7-7-91.8-8.4-276.4-2.3-293.8 4.1-11.7 17.8-24.6 26-24.6 3.9 0 5.5 2.1 5.7 7.7.2 6.1.9 5.3 2.9-4l2.6-11.7 31.4-13.2C150.6 32 258.8-4 267.3-.8c3 1.1 4 7.5 4 25.6 0 21.5.5 24 4.9 23.2 2.7-.5 5.3-3.6 5.8-6.9 1.1-7.7 7.5-9.3 37.5-9.3 28.3 0 38.7 3 38.7 11.1 0 3.2 1.9 5.7 4.2 5.7 3.4 0 4.2-4.3 4.2-22.1 0-29.4 1.6-30.6 29.6-22.7 50.3 14.1 180.7 62.4 191.2 70.8 1.9 1.5 3.5 7.1 3.5 12.3s1 9.5 2.3 9.5c1.3 0 2.2-2.8 2.1-6.3-.4-11 10.2-9.4 21.5 3.1 8.1 8.9 10.5 14.3 12.2 27.5 3.7 27.6 2 154.9-3.2 243.5-8 136.1-6.8 246.9 4.1 398.2 14.8 205.3 9.9 262.2-29.6 341.6-41.4 83.1-117.7 139.9-215.6 160.3-30.7 6.4-86.6 7.8-116.4 2.9z"/>
+          <clipPath id="viperClip"><use href="#viperOutline"/></clipPath>
+        </defs>
+        <use href="#viperOutline" class="m-shell"/>
+        <g clip-path="url(#viperClip)">
+          <path id="mbL" class="m-btn" d="M 0 0 L 312 0 L 312 486 Q 160 510, 0 462 Z"/>
+          <path id="mbR" class="m-btn" d="M 326 0 L 640 0 L 640 462 Q 480 510, 326 486 Z"/>
+          <path class="m-seam" d="M 10 462 Q 165 510, 319 488 Q 473 510, 628 462"/>
+          <line class="m-seam" x1="319" y1="32" x2="319" y2="488"/>
+        </g>
+        <use href="#viperOutline" fill="none" stroke="rgba(255,255,255,0.52)" stroke-width="18" stroke-linejoin="round"/>
+        <rect id="mbM" class="m-wheel" x="284" y="138" width="70" height="184" rx="35"/>
+        <rect id="mbX2" class="m-side" x="-6" y="430" width="32" height="156" rx="14"/>
+        <rect id="mbX1" class="m-side" x="-6" y="618" width="32" height="156" rx="14"/>
+        <circle id="mbLed" class="m-led" cx="319" cy="560" r="15"/>
+      </svg>
+    </div>
+  </div>
+</div>
+
+<div id="panel">
+  <div class="p-head">
+    <b>直播设备配置</b>
+    <button class="chip" id="pClose" type="button">关闭 (C)</button>
+  </div>
+  <div class="p-tabs">
+    <a class="p-tab" href="/overlay?panel=1">键盘 HUD</a>
+    <a class="p-tab on" href="/overlay/mouse?panel=1">鼠标垫追踪</a>
+  </div>
+  <div class="p-row">
+    <label for="pPad">鼠标垫尺寸</label>
+    <select id="pPad">
+      <option value="gsr3">卓威 G-SR III (470×390)</option>
+      <option value="sq">方形 (500×500)</option>
+      <option value="wide">宽垫 (16:10)</option>
+      <option value="xl">桌垫 (900×400)</option>
+    </select>
+  </div>
+  <div class="p-row" style="margin-bottom:4px"><label>主题</label></div>
+  <div class="chips" id="pThemes"></div>
+  <div class="p-row">
+    <label for="pScale">缩放</label>
+    <input id="pScale" type="range" min="0.5" max="2.5" step="0.05" value="1">
+    <span class="p-val" id="pScaleVal">1.00</span>
+  </div>
+  <div class="p-row">
+    <label for="pOpacity">垫面透明</label>
+    <input id="pOpacity" type="range" min="0.1" max="0.95" step="0.05" value="0.62">
+    <span class="p-val" id="pOpacityVal">0.62</span>
+  </div>
+  <div class="p-row">
+    <label for="pMOpacity">鼠标透明</label>
+    <input id="pMOpacity" type="range" min="0.15" max="1.0" step="0.05" value="0.9">
+    <span class="p-val" id="pMOpacityVal">0.90</span>
+  </div>
+  <div class="p-row">
+    <label for="pSens">灵敏度</label>
+    <input id="pSens" type="range" min="0.2" max="3.0" step="0.05" value="1">
+    <span class="p-val" id="pSensVal">1.00</span>
+  </div>
+  <div class="p-row">
+    <label for="pRecenter">自动回中</label>
+    <select id="pRecenter">
+      <option value="gentle">缓慢回中（防抬鼠偏移）</option>
+      <option value="fast">快速回中</option>
+      <option value="off">保持原位（按 R 归中）</option>
+    </select>
+  </div>
+  <div class="p-row">
+    <label for="pAlign">对齐</label>
+    <select id="pAlign">
+      <option value="center">居中</option>
+      <option value="tl">左上</option>
+      <option value="tr">右上</option>
+      <option value="bl">左下</option>
+      <option value="br">右下</option>
+    </select>
+  </div>
+  <div class="p-row">
+    <label for="pTrail">移动轨迹</label>
+    <input id="pTrail" type="checkbox" checked>
+  </div>
+  <div class="p-row">
+    <label for="pChecker">预览透明格</label>
+    <input id="pChecker" type="checkbox">
+  </div>
+  <input id="pUrl" class="p-url" type="text" readonly>
+  <div class="p-actions">
+    <button id="pCopy" class="p-btn primary" type="button">复制鼠标垫链接</button>
+    <button id="pReset" class="p-btn" type="button">恢复默认</button>
+  </div>
+  <div class="p-hint">独立透明源，与键盘 HUD 链接分开；OBS 添加两个「浏览器」源即可各自自由摆放。按 C 切面板，按 R 归中。</div>
+</div>
+
+<script>
+__THEME_JS__
+const PAD_SIZES = { gsr3: [306, 254], sq: [270, 270], wide: [340, 212], xl: [405, 180] };
+function clamp(v, lo, hi, def) {
+  const n = parseFloat(v);
+  return isNaN(n) ? def : Math.max(lo, Math.min(hi, n));
+}
+function readConfig() {
+  const q = new URLSearchParams(location.search);
+  const rawPad = (q.get('pad') || 'gsr3').toLowerCase();
+  const pad = PAD_SIZES[rawPad] ? rawPad : 'gsr3';
+  const hasThemeQ = q.has('theme');
+  const rawTheme = (q.get('theme') || 'ramp').toLowerCase();
+  const theme = FILL_PRESETS[rawTheme] ? rawTheme : 'ramp';
+  const rawRec = (q.get('recenter') || 'gentle').toLowerCase();
+  const recenter = ['gentle', 'fast', 'off'].indexOf(rawRec) >= 0 ? rawRec : 'gentle';
+  const rawAlign = (q.get('align') || 'center').toLowerCase();
+  const align = ['center', 'tl', 'tr', 'bl', 'br'].indexOf(rawAlign) >= 0 ? rawAlign : 'center';
+  const rawTrail = (q.get('trail') || '1').toLowerCase();
+  return {
+    pad, theme, hasThemeQ,
+    scale: clamp(q.get('scale'), 0.5, 2.5, 1.0),
+    opacity: clamp(q.get('opacity') !== null ? q.get('opacity') : q.get('alpha'), 0.1, 0.95, 0.62),
+    mopacity: clamp(q.get('mopacity'), 0.15, 1.0, 0.90),
+    sens: clamp(q.get('sens'), 0.2, 3.0, 1.0),
+    recenter, align,
+    trail: !(rawTrail === '0' || rawTrail === 'false' || rawTrail === 'off'),
+    panel: q.get('panel') === '1'
+  };
+}
+
+let cfg = readConfig();
+const stage = document.getElementById('stage');
+const padEl = document.getElementById('pad');
+const mouseEl = document.getElementById('mouse');
+const trailCv = document.getElementById('trailCv');
+const tCtx = trailCv.getContext('2d');
+const panelEl = document.getElementById('panel');
+const pThemes = document.getElementById('pThemes');
+let padW = 340, padH = 210, mouseW = 52, mouseH = 80;
+
+for (const id in FILL_PRESETS) {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'chip'; b.dataset.theme = id;
+  b.innerHTML = '<span class="sw" style="background:' + FILL_PRESETS[id].acc + '"></span>' + FILL_PRESETS[id].label;
+  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(); });
+  pThemes.appendChild(b);
+}
+
+function buildObsUrl(includePanel) {
+  const p = new URLSearchParams();
+  if (cfg.pad !== 'gsr3') p.set('pad', cfg.pad);
+  if (cfg.theme !== 'ramp') p.set('theme', cfg.theme);
+  if (Math.abs(cfg.scale - 1.0) > 0.005) p.set('scale', cfg.scale.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
+  if (Math.abs(cfg.opacity - 0.62) > 0.005) p.set('opacity', cfg.opacity.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
+  if (Math.abs(cfg.mopacity - 0.90) > 0.005) p.set('mopacity', cfg.mopacity.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
+  if (Math.abs(cfg.sens - 1.0) > 0.005) p.set('sens', cfg.sens.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
+  if (cfg.recenter !== 'gentle') p.set('recenter', cfg.recenter);
+  if (cfg.align !== 'center') p.set('align', cfg.align);
+  if (!cfg.trail) p.set('trail', '0');
+  if (includePanel) p.set('panel', '1');
+  const qs = p.toString();
+  return location.origin + '/overlay/mouse' + (qs ? ('?' + qs) : '');
+}
+
+function syncPanelUI() {
+  document.getElementById('pPad').value = cfg.pad;
+  document.getElementById('pScale').value = cfg.scale;
+  document.getElementById('pScaleVal').textContent = cfg.scale.toFixed(2);
+  document.getElementById('pOpacity').value = cfg.opacity;
+  document.getElementById('pOpacityVal').textContent = cfg.opacity.toFixed(2);
+  document.getElementById('pMOpacity').value = cfg.mopacity;
+  document.getElementById('pMOpacityVal').textContent = cfg.mopacity.toFixed(2);
+  document.getElementById('pSens').value = cfg.sens;
+  document.getElementById('pSensVal').textContent = cfg.sens.toFixed(2);
+  document.getElementById('pRecenter').value = cfg.recenter;
+  document.getElementById('pAlign').value = cfg.align;
+  document.getElementById('pTrail').checked = cfg.trail;
+  for (const ch of pThemes.children) ch.classList.toggle('on', ch.dataset.theme === cfg.theme);
+  document.getElementById('pUrl').value = buildObsUrl(false);
+  panelEl.classList.toggle('open', cfg.panel);
+}
+
+function applyConfig() {
+  const base = PAD_SIZES[cfg.pad] || PAD_SIZES.gsr3;
+  padW = Math.round(base[0] * cfg.scale);
+  padH = Math.round(base[1] * cfg.scale);
+  mouseW = Math.round(44 * cfg.scale);
+  mouseH = Math.round(84 * cfg.scale);
+  document.documentElement.style.setProperty('--padw', padW + 'px');
+  document.documentElement.style.setProperty('--padh', padH + 'px');
+  document.documentElement.style.setProperty('--op', cfg.opacity.toFixed(2));
+  document.documentElement.style.setProperty('--mop', cfg.mopacity.toFixed(2));
+  const preset = FILL_PRESETS[cfg.theme] || FILL_PRESETS.ramp;
+  document.documentElement.style.setProperty('--acc', preset.acc);
+  mouseEl.style.width = mouseW + 'px';
+  mouseEl.style.height = mouseH + 'px';
+  stage.className = 'align-' + cfg.align;
+  const dpr = window.devicePixelRatio || 1;
+  trailCv.width = Math.max(1, Math.round(padW * dpr));
+  trailCv.height = Math.max(1, Math.round(padH * dpr));
+  tCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  syncPanelUI();
+  try { history.replaceState(null, '', buildObsUrl(cfg.panel)); } catch (e) {}
+}
+
+document.getElementById('pPad').addEventListener('change', e => { cfg.pad = e.target.value; applyConfig(); });
+document.getElementById('pScale').addEventListener('input', e => { cfg.scale = parseFloat(e.target.value); applyConfig(); });
+document.getElementById('pOpacity').addEventListener('input', e => { cfg.opacity = parseFloat(e.target.value); applyConfig(); });
+document.getElementById('pMOpacity').addEventListener('input', e => { cfg.mopacity = parseFloat(e.target.value); applyConfig(); });
+document.getElementById('pSens').addEventListener('input', e => { cfg.sens = parseFloat(e.target.value); applyConfig(); });
+document.getElementById('pRecenter').addEventListener('change', e => { cfg.recenter = e.target.value; applyConfig(); });
+document.getElementById('pAlign').addEventListener('change', e => { cfg.align = e.target.value; applyConfig(); });
+document.getElementById('pTrail').addEventListener('change', e => { cfg.trail = e.target.checked; if (!cfg.trail) trail.length = 0; applyConfig(); });
+document.getElementById('pChecker').addEventListener('change', e => { document.body.classList.toggle('checker', e.target.checked); });
+document.getElementById('pClose').addEventListener('click', () => {
+  cfg.panel = false; document.body.classList.remove('checker'); document.getElementById('pChecker').checked = false;
+  syncPanelUI(); try { history.replaceState(null, '', buildObsUrl(false)); } catch (e) {}
+});
+document.getElementById('pReset').addEventListener('click', () => {
+  cfg = { pad:'gsr3', theme:'ramp', hasThemeQ:false, scale:1.0, opacity:0.62, mopacity:0.90, sens:1.0, recenter:'gentle', align:'center', trail:true, panel:cfg.panel };
+  tx = ty = px = py = 0; trail.length = 0; applyConfig();
+});
+document.getElementById('pCopy').addEventListener('click', () => {
+  const url = buildObsUrl(false), btn = document.getElementById('pCopy');
+  const done = () => { btn.textContent = '已复制 ✓'; setTimeout(() => { btn.textContent = '复制鼠标垫链接'; }, 1600); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(done, () => { const i = document.getElementById('pUrl'); i.select(); document.execCommand('copy'); done(); });
+  } else { const i = document.getElementById('pUrl'); i.select(); document.execCommand('copy'); done(); }
+});
+addEventListener('keydown', e => {
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+  if (e.code === 'KeyC' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+    cfg.panel = !cfg.panel;
+    if (!cfg.panel) { document.body.classList.remove('checker'); document.getElementById('pChecker').checked = false; }
+    syncPanelUI(); try { history.replaceState(null, '', buildObsUrl(cfg.panel)); } catch (e2) {}
+  } else if (e.code === 'KeyR' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+    tx = ty = 0; trail.length = 0;
+  }
+});
+
+let tx = 0, ty = 0, px = 0, py = 0, lastMoveMs = 0, wheelUntil = 0, lastFrameMs = performance.now();
+const btns = { l: false, r: false, m: false, x1: false, x2: false };
+const trail = [];
+const mbL = document.getElementById('mbL'), mbR = document.getElementById('mbR');
+const mbM = document.getElementById('mbM'), mbX1 = document.getElementById('mbX1');
+const mbX2 = document.getElementById('mbX2'), mbLed = document.getElementById('mbLed');
+
+const es = new EventSource('/events');
+es.onmessage = ev => {
+  const m = JSON.parse(ev.data);
+  if (!cfg.hasThemeQ && m.theme && FILL_PRESETS[m.theme] && m.theme !== cfg.theme) {
+    cfg.theme = m.theme; applyConfig();
+  }
+  const ms = m.m;
+  if (!ms) return;
+  if (ms.dx || ms.dy) {
+    const step = 0.0032 * cfg.sens;
+    const rx = Math.max(1, (padW - mouseW) * 0.5);
+    const ry = Math.max(1, (padH - mouseH) * 0.5);
+    const ratio = rx / ry;
+    tx = Math.max(-1, Math.min(1, tx + ms.dx * step));
+    ty = Math.max(-1, Math.min(1, ty + ms.dy * step * ratio));
+    lastMoveMs = performance.now();
+  }
+  if (ms.w) wheelUntil = performance.now() + 140;
+  btns.l = !!ms.l; btns.r = !!ms.r; btns.m = !!ms.m;
+  btns.x1 = !!ms.x1; btns.x2 = !!ms.x2;
+};
+
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastFrameMs) / 1000);
+  lastFrameMs = now;
+  const idleMs = now - lastMoveMs;
+  if (cfg.recenter === 'fast') {
+    const k = Math.exp(-dt * 4.5);
+    tx *= k; ty *= k;
+  } else if (cfg.recenter === 'gentle' && idleMs > 320) {
+    const k = Math.exp(-dt * 1.4);
+    tx *= k; ty *= k;
+  }
+  const prevX = px, prevY = py;
+  const alpha = 1 - Math.exp(-dt * 24);
+  px += (tx - px) * alpha;
+  py += (ty - py) * alpha;
+
+  const padInset = 10 * cfg.scale;
+  const maxOx = Math.max(4, (padW - mouseW) * 0.5 - padInset);
+  const maxOy = Math.max(4, (padH - mouseH) * 0.5 - padInset);
+  const cx = padW * 0.5 + px * maxOx;
+  const cy = padH * 0.5 + py * maxOy;
+  const vx = (px - prevX) / Math.max(0.004, dt);
+  const tilt = Math.max(-6, Math.min(6, vx * 1.2));
+  mouseEl.style.transform = 'translate3d(' + (cx - mouseW * 0.5).toFixed(1) + 'px,' +
+    (cy - mouseH * 0.5).toFixed(1) + 'px,0) rotate(' + tilt.toFixed(2) + 'deg)';
+
+  const moving = idleMs < 180;
+  mbL.classList.toggle('on', btns.l);
+  mbR.classList.toggle('on', btns.r);
+  mbM.classList.toggle('on', btns.m || now < wheelUntil);
+  mbX1.classList.toggle('on', btns.x1);
+  mbX2.classList.toggle('on', btns.x2);
+  mbLed.classList.toggle('hot', moving || btns.l || btns.r);
+
+  if (cfg.trail) {
+    if (moving || trail.length) {
+      if (moving) trail.push([cx, cy, now]);
+      while (trail.length && (now - trail[0][2] > 620 || trail.length > 48)) trail.shift();
+      tCtx.clearRect(0, 0, padW, padH);
+      if (trail.length > 1) {
+        const speedR = Math.min(1, Math.hypot(tx - px, ty - py) * 3.5 + (btns.l ? 0.5 : 0));
+        const st = (FILL_PRESETS[cfg.theme] || FILL_PRESETS.ramp).style(speedR);
+        tCtx.lineCap = 'round'; tCtx.lineJoin = 'round';
+        for (let i = 1; i < trail.length; i++) {
+          const age = 1 - (now - trail[i][2]) / 620;
+          if (age <= 0) continue;
+          tCtx.strokeStyle = st.acc;
+          tCtx.globalAlpha = age * 0.68;
+          tCtx.lineWidth = Math.max(1.4, age * 3.5 * cfg.scale);
+          tCtx.beginPath();
+          tCtx.moveTo(trail[i - 1][0], trail[i - 1][1]);
+          tCtx.lineTo(trail[i][0], trail[i][1]);
+          tCtx.stroke();
+        }
+        tCtx.globalAlpha = 1;
+      }
+    }
+  } else {
+    tCtx.clearRect(0, 0, padW, padH);
+  }
+  requestAnimationFrame(loop);
+}
+
+applyConfig();
+requestAnimationFrame(loop);
+</script>
+</body></html>
+"""
+
+
 
 def single_instance():
     """Only one monitor per user: two instances would fight over mapping.json."""
@@ -3492,7 +4136,7 @@ def workbench_html():
   <span id="r_stamp" style="display:none"></span>
   <span style="flex:1"></span>
   <a class="nav" href="/">← 返回监测</a>
-  <a class="nav" href="/overlay?panel=1" target="_blank">OBS 覆盖层</a>
+  <a class="nav" href="/overlay?panel=1" target="_blank">直播设备</a>
 </header>
 
 <div class="wrap">
@@ -4211,7 +4855,7 @@ def main():
         return
 
     start = (ENGINE.run_demo, ENGINE.rate_tick) if args.demo else \
-            (ENGINE.run_reader, ENGINE.run_keys, ENGINE.rate_tick)
+            (ENGINE.run_reader, ENGINE.run_keys, ENGINE.run_mouse, ENGINE.rate_tick)
     for fn in start:
         t = threading.Thread(target=fn)
         t.daemon = True
