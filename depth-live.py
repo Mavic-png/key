@@ -33,10 +33,10 @@ except ImportError:                      # Python < 3.7
     class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
         daemon_threads = True
         allow_reuse_address = True
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlsplit
 
 FULL = 3.50
-VERSION = "1.9.8"
+VERSION = "1.9.9"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1033,10 +1033,35 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    STATE_PATHS = ("/rec/start", "/rec/stop", "/rec/clear", "/auto", "/bind",
+                   "/resetmap", "/reset", "/openfolder", "/quit")
+
+    def same_origin(self):
+        """Reject cross-site writes. Browsers send Origin (fetch) or Referer
+        (img/script); a plain local client sends neither and is allowed."""
+        port = self.server.server_address[1]
+
+        def ok(hostname, p):
+            return hostname in ("127.0.0.1", "localhost", "::1") and p in (None, port)
+
+        for header in ("Origin", "Referer"):
+            raw = (self.headers.get(header) or "").strip()
+            if not raw:
+                continue
+            try:
+                parts = urlsplit(raw)
+            except ValueError:
+                return False
+            return ok(parts.hostname, parts.port)
+        return True
+
     def do_GET(self):
-        host = (self.headers.get("Host") or "").strip().lower()
-        host = host.rsplit(":", 1)[0] if host else ""
-        if host not in ("127.0.0.1", "localhost", "[::1]", ""):
+        raw_host = (self.headers.get("Host") or "").strip().lower()
+        try:
+            host = urlsplit("//" + raw_host).hostname if raw_host else ""
+        except ValueError:
+            host = None
+        if host not in ("127.0.0.1", "localhost", "::1", ""):
             body = b"bad host"
             self.send_response(403)
             self.send_header("Content-Length", str(len(body)))
@@ -1045,6 +1070,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         ENGINE.last_client = time.time()
         url = urlparse(self.path)
+        if url.path in self.STATE_PATHS and not self.same_origin():
+            body = b"cross-origin rejected"
+            self.send_response(403)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if url.path == "/":
             body = page_html().encode("utf-8")
             self.send_response(200)

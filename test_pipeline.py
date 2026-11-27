@@ -41,9 +41,13 @@ def load(name, path):
 
 
 # tests must never read or write the real mapping file
-os.environ["DEPTH_MONITOR_HOME"] = tempfile.mkdtemp(prefix="dl-test-")
+_TEST_HOME = tempfile.mkdtemp(prefix="dl-test-")
+os.environ["DEPTH_MONITOR_HOME"] = _TEST_HOME
 
 dl = load("dl", os.path.join(HERE, "depth-live.py"))
+
+assert os.path.abspath(dl.ENGINE.map_path).startswith(os.path.abspath(_TEST_HOME)), (
+    "tests would touch the real mapping file: %s" % dl.ENGINE.map_path)
 
 
 def make_engine(mapped=5, unmapped=3, samples=120):
@@ -572,6 +576,40 @@ def t_rejects_foreign_host():
         srv.shutdown()
 
 
+def t_ipv6_host_allowed():
+    """Host: [::1] must parse correctly (rsplit broke it before)."""
+    import http.client
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/snapshot", headers={"Host": "[::1]:%d" % port})
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 200, "IPv6 loopback host rejected: %d" % resp.status
+        conn.close()
+    finally:
+        srv.shutdown()
+
+
+def t_cross_origin_state_change_rejected():
+    """A page on another origin must not be able to reset the mapping."""
+    import http.client
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/resetmap", headers={"Origin": "http://evil.example.com"})
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 403, resp.status
+        conn.close()
+        # a same-origin request still works
+        fetch(port, "/resetmap")
+    finally:
+        srv.shutdown()
+
+
 def t_single_instance_guard():
     """Second instance on the same config dir must exit; another dir must start."""
     import subprocess, tempfile, time
@@ -681,6 +719,8 @@ def main():
         ("idle exit runs full shutdown", t_idle_exit_uses_full_shutdown),
         ("quit 409 over real http", t_quit_http_409_when_save_fails),
         ("foreign host rejected", t_rejects_foreign_host),
+        ("ipv6 host allowed", t_ipv6_host_allowed),
+        ("cross-origin write rejected", t_cross_origin_state_change_rejected),
         ("single instance guard", t_single_instance_guard),
         ("frames loader (wide csv)", t_frames_from_wide),
     ]:

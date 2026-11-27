@@ -102,7 +102,7 @@ and Premiere imports it as an image sequence with alpha intact.
 python test_pipeline.py
 ```
 
-Thirty-two headless checks, including the ones static reviews asked for:
+Thirty-four headless checks, including the ones static reviews asked for:
 
 * firmware switch-zero vs. real release (both orders)
 * hold re-emission when the mapping table is empty
@@ -126,7 +126,9 @@ Thirty-two headless checks, including the ones static reviews asked for:
 * a manual bind keeps its own press valid, and a deferred bind does too
 * the idle timer runs the same ordered shutdown as `/quit`
 * a failed save answers 409 over real HTTP and leaves the server running
-* a foreign `Host` header is refused (DNS rebinding)
+* a foreign `Host` header is refused (DNS rebinding) and `[::1]` still parses
+* cross-origin state changes are refused while same-origin keeps working
+* the suite asserts its engine points at the temp config dir
 
 ## Licence
 
