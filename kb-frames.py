@@ -33,6 +33,12 @@ LAYOUTS = {
         ("A", 0.0, 1.0, 1.0), ("S", 1.0, 1.0, 1.0), ("D", 2.0, 1.0, 1.0),
         ("LAlt", 0.0, 2.0, 1.25), ("Space", 1.25, 2.0, 2.75),
     ],
+    # compact cluster for overlaying on gameplay: movement keys, crouch, jump
+    "hud": [
+        ("W", 1.0, 0.0, 1.0),
+        ("A", 0.0, 1.0, 1.0), ("S", 1.0, 1.0, 1.0), ("D", 2.0, 1.0, 1.0),
+        ("LCtrl", 0.0, 2.0, 1.25), ("Space", 1.25, 2.0, 3.0),
+    ],
 }
 LABELS = {"LAlt": "Alt", "Space": "", "Bksp": "Back", "LShift": "Shift",
           "LCtrl": "Ctrl", "Enter": "Enter", "Tab": "Tab"}
@@ -184,9 +190,9 @@ def build_slot(label, x, y, w, unit, gap, theme, alpha, width_px):
                 label_img=label_img, width=width_px, theme=theme)
 
 
-def render_frame(idx, fps, size, slots, series):
+def render_frame(idx, fps, size, slots, series, bg=None):
     W, H = size
-    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    canvas = Image.new("RGBA", (W, H), bg if bg else (0, 0, 0, 0))
     t = idx / float(fps)
     draw = ImageDraw.Draw(canvas)
     for s in slots:
@@ -223,7 +229,7 @@ def _init(cfg):
     _W.update(cfg)
 
 
-FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "ffmpeg"
+FFMPEG = r"C:\Users\74005\ffmpeg\bin\ffmpeg.exe"
 
 
 def _segment_cmd(path, size, fps):
@@ -271,7 +277,8 @@ def _render_range(rng):
     start, end = rng
     out = _W["out"]
     for i in range(start, end):
-        img = render_frame(i, _W["fps"], _W["size"], _W["slots"], _W["series"])
+        img = render_frame(i, _W["fps"], _W["size"], _W["slots"], _W["series"],
+                           _W.get("bg"))
         img.save(os.path.join(out, "frame_%05d.png" % i), "PNG", compress_level=1)
     return end - start
 
@@ -357,6 +364,7 @@ def main():
     ap.add_argument("--start", type=float, default=0.0)
     ap.add_argument("--end", type=float, default=0.0)
     ap.add_argument("--jobs", type=int, default=0, help="worker processes (0 = all cores)")
+    ap.add_argument("--bg", default="", help="solid background colour, e.g. #101014")
     ap.add_argument("--png-only", action="store_true")
     ap.add_argument("--pipe", action="store_true", default=False,
                     help="stream frames into per-worker ffmpeg (slower on ProRes)")
@@ -413,7 +421,18 @@ def main():
 
     import time
     t0 = time.perf_counter()
-    cfg = dict(out=out_dir, fps=args.fps, size=(W, H), slots=slots, series=series)
+    bg = None
+    if args.bg:
+        hexval = args.bg.lstrip("#")
+        if len(hexval) == 6:
+            bg = (int(hexval[0:2], 16), int(hexval[2:4], 16), int(hexval[4:6], 16), 255)
+        elif len(hexval) == 8:
+            bg = (int(hexval[0:2], 16), int(hexval[2:4], 16),
+                  int(hexval[4:6], 16), int(hexval[6:8], 16))
+        else:
+            print("bad --bg value, expected #RRGGBB or #RRGGBBAA")
+            return 2
+    cfg = dict(out=out_dir, fps=args.fps, size=(W, H), slots=slots, series=series, bg=bg)
     if jobs <= 1 or n < 40:
         _init(cfg)
         _render_range((0, n))

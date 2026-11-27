@@ -53,7 +53,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
