@@ -53,7 +53,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1411,7 +1411,9 @@ PAGE = r"""<!DOCTYPE html>
   #right { width:352px; display:flex; flex-direction:column; gap:12px; }
   .card.pad { padding:14px 16px; }
   .big { display:flex; align-items:baseline; justify-content:space-between; }
-  #livecard { flex:0 0 auto; max-height:150px; overflow:hidden; }
+  /* fixed height: the list grows while several keys are held, and a growing
+     card would shrink the keyboard card and move the keys up and down */
+  #livecard { flex:0 0 196px; height:196px; overflow:hidden; }
   #livecard #bars { min-height:0; }
   #curkey { font-size:30px; font-weight:700; letter-spacing:1px; }
   #curmm { font-size:34px; font-weight:700; color:var(--acc); font-variant-numeric:tabular-nums; }
