@@ -127,7 +127,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.16.1"
+VERSION = "1.16.2"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1672,6 +1672,7 @@ class Engine(object):
                     prev[vk] = False
                     self.released_by_watchdog += 1
                     self.apply_key_state(vk, False, now)
+            self.sweep_silent_released(now)
             # global hotkeys: work even when the game has focus (no window switching)
             ctrl = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
             alt = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
@@ -1721,6 +1722,27 @@ class Engine(object):
         except Exception:
             pass
 
+    def sweep_silent_released(self, now, silence=0.12):
+        """Fallback zero for keys that are OS-up AND whose HID analog stream went silent.
+
+        With Rapid Trigger or SOCD enabled, OS Key-Up fires while the physical magnet
+        is still depressed (e.g. 3.25 mm) and the keyboard keeps streaming real 100 Hz
+        travel until physical release (0.00 mm). Only zero here if the stream actually
+        stopped updating for longer than `silence` seconds.
+        """
+        with self.lock:
+            stale = []
+            for idx, st in self.keys.items():
+                vk = st.get("vk")
+                if vk is None or st.get("mm", 0.0) <= 0.0:
+                    continue
+                if self.os_key_down(vk):
+                    continue
+                if now - st.get("t_last", 0.0) > silence:
+                    stale.append(idx)
+            for idx in stale:
+                self.on_depth(now, idx, 0.0)
+
     def apply_key_state(self, vk, down, now):
         """Apply one physical key transition. Shared by the edge detector and the
         watchdog so a missed edge cannot leave a key stuck as held."""
@@ -1728,17 +1750,15 @@ class Engine(object):
             self._log_key(vk, down)
             with self.lock:
                 self.mark_key(vk, down, now)
-                if not down:
-                    released = [i for i, st in self.keys.items()
-                                if st.get("vk") == vk]
-                    for i in released:
-                        self.on_depth(now, i, 0.0)
                 # hold the lock across the transition so a mapping reset from
-                # another thread cannot slip in between
+                # another thread cannot slip in between; also measure RT release
+                # depth BEFORE any silent-fallback zeroing
                 bumped = self._key_transition(vk, down, now)
                 if bumped and self.key_known(vk):
                     # this very press taught/bound the key: keep its state
                     self.refresh_key_state(vk, down, now)
+                if not down:
+                    self.sweep_silent_released(now)
         except Exception:
             now_s = time.time()
             if now_s - getattr(self, "_last_key_err", 0) > 1.0:

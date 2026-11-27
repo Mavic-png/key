@@ -1052,6 +1052,47 @@ def t_mouse_memory_cap_and_mouse_only_and_integrity():
     assert open(latest_p, encoding="utf-8").read() == before
 
 
+def t_rt_release_preserves_true_travel():
+    """RT OS Key-Up while magnet is still at 3.25mm must NOT inject an artificial 0.0."""
+    e = make_engine()
+    e.start_recording()
+    e.on_depth(1.000, 31, 3.50)
+    e.apply_key_state(0x41, True, 1.000)
+    e.on_depth(1.010, 31, 3.50)
+    # RT fires OS Key-Up at 1.015s while physical magnet is only slightly lifted
+    e.apply_key_state(0x41, False, 1.015)
+    assert e.keys[31]["mm"] == 3.50, "RT key-up wrongly slammed mm to %r" % e.keys[31]["mm"]
+    assert all(r[2] > 0.0 for r in e.rec), "artificial 0.0 injected into recording: %r" % e.rec
+    assert e.press_state[31] and e.press_state[31]["up"] == 3.50, e.press_state[31]
+    # Hardware continues streaming real rebound travel every 10ms
+    for i, mm in enumerate((3.25, 2.80, 2.41, 1.49, 0.35), start=1):
+        t = 1.015 + i * 0.010
+        e.on_depth(t, 31, mm)
+        e.sweep_silent_released(t + 0.004)
+        assert e.keys[31]["mm"] == mm, (mm, e.keys[31]["mm"])
+    # Hardware finally sends physical 0.00 mm
+    e.on_depth(1.080, 31, 0.0)
+    assert e.keys[31]["mm"] == 0.0
+    assert e.last_press and e.last_press["peak"] == 3.50
+
+
+def t_socd_hold_and_silent_fallback():
+    """SOCD OS Key-Up keeps true depth while HID streams, and zeroes after 120ms silence."""
+    e = make_engine()
+    e.on_depth(2.000, 31, 3.50)
+    e.apply_key_state(0x41, True, 2.000)
+    # SOCD triggers A Key-Up while finger keeps holding A at 3.50mm
+    e.apply_key_state(0x41, False, 2.010)
+    for i in range(1, 20):
+        t = 2.010 + i * 0.010
+        e.on_depth(t, 31, 3.50)
+        e.sweep_silent_released(t + 0.005)
+        assert e.keys[31]["mm"] == 3.50
+    # Once HID stream goes silent for >120ms while OS-up, fallback zeroes cleanly
+    e.sweep_silent_released(2.010 + 0.20 + 0.15)
+    assert e.keys[31]["mm"] == 0.0, e.keys[31]["mm"]
+
+
 def main():
     print("depth pipeline tests")
     for name, fn in [
@@ -1105,6 +1146,8 @@ def main():
         ("autosave failure restores buffers", t_autosave_failure_restores_buffers),
         ("rapid click and wheel preserved", t_rapid_click_and_wheel_preserved),
         ("mouse cap, mouse-only & integrity", t_mouse_memory_cap_and_mouse_only_and_integrity),
+        ("RT release preserves true travel", t_rt_release_preserves_true_travel),
+        ("SOCD hold + silent fallback zero", t_socd_hold_and_silent_fallback),
     ]:
         check(name, fn)
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
