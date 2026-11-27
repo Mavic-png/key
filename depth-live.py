@@ -127,7 +127,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.15.0"
+VERSION = "1.15.1"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -445,6 +445,7 @@ class Engine(object):
         self.settings_path = os.path.join(data_home, "settings.json")
         self.full_mm = FULL
         self.theme = "ramp"
+        self.mouse_span = 14800
         self.mouse_events = []       # (dx, dy, wheel) live ring for SSE cursors
         self._mouse_abs = 0
         self.mouse_btns = {"l": False, "r": False, "m": False, "x1": False, "x2": False}
@@ -462,10 +463,13 @@ class Engine(object):
             th = (raw.get("theme") or "").strip().lower()
             if th in ("ramp", "cyan", "mint", "amber", "crimson", "violet"):
                 self.theme = th
+            ms = int(round(float(raw.get("mouse_span", 14800))))
+            if 500 <= ms <= 200000:
+                self.mouse_span = ms
         except Exception:
             pass
 
-    def update_settings(self, full_mm=None, theme=None, save=True):
+    def update_settings(self, full_mm=None, theme=None, mouse_span=None, save=True):
         with self.lock:
             if full_mm is not None:
                 try:
@@ -478,7 +482,14 @@ class Engine(object):
                 th = str(theme).strip().lower()
                 if th in ("ramp", "cyan", "mint", "amber", "crimson", "violet"):
                     self.theme = th
-            snap = {"full_mm": self.full_mm, "theme": self.theme}
+            if mouse_span is not None:
+                try:
+                    ms = int(round(float(mouse_span)))
+                    if 500 <= ms <= 200000:
+                        self.mouse_span = ms
+                except (TypeError, ValueError):
+                    pass
+            snap = {"full_mm": self.full_mm, "theme": self.theme, "mouse_span": self.mouse_span}
         if save:
             try:
                 self._write_atomic(self.settings_path, json.dumps(snap, ensure_ascii=False, indent=1))
@@ -957,9 +968,9 @@ class Engine(object):
                     st["vk"] = 0x41 if name == "A" else (0x53 if name == "S"
                                                          else (0x44 if name == "D" else 0x20))
                 self.on_depth(now, idx, round(max(0.0, min(full, mm)), 2))
-            # Synthetic mouse figure-8 + burst clicks
-            mx = math.sin(dt_t * 1.35) * 260.0
-            my = math.sin(dt_t * 2.70) * 140.0
+            # Synthetic mouse figure-8 + burst clicks (scaled to ~14800-count G-SR III pad)
+            mx = math.sin(dt_t * 1.35) * 5200.0
+            my = math.sin(dt_t * 2.70) * 3000.0
             dx, dy = int(round(mx - prev_mx)), int(round(my - prev_my))
             prev_mx += dx
             prev_my += dy
@@ -1113,8 +1124,9 @@ class Engine(object):
         there is no reason to keep a HID reader and a process alive."""
         if seconds <= 0:
             return
+        step = min(1.5, max(0.2, seconds / 4.0))
         while True:
-            time.sleep(5.0)
+            time.sleep(step)
             with self.lock:
                 busy = self.recording or self.auto
             if busy:
@@ -1649,6 +1661,7 @@ class Engine(object):
                 "token": self.token,
                 "full_mm": round(self.full_mm, 2),
                 "theme": self.theme,
+                "mouse_span": self.mouse_span,
                 "binding": self.pending_label,
                 "bind_msg": self.bind_msg,
                 "recording": self.recording,
@@ -2090,8 +2103,10 @@ class Handler(BaseHTTPRequestHandler):
                 body_obj = {}
             full_v = body_obj.get("full_mm", (q.get("full_mm") or [None])[0])
             theme_v = body_obj.get("theme", (q.get("theme") or [None])[0])
-            snap = ENGINE.update_settings(full_mm=full_v, theme=theme_v, save=True)
-            self._send_json({"ok": True, "full_mm": snap["full_mm"], "theme": snap["theme"]})
+            span_v = body_obj.get("mouse_span", (q.get("mouse_span") or [None])[0])
+            snap = ENGINE.update_settings(full_mm=full_v, theme=theme_v, mouse_span=span_v, save=True)
+            self._send_json({"ok": True, "full_mm": snap["full_mm"],
+                             "theme": snap["theme"], "mouse_span": snap["mouse_span"]})
         elif url.path == "/resetmap":
             ENGINE.reset_mapping()
             body = b"ok"
@@ -3677,7 +3692,21 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
   .p-btn:hover { background: rgba(255, 255, 255, 0.15); }
   .p-btn.primary { background: rgba(56, 189, 248, 0.22); border-color: rgba(56, 189, 248, 0.55); color: #e0f2fe; }
   .p-btn.primary:hover { background: rgba(56, 189, 248, 0.34); }
+  .p-btn.cal { background: rgba(251, 191, 36, 0.16); border-color: rgba(251, 191, 36, 0.48); color: #fde68a; }
+  .p-btn.cal:hover { background: rgba(251, 191, 36, 0.28); }
+  .p-btn.cal.on { background: rgba(251, 191, 36, 0.32); color: #fff; }
   .p-hint { color: rgba(255, 255, 255, 0.42); font-size: 11px; margin-top: 8px; line-height: 1.4; }
+  #calBanner {
+    position: absolute; inset: 0; z-index: 20; display: none;
+    flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+    background: rgba(12, 15, 21, 0.86); backdrop-filter: blur(6px);
+    padding: 14px; text-align: center;
+  }
+  #calBanner.on { display: flex; }
+  #calBanner b { font-size: 13px; color: #fde68a; }
+  #calBanner span { font-size: 11px; color: rgba(255, 255, 255, 0.78); line-height: 1.45; }
+  #calCount { font-size: 18px; font-weight: 700; color: #38bdf8;
+              font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; }
 </style></head>
 <body>
 <div id="stage">
@@ -3709,6 +3738,12 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
         <rect id="mbX1" class="m-side" x="-6" y="618" width="32" height="156" rx="14"/>
         <circle id="mbLed" class="m-led" cx="319" cy="560" r="15"/>
       </svg>
+    </div>
+    <div id="calBanner">
+      <b>垫宽校准中（左 → 右）</b>
+      <span>请把鼠标放物理垫子最左侧<br>向右平推至最右侧后，按【鼠标中键】保存退出</span>
+      <div id="calCount">0 counts</div>
+      <span style="opacity:.55">未移动直接按中键 或 按 Esc 取消</span>
     </div>
   </div>
 </div>
@@ -3750,15 +3785,15 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="p-row">
     <label for="pSens">灵敏度</label>
-    <input id="pSens" type="range" min="0.2" max="3.0" step="0.05" value="1">
+    <input id="pSens" type="range" min="0.2" max="4.0" step="0.05" value="1">
     <span class="p-val" id="pSensVal">1.00</span>
   </div>
   <div class="p-row">
-    <label for="pRecenter">自动回中</label>
+    <label for="pRecenter">回中模式</label>
     <select id="pRecenter">
-      <option value="gentle">缓慢回中（防抬鼠偏移）</option>
-      <option value="fast">快速回中</option>
-      <option value="off">保持原位（按 R 归中）</option>
+      <option value="smart">智能抬鼠回中（推荐）</option>
+      <option value="fast">敏捷方向模式</option>
+      <option value="off">不自动回中</option>
     </select>
   </div>
   <div class="p-row">
@@ -3779,12 +3814,19 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
     <label for="pChecker">预览透明格</label>
     <input id="pChecker" type="checkbox">
   </div>
+  <div class="p-actions" style="margin-bottom:8px">
+    <button id="pCal" class="p-btn cal" type="button">校准垫宽 (左→右)</button>
+    <button id="pCenter" class="p-btn" type="button" style="flex:0 0 68px">归中</button>
+  </div>
+  <div class="p-row" style="margin-bottom:6px;font-size:11px;color:rgba(255,255,255,.48)">
+    <span>当前满宽基准</span><span id="pSpanVal" class="p-val" style="width:auto">14800 counts</span>
+  </div>
   <input id="pUrl" class="p-url" type="text" readonly>
   <div class="p-actions">
     <button id="pCopy" class="p-btn primary" type="button">复制鼠标垫链接</button>
     <button id="pReset" class="p-btn" type="button">恢复默认</button>
   </div>
-  <div class="p-hint">独立透明源，与键盘 HUD 链接分开；OBS 添加两个「浏览器」源即可各自自由摆放。按 C 切面板，按 R 归中。</div>
+  <div class="p-hint">独立透明源，与键盘 HUD 链接分开。按 C 切面板，按 Home 归中（已避开游戏 R 换弹键）；校准后自动同步 OBS。</div>
 </div>
 
 <script>
@@ -3801,17 +3843,20 @@ function readConfig() {
   const hasThemeQ = q.has('theme');
   const rawTheme = (q.get('theme') || 'ramp').toLowerCase();
   const theme = FILL_PRESETS[rawTheme] ? rawTheme : 'ramp';
-  const rawRec = (q.get('recenter') || 'gentle').toLowerCase();
-  const recenter = ['gentle', 'fast', 'off'].indexOf(rawRec) >= 0 ? rawRec : 'gentle';
+  const hasSpanQ = q.has('span');
+  const span = Math.round(clamp(q.get('span'), 500, 200000, 14800));
+  const rawRec = (q.get('recenter') || 'smart').toLowerCase();
+  const recenter = rawRec === 'gentle' ? 'smart'
+                 : (['smart', 'fast', 'off'].indexOf(rawRec) >= 0 ? rawRec : 'smart');
   const rawAlign = (q.get('align') || 'center').toLowerCase();
   const align = ['center', 'tl', 'tr', 'bl', 'br'].indexOf(rawAlign) >= 0 ? rawAlign : 'center';
   const rawTrail = (q.get('trail') || '1').toLowerCase();
   return {
-    pad, theme, hasThemeQ,
+    pad, theme, hasThemeQ, span, hasSpanQ,
     scale: clamp(q.get('scale'), 0.5, 2.5, 1.0),
     opacity: clamp(q.get('opacity') !== null ? q.get('opacity') : q.get('alpha'), 0.1, 0.95, 0.62),
     mopacity: clamp(q.get('mopacity'), 0.15, 1.0, 0.90),
-    sens: clamp(q.get('sens'), 0.2, 3.0, 1.0),
+    sens: clamp(q.get('sens'), 0.2, 4.0, 1.0),
     recenter, align,
     trail: !(rawTrail === '0' || rawTrail === 'false' || rawTrail === 'off'),
     panel: q.get('panel') === '1'
@@ -3844,7 +3889,8 @@ function buildObsUrl(includePanel) {
   if (Math.abs(cfg.opacity - 0.62) > 0.005) p.set('opacity', cfg.opacity.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
   if (Math.abs(cfg.mopacity - 0.90) > 0.005) p.set('mopacity', cfg.mopacity.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
   if (Math.abs(cfg.sens - 1.0) > 0.005) p.set('sens', cfg.sens.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
-  if (cfg.recenter !== 'gentle') p.set('recenter', cfg.recenter);
+  if (cfg.hasSpanQ && cfg.span !== 14800) p.set('span', String(cfg.span));
+  if (cfg.recenter !== 'smart') p.set('recenter', cfg.recenter);
   if (cfg.align !== 'center') p.set('align', cfg.align);
   if (!cfg.trail) p.set('trail', '0');
   if (includePanel) p.set('panel', '1');
@@ -3862,6 +3908,7 @@ function syncPanelUI() {
   document.getElementById('pMOpacityVal').textContent = cfg.mopacity.toFixed(2);
   document.getElementById('pSens').value = cfg.sens;
   document.getElementById('pSensVal').textContent = cfg.sens.toFixed(2);
+  document.getElementById('pSpanVal').textContent = cfg.span + ' counts';
   document.getElementById('pRecenter').value = cfg.recenter;
   document.getElementById('pAlign').value = cfg.align;
   document.getElementById('pTrail').checked = cfg.trail;
@@ -3906,8 +3953,50 @@ document.getElementById('pClose').addEventListener('click', () => {
   cfg.panel = false; document.body.classList.remove('checker'); document.getElementById('pChecker').checked = false;
   syncPanelUI(); try { history.replaceState(null, '', buildObsUrl(false)); } catch (e) {}
 });
+let calibrating = false, calDx = 0, prevMidBtn = false, srvToken = '';
+const calBanner = document.getElementById('calBanner');
+const calCountEl = document.getElementById('calCount');
+const calBtn = document.getElementById('pCal');
+
+function setCalibrating(on, saveResult) {
+  if (on) {
+    calibrating = true; calDx = 0;
+    tx = -1; ty = 0; trail.length = 0;
+    calCountEl.textContent = '0 counts';
+    calBanner.classList.add('on');
+    calBtn.classList.add('on');
+    calBtn.textContent = '校准中… (中键完成)';
+    return;
+  }
+  const measured = Math.round(Math.abs(calDx));
+  calibrating = false;
+  calBanner.classList.remove('on');
+  calBtn.classList.remove('on');
+  calBtn.textContent = '校准垫宽 (左→右)';
+  if (saveResult && measured >= 500) {
+    cfg.span = Math.max(500, Math.min(200000, measured));
+    cfg.sens = 1.0;
+    cfg.hasSpanQ = false;
+    fetch('/settings', {
+      method: 'POST',
+      headers: { 'X-Depth-Token': srvToken },
+      body: JSON.stringify({ mouse_span: cfg.span })
+    }).catch(() => {});
+    applyConfig();
+  }
+  tx = ty = 0; trail.length = 0;
+}
+
+calBtn.addEventListener('click', () => { setCalibrating(!calibrating, false); calBtn.blur(); });
+document.getElementById('pCenter').addEventListener('click', () => { tx = ty = 0; trail.length = 0; });
 document.getElementById('pReset').addEventListener('click', () => {
-  cfg = { pad:'gsr3', theme:'ramp', hasThemeQ:false, scale:1.0, opacity:0.62, mopacity:0.90, sens:1.0, recenter:'gentle', align:'center', trail:true, panel:cfg.panel };
+  if (calibrating) setCalibrating(false, false);
+  cfg = { pad:'gsr3', theme:'ramp', hasThemeQ:false, span:14800, hasSpanQ:false, scale:1.0, opacity:0.62, mopacity:0.90, sens:1.0, recenter:'smart', align:'center', trail:true, panel:cfg.panel };
+  fetch('/settings', {
+    method: 'POST',
+    headers: { 'X-Depth-Token': srvToken },
+    body: JSON.stringify({ mouse_span: 14800 })
+  }).catch(() => {});
   tx = ty = px = py = 0; trail.length = 0; applyConfig();
 });
 document.getElementById('pCopy').addEventListener('click', () => {
@@ -3919,12 +4008,13 @@ document.getElementById('pCopy').addEventListener('click', () => {
 });
 addEventListener('keydown', e => {
   const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (e.code === 'Escape' && calibrating) { setCalibrating(false, false); return; }
   if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
   if (e.code === 'KeyC' && !e.ctrlKey && !e.altKey && !e.metaKey) {
     cfg.panel = !cfg.panel;
     if (!cfg.panel) { document.body.classList.remove('checker'); document.getElementById('pChecker').checked = false; }
     syncPanelUI(); try { history.replaceState(null, '', buildObsUrl(cfg.panel)); } catch (e2) {}
-  } else if (e.code === 'KeyR' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+  } else if (e.code === 'Home' && !e.ctrlKey && !e.altKey && !e.metaKey) {
     tx = ty = 0; trail.length = 0;
   }
 });
@@ -3939,13 +4029,34 @@ const mbX2 = document.getElementById('mbX2'), mbLed = document.getElementById('m
 const es = new EventSource('/events');
 es.onmessage = ev => {
   const m = JSON.parse(ev.data);
+  if (m.token) srvToken = m.token;
   if (!cfg.hasThemeQ && m.theme && FILL_PRESETS[m.theme] && m.theme !== cfg.theme) {
     cfg.theme = m.theme; applyConfig();
   }
+  if (!cfg.hasSpanQ && m.mouse_span && Math.abs(m.mouse_span - cfg.span) >= 1) {
+    cfg.span = Math.round(clamp(m.mouse_span, 500, 200000, 14800));
+    syncPanelUI();
+  }
   const ms = m.m;
   if (!ms) return;
+  const midNow = !!ms.m;
+  if (calibrating) {
+    if (ms.dx) {
+      calDx += ms.dx;
+      const absDx = Math.round(Math.abs(calDx));
+      calCountEl.textContent = absDx + ' counts';
+      tx = Math.max(-1, Math.min(1, -1 + 2 * Math.min(1, absDx / Math.max(2000, cfg.span))));
+      lastMoveMs = performance.now();
+    }
+    if (midNow && !prevMidBtn) setCalibrating(false, Math.abs(calDx) >= 500);
+    prevMidBtn = midNow;
+    btns.l = !!ms.l; btns.r = !!ms.r; btns.m = midNow;
+    btns.x1 = !!ms.x1; btns.x2 = !!ms.x2;
+    return;
+  }
+  prevMidBtn = midNow;
   if (ms.dx || ms.dy) {
-    const step = 0.0032 * cfg.sens;
+    const step = (2.0 * cfg.sens) / Math.max(500, cfg.span);
     const rx = Math.max(1, (padW - mouseW) * 0.5);
     const ry = Math.max(1, (padH - mouseH) * 0.5);
     const ratio = rx / ry;
@@ -3954,7 +4065,7 @@ es.onmessage = ev => {
     lastMoveMs = performance.now();
   }
   if (ms.w) wheelUntil = performance.now() + 140;
-  btns.l = !!ms.l; btns.r = !!ms.r; btns.m = !!ms.m;
+  btns.l = !!ms.l; btns.r = !!ms.r; btns.m = midNow;
   btns.x1 = !!ms.x1; btns.x2 = !!ms.x2;
 };
 
@@ -3962,12 +4073,16 @@ function loop(now) {
   const dt = Math.min(0.05, (now - lastFrameMs) / 1000);
   lastFrameMs = now;
   const idleMs = now - lastMoveMs;
-  if (cfg.recenter === 'fast') {
-    const k = Math.exp(-dt * 4.5);
-    tx *= k; ty *= k;
-  } else if (cfg.recenter === 'gentle' && idleMs > 320) {
-    const k = Math.exp(-dt * 1.4);
-    tx *= k; ty *= k;
+  if (!calibrating) {
+    if (cfg.recenter === 'fast' && idleMs > 60) {
+      const k = Math.exp(-dt * 5.2);
+      tx *= k; ty *= k;
+    } else if (cfg.recenter === 'smart' && idleMs > 200) {
+      const dist = Math.min(1.4, Math.hypot(tx, ty));
+      const rate = 1.6 + dist * 4.2;
+      const k = Math.exp(-dt * rate);
+      tx *= k; ty *= k;
+    }
   }
   const prevX = px, prevY = py;
   const alpha = 1 - Math.exp(-dt * 24);
