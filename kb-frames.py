@@ -361,6 +361,8 @@ def main():
     ap.add_argument("--theme", default="ramp", choices=sorted(THEMES))
     ap.add_argument("--alpha", type=float, default=0.86)
     ap.add_argument("--alias", default="")
+    ap.add_argument("--speed", type=float, default=1.0,
+                    help="time scale: 0.5 = half speed, 2 = double speed")
     ap.add_argument("--start", type=float, default=0.0)
     ap.add_argument("--end", type=float, default=0.0)
     ap.add_argument("--jobs", type=int, default=0, help="worker processes (0 = all cores)")
@@ -393,6 +395,11 @@ def main():
         series = clipped
         dur = (args.end - args.start) if args.end else max(
             (v[-1][0] for v in series.values()), default=0.0)
+
+    if abs(args.speed - 1.0) > 1e-6:
+        factor = 1.0 / args.speed          # slower playback = longer timeline
+        series = {k: [(t * factor, mm) for t, mm in v] for k, v in series.items()}
+        dur = dur * factor
 
     theme = THEMES[args.theme]
     slots_def = [(label, x, y, w) for label, x, y, w in LAYOUTS[args.layout]

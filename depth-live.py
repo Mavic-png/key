@@ -19,6 +19,9 @@ import io
 import json
 import os
 import secrets
+import sys
+import subprocess
+import shutil
 import socket
 import threading
 import time
@@ -38,6 +41,53 @@ from urllib.parse import urlparse, parse_qs, urlsplit
 FULL = 3.50
 
 
+def find_kb_frames():
+    """Locate kb-frames.py: next to the exe, then the cwd, then this file."""
+    here = []
+    if getattr(sys, "frozen", False):
+        here.append(os.path.dirname(os.path.abspath(sys.executable)))
+    here.append(os.getcwd())
+    here.append(os.path.dirname(os.path.abspath(__file__)))
+    for folder in here:
+        path = os.path.join(folder, "kb-frames.py")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _python_has_pillow(exe):
+    try:
+        out = subprocess.run([exe, "-c", "import PIL;print(PIL.__version__)"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=4)
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
+def find_python(kb_path=None):
+    """Interpreter that can run the renderer: needs Pillow, which the exe lacks."""
+    env = os.environ.get("DEPTH_RENDER_PYTHON")
+    if env and os.path.isfile(env):
+        return env
+    cands = []
+    if kb_path:
+        root = os.path.dirname(os.path.abspath(kb_path))
+        cands += [os.path.join(root, r".build\venv\Scripts\python.exe"),
+                  os.path.join(root, r"venv\Scripts\python.exe"),
+                  os.path.join(root, r".venv\Scripts\python.exe")]
+    if not getattr(sys, "frozen", False):
+        cands.append(sys.executable)
+    for name in ("python", "python3", "py"):
+        found = shutil.which(name)
+        if found:
+            cands.append(found)
+    for exe in cands:
+        if exe and os.path.isfile(exe) and _python_has_pillow(exe):
+            return exe
+    return None
+
+
 def data_home():
     """Where mapping/logs live.  Tests point this at a temp dir."""
     h = os.environ.get("DEPTH_MONITOR_HOME")
@@ -53,7 +103,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -289,6 +339,8 @@ class Engine(object):
         self.last_client = time.time()
         self.stop_io = threading.Event()
         self._key_events = []
+        self.export = {"running": False, "pct": 0, "msg": "", "out": "",
+                       "proc": None, "t0": 0.0, "eta": 0, "error": ""}
         self.gaps = collections.deque(maxlen=8000)   # inter-arrival seconds
         self._last_depth_t = None
         self._gap_anomalies = 0
@@ -777,6 +829,183 @@ class Engine(object):
                     self.rec = []
                     self.rec_t0 = None
 
+    # ---- workbench -------------------------------------------------
+    def wb_manifest(self):
+        base = recordings_dir()
+        path = os.path.join(base, "latest.json")
+        if not os.path.isfile(path):
+            return None, base
+        try:
+            with io.open(path, encoding="utf-8") as f:
+                return json.load(f), base
+        except Exception:
+            return None, base
+
+    def wb_info(self):
+        manifest, base = self.wb_manifest()
+        if not manifest:
+            return {"ok": False, "error": "\u8fd8\u6ca1\u6709\u5f55\u5236",
+                    "base": base}
+        wide = os.path.join(base, manifest.get("wide", ""))
+        keys, dur, samples = [], 0.0, 0
+        try:
+            with io.open(wide, encoding="utf-8") as f:
+                header = None
+                for line in f:
+                    if line.startswith("#"):
+                        continue
+                    if header is None:
+                        header = [h.strip() for h in line.strip().split(",")]
+                        keys = header[2:]
+                        continue
+                    samples += 1
+                    dur = float(line.split(",")[0])
+        except Exception as exc:
+            return {"ok": False, "error": "\u8bfb\u53d6\u5f55\u5236\u5931\u8d25\uff1a%s" % exc,
+                    "base": base}
+        return {"ok": True, "base": base, "stamp": manifest.get("stamp"),
+                "created": manifest.get("created"), "duration": round(dur, 3),
+                "samples": samples, "keys": keys,
+                "wide": manifest.get("wide"), "long": manifest.get("long"),
+                "integrity": manifest.get("integrity")}
+
+    def wb_series(self, step=0.02, limit=1600):
+        manifest, base = self.wb_manifest()
+        if not manifest:
+            return {"ok": False, "error": "no recording"}
+        wide = os.path.join(base, manifest.get("wide", ""))
+        rows = []
+        keys = []
+        try:
+            with io.open(wide, encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("#"):
+                        continue
+                    parts = line.strip().split(",")
+                    if not keys:
+                        keys = parts[2:]
+                        continue
+                    # column 1 is a wall-clock stamp, not a number
+                    rows.append([float(parts[0])] + [float(x) for x in parts[2:]])
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if not rows:
+            return {"ok": False, "error": "empty recording"}
+        stride = max(1, int(len(rows) / limit))
+        rows = rows[::stride]
+        return {"ok": True, "keys": keys, "duration": rows[-1][0],
+                "step": round(rows[1][0] - rows[0][0], 4) if len(rows) > 1 else step,
+                "t": [round(r[0], 3) for r in rows],
+                "v": {keys[i]: [round(r[1 + i], 2) for r in rows]
+                      for i in range(len(keys))}}
+
+    def export_status(self):
+        with self.lock:
+            job = dict(self.export)
+        job.pop("proc", None)
+        return job
+
+    def cancel_export(self):
+        with self.lock:
+            proc = self.export.get("proc")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            with self.lock:
+                self.export.update(running=False, msg="\u5df2\u53d6\u6d88", pct=0)
+            return True
+        return False
+
+    def start_export(self, params):
+        with self.lock:
+            if self.export.get("running"):
+                return False, "\u5df2\u6709\u5bfc\u51fa\u4efb\u52a1\u5728\u8fd0\u884c"
+        kb = find_kb_frames()
+        py = find_python(kb)
+        if not kb or not py:
+            return False, ("\u627e\u4e0d\u5230\u6e32\u67d3\u5668\uff1a\u9700\u8981 kb-frames.py \u4e0e "
+                           "Pillow\u3002\u8bf7\u628a kb-frames.py \u653e\u5728 exe \u540c\u76ee\u5f55\uff0c"
+                           "\u5e76\u5b89\u88c5 python -m pip install pillow")
+        manifest, base = self.wb_manifest()
+        if not manifest:
+            return False, "\u8fd8\u6ca1\u6709\u5f55\u5236"
+        wide = os.path.join(base, manifest.get("wide", ""))
+        start = float(params.get("start") or 0.0)
+        end = float(params.get("end") or 0.0)
+        fps = int(params.get("fps") or 60)
+        size = params.get("size") or "1920x1080"
+        layout = params.get("layout") or "hud"
+        keys = [k for k in (params.get("keys") or []) if k]
+        speed = float(params.get("speed") or 1.0)
+        bg = (params.get("bg") or "").strip()
+        png = bool(params.get("png"))
+        out_name = params.get("out") or ("depth-%s" % time.strftime("%Y%m%d-%H%M%S"))
+        exports = os.path.join(base, "exports")
+        try:
+            if not os.path.isdir(exports):
+                os.makedirs(exports)
+        except Exception:
+            exports = base
+        out_path = os.path.join(exports, out_name)
+        argv = [py, kb, wide, "--fps", str(fps), "--size", size,
+                "--layout", layout, "--speed", str(speed), "-o", out_path]
+        if keys:
+            argv += ["--keys"] + keys
+        if start > 0:
+            argv += ["--start", "%.3f" % start]
+        if end > 0:
+            argv += ["--end", "%.3f" % end]
+        if bg:
+            argv += ["--bg", bg]
+        if png:
+            argv += ["--png-only", "--keep-frames"]
+        try:
+            proc = subprocess.Popen(argv, cwd=os.path.dirname(kb),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    universal_newlines=True, encoding="utf-8",
+                                    errors="replace")
+        except Exception as exc:
+            return False, "\u542f\u52a8\u6e32\u67d3\u5668\u5931\u8d25\uff1a%s" % exc
+        with self.lock:
+            self.export = {"running": True, "pct": 0, "msg": "\u6b63\u5728\u6e32\u67d3",
+                           "out": out_path, "proc": proc, "t0": time.time(),
+                           "eta": 0, "error": "", "argv": " ".join(argv)}
+
+        def pump():
+            last = 0
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                pct = None
+                if "frames encoded" in line or "frames" in line and "/" in line:
+                    try:
+                        part = [w for w in line.split() if "/" in w][0]
+                        done, total = part.split("/")
+                        pct = int(float(done) * 100 / max(1.0, float(total)))
+                    except Exception:
+                        pct = None
+                with self.lock:
+                    if pct is not None:
+                        self.export["pct"] = min(99, pct)
+                        elapsed = time.time() - self.export["t0"]
+                        if pct > 2:
+                            self.export["eta"] = int(elapsed * (100 - pct) / pct)
+                    self.export["msg"] = line[:120]
+                last = pct or last
+            rc = proc.wait()
+            with self.lock:
+                self.export.update(running=False, pct=100 if rc == 0 else 0,
+                                   msg="\u5b8c\u6210" if rc == 0 else "\u5931\u8d25 (rc=%d)" % rc,
+                                   error="" if rc == 0 else "rc=%d" % rc)
+
+        t = threading.Thread(target=pump)
+        t.daemon = True
+        t.start()
+        return True, out_path
+
     def sample_quality(self):
         """How healthy is the HID stream right now (or during the last N packets)."""
         with self.lock:
@@ -1136,7 +1365,16 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     STATE_PATHS = ("/rec/start", "/rec/stop", "/rec/clear", "/auto", "/bind",
-                   "/resetmap", "/reset", "/openfolder", "/quit")
+                   "/resetmap", "/reset", "/openfolder", "/quit",
+                   "/wb/export", "/wb/cancel")
+
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_text(self, status, text):
         body = text.encode("utf-8")
@@ -1317,6 +1555,34 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif url.path == "/wb":
+            body = workbench_html().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif url.path == "/wb/info":
+            self._send_json(ENGINE.wb_info())
+        elif url.path == "/wb/series":
+            q = parse_qs(url.query)
+            step = float((q.get("step") or ["0.02"])[0] or 0.02)
+            try:
+                self._send_json(ENGINE.wb_series(step))
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)})
+        elif url.path == "/wb/status":
+            self._send_json(ENGINE.export_status())
+        elif url.path == "/wb/cancel":
+            self._send_json({"ok": ENGINE.cancel_export()})
+        elif url.path == "/wb/export":
+            raw = getattr(self, "_body", b"") or b"{}"
+            try:
+                params = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                params = {}
+            ok, msg = ENGINE.start_export(params)
+            self._send_json({"ok": ok, "message": msg})
         elif url.path == "/openfolder":
             try:
                 folder = recordings_dir()
@@ -1370,11 +1636,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
+        self._body = b""
         if length > 0:
             try:
-                self.rfile.read(length)
+                self._body = self.rfile.read(length)
             except Exception:
-                pass
+                self._body = b""
         self._handle("POST")
 
     def stream(self):
@@ -1921,6 +2188,254 @@ def single_instance():
         print("warning: single-instance guard unavailable: %r" % (exc,))
         _log_exc("single_instance")
         return None
+
+
+def workbench_html():
+    """Segment picker + export workbench for recorded depth data."""
+    return """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>素材选段</title>
+<style>
+  :root { --bg:#0b1017; --card:#121a26; --edge:#1f2836; --fg:#e6edf3; --dim:#7d8797;
+          --acc:#38bdf8; --hot:#f87171; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:"Microsoft YaHei UI",system-ui,sans-serif; font-size:13px; }
+  header { display:flex; align-items:center; gap:14px; padding:12px 20px; }
+  h1 { font-size:15px; margin:0; letter-spacing:1px; }
+  a { color:var(--acc); text-decoration:none; }
+  .card { background:var(--card); border:1px solid var(--edge); border-radius:12px;
+          padding:12px 14px; margin:0 16px 12px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .sub { color:var(--dim); font-size:11px; letter-spacing:1px; margin-bottom:6px; }
+  canvas { width:100%; height:260px; display:block; background:#0d141d; border-radius:8px;
+           cursor:crosshair; }
+  input, select, button { background:#16202e; color:var(--fg); border:1px solid var(--edge);
+          border-radius:7px; padding:5px 8px; font-size:12px; }
+  button { cursor:pointer; }
+  button:hover { background:#1d2a3b; }
+  button.primary { background:#0f3d2e; border-color:#1f6f4a; color:#7ee2b8; }
+  .pill { color:var(--dim); }
+  .pill b { color:#cbd5e1; font-weight:600; }
+  #tracks { position:relative; }
+  #hint { color:#4b5563; font-size:11px; margin-top:6px; }
+  #prog { height:6px; background:#16202e; border-radius:4px; overflow:hidden; margin-top:8px; }
+  #prog i { display:block; height:100%; width:0%; background:linear-gradient(90deg,#38bdf8,#f472b6); }
+  #log { color:var(--dim); font-size:11px; margin-top:6px; white-space:pre-wrap; }
+</style></head><body>
+<header>
+  <h1>素材选段</h1>
+  <span class="pill">录制 <b id="r_stamp">—</b></span>
+  <span class="pill">时长 <b id="r_dur">—</b></span>
+  <span class="pill">采样 <b id="r_n">—</b></span>
+  <span class="pill" id="r_keys">—</span>
+  <span style="flex:1"></span>
+  <a href="/">← 返回监控</a>
+</header>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <div class="sub" style="margin:0">磁通量时间轴（拖拽选择区间，滚轮缩放）</div>
+    <div class="row">
+      <button onclick="zoom(0.5)">放大</button>
+      <button onclick="zoom(2)">缩小</button>
+      <button onclick="resetView()">全览</button>
+    </div>
+  </div>
+  <div id="tracks"><canvas id="cv"></canvas></div>
+  <div id="hint">拖动选择区间 · 双击清除选择</div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <span class="sub" style="margin:0">起点</span>
+    <input id="sel_start" size="7" value="0.000">
+    <span class="sub" style="margin:0">终点</span>
+    <input id="sel_end" size="7" value="0.000">
+    <span class="pill">选中 <b id="sel_len">0.000</b> 秒</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <span class="sub" style="margin:0">布局</span>
+    <select id="layout"><option value="hud">HUD 键簇</option><option value="wasd">整键盘</option></select>
+    <span class="sub" style="margin:0">分辨率</span>
+    <select id="size">
+      <option value="1920x1080">1080p</option>
+      <option value="2560x1440">1440p</option>
+      <option value="3840x2160">4K</option>
+    </select>
+    <span class="sub" style="margin:0">帧率</span>
+    <select id="fps"><option>30</option><option selected>60</option><option>120</option></select>
+    <span class="sub" style="margin:0">速度</span>
+    <select id="speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <span class="sub" style="margin:0">格式</span>
+    <select id="fmt">
+      <option value="prores">ProRes 4444（透明）</option>
+      <option value="png">PNG 序列（透明）</option>
+    </select>
+    <span class="sub" style="margin:0">背景</span>
+    <select id="bg"><option value="">透明</option><option value="#101014">深色 #101014</option><option value="#ffffff">白色</option></select>
+    <button class="primary" onclick="startExport()">开始导出</button>
+    <button onclick="cancelExport()">取消</button>
+  </div>
+  <div id="prog"><i></i></div>
+  <div id="log">—</div>
+</div>
+
+<script>
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let info = null, data = null, view = [0, 1], sel = [0, 0], dragging = false, dragFrom = 0;
+
+function fmt(t) { return (t || 0).toFixed(3); }
+
+function fit() {
+  const dpr = window.devicePixelRatio || 1;
+  const r = cv.getBoundingClientRect();
+  cv.width = Math.max(200, r.width * dpr);
+  cv.height = 260 * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+
+function xOf(t) {
+  const w = cv.getBoundingClientRect().width;
+  return (t - view[0]) / Math.max(1e-6, view[1] - view[0]) * w;
+}
+function tOf(x) {
+  const w = cv.getBoundingClientRect().width;
+  return view[0] + x / Math.max(1, w) * (view[1] - view[0]);
+}
+
+function draw() {
+  const w = cv.getBoundingClientRect().width, h = 260;
+  ctx.clearRect(0, 0, w, h);
+  if (!data || !data.ok) {
+    ctx.fillStyle = '#7d8797'; ctx.font = '13px sans-serif';
+    ctx.fillText(data && data.error ? ('读取失败：' + data.error) : '没有录制数据', 16, 40);
+    return;
+  }
+  const keys = data.keys, n = keys.length;
+  const rowH = (h - 10) / Math.max(1, n);
+  const x0 = xOf(sel[0]), x1 = xOf(sel[1]);
+  if (sel[1] > sel[0]) {
+    ctx.fillStyle = 'rgba(56,189,248,.12)';
+    ctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
+    ctx.strokeStyle = 'rgba(56,189,248,.8)';
+    ctx.beginPath(); ctx.moveTo(x0, 0); ctx.lineTo(x0, h);
+    ctx.moveTo(x1, 0); ctx.lineTo(x1, h); ctx.stroke();
+  }
+  ctx.font = '10px monospace';
+  keys.forEach((k, row) => {
+    const y = row * rowH + 5, base = y + rowH - 4;
+    ctx.fillStyle = '#7d8797';
+    ctx.fillText(k, 3, y + 9);
+    ctx.strokeStyle = 'rgba(255,255,255,.04)';
+    ctx.beginPath(); ctx.moveTo(0, base); ctx.lineTo(w, base); ctx.stroke();
+    const vals = data.v[k] || [];
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < vals.length; i++) {
+      const t = data.t[i];
+      if (t < view[0] || t > view[1]) continue;
+      const x = xOf(t);
+      const yv = base - Math.min(1, vals[i] / 3.5) * (rowH - 12);
+      if (!started) { ctx.moveTo(x, yv); started = true; } else ctx.lineTo(x, yv);
+    }
+    ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1; ctx.stroke();
+  });
+  ctx.fillStyle = '#4b5563';
+  ctx.fillText(fmt(view[0]) + 's', 4, h - 2);
+  ctx.fillText(fmt(view[1]) + 's', w - 60, h - 2);
+}
+
+function setSel(a, b) {
+  sel = [Math.max(0, Math.min(a, b)), Math.max(a, b)];
+  document.getElementById('sel_start').value = fmt(sel[0]);
+  document.getElementById('sel_end').value = fmt(sel[1]);
+  document.getElementById('sel_len').textContent = fmt(sel[1] - sel[0]);
+  draw();
+}
+
+cv.addEventListener('mousedown', e => {
+  dragging = true;
+  dragFrom = Math.max(0, tOf(e.offsetX));
+  setSel(dragFrom, dragFrom);
+});
+cv.addEventListener('mousemove', e => {
+  if (dragging) setSel(dragFrom, Math.max(0, tOf(e.offsetX)));
+});
+window.addEventListener('mouseup', () => { dragging = false; });
+cv.addEventListener('dblclick', () => setSel(0, 0));
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const z = e.deltaY > 0 ? 1.25 : 0.8;
+  const pivot = Math.max(0, tOf(e.offsetX));
+  view = [pivot - (pivot - view[0]) * z, pivot + (view[1] - pivot) * z];
+  draw();
+}, { passive: false });
+
+function zoom(f) {
+  const mid = (view[0] + view[1]) / 2, half = (view[1] - view[0]) / 2 * f;
+  view = [Math.max(0, mid - half), mid + half];
+  draw();
+}
+function resetView() { view = [0, data ? data.duration : 1]; draw(); }
+
+function load() {
+  fetch('/wb/info').then(r => r.json()).then(j => {
+    info = j;
+    if (!j.ok) { document.getElementById('log').textContent = j.error || '没有录制'; data = j; draw(); return; }
+    document.getElementById('r_stamp').textContent = j.stamp || '—';
+    document.getElementById('r_dur').textContent = (j.duration || 0).toFixed(2) + ' s';
+    document.getElementById('r_n').textContent = j.samples;
+    document.getElementById('r_keys').textContent = (j.keys || []).join(' ');
+    fetch('/wb/series?step=0.02').then(r => r.json()).then(k => {
+      data = k;
+      if (k.ok) { view = [0, k.duration]; setSel(0, Math.min(k.duration, 5)); }
+      draw();
+    });
+  });
+}
+
+function startExport() {
+  if (!data || !data.ok) { alert('还没有可导出的录制'); return; }
+  if (!(sel[1] > sel[0])) { alert('请先在时间轴上拖出一段区间'); return; }
+  const params = {
+    start: sel[0], end: sel[1],
+    layout: document.getElementById('layout').value,
+    size: document.getElementById('size').value,
+    fps: Number(document.getElementById('fps').value),
+    speed: Number(document.getElementById('speed').value),
+    bg: document.getElementById('bg').value,
+    png: document.getElementById('fmt').value === 'png',
+    keys: info.keys.filter(k => ['W','A','S','D','Space','LCtrl','LAlt','LShift'].includes(k))
+  };
+  const tok = window.__token || '';
+  fetch('/wb/export', { method:'POST', headers:{'X-Depth-Token': tok}, body: JSON.stringify(params) })
+    .then(r => r.json())
+    .then(j => { document.getElementById('log').textContent = j.message || ''; poll(); });
+}
+
+function poll() {
+  fetch('/wb/status').then(r => r.json()).then(j => {
+    document.querySelector('#prog i').style.width = (j.pct || 0) + '%';
+    let text = (j.msg || '') + (j.running ? (j.eta ? (' · 剩余约 ' + j.eta + ' s') : '') : '');
+    if (j.out) text += '  |  输出：' + j.out;
+    document.getElementById('log').textContent = text || '—';
+    if (j.running) setTimeout(poll, 700);
+  });
+}
+
+function cancelExport() { fetch('/wb/cancel', { method:'POST' }).then(() => poll()); }
+
+fetch('/snapshot').then(r => r.json()).then(j => { window.__token = j.token || ''; });
+addEventListener('resize', fit);
+load();
+fit();
+</script></body></html>"""
 
 
 srv_ref = [None]

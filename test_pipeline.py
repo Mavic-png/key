@@ -866,6 +866,32 @@ def t_reader_stop_before_io():
     assert api.closed == 1
 
 
+def t_wb_info_and_series():
+    """The workbench reads the latest manifest and returns per-key tracks."""
+    base = dl.recordings_dir()
+    stamp = "20260101-000000"
+    vdir = os.path.join(base, stamp)
+    os.makedirs(vdir, exist_ok=True)
+    wide = os.path.join(vdir, "wide.csv")
+    with io.open(wide, "w", encoding="utf-8") as f:
+        f.write("# test\nt_s,wall,W,A\n")
+        for i in range(50):
+            f.write("%.2f,2026-01-01T00:00:00,%.2f,%.2f\n"
+                    % (i * 0.01, 3.5 if 10 <= i < 30 else 0.0, 2.0 if 20 <= i < 40 else 0.0))
+    with io.open(os.path.join(base, "latest.json"), "w", encoding="utf-8") as f:
+        json.dump({"stamp": stamp, "wide": stamp + "/wide.csv",
+                   "long": stamp + "/long.csv", "samples": 50}, f)
+    e = dl.Engine()
+    info = e.wb_info()
+    assert info["ok"] and info["keys"] == ["W", "A"], info
+    assert abs(info["duration"] - 0.49) < 0.02, info["duration"]
+    ser = e.wb_series()
+    assert ser["ok"] and ser["keys"] == ["W", "A"], ser
+    assert len(ser["t"]) == len(ser["v"]["W"])
+    peak = max(ser["v"]["W"])
+    assert 3.0 <= peak <= 3.5, peak
+
+
 def t_frames_from_wide():
     try:
         kf = load("kf", os.path.join(HERE, "kb-frames.py"))
@@ -933,6 +959,7 @@ def main():
         ("single instance guard", t_single_instance_guard),
         ("reader cancel window", t_reader_cancel_window),
         ("reader stop before io", t_reader_stop_before_io),
+        ("workbench info + series", t_wb_info_and_series),
         ("frames loader (wide csv)", t_frames_from_wide),
     ]:
         check(name, fn)
