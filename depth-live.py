@@ -127,7 +127,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.15.1"
+VERSION = "1.16.1"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -396,6 +396,8 @@ class Engine(object):
         self.recording = False
         self.rec = []                # (t, index, mm) only while recording
         self.rec_mouse = []          # (t, dx, dy, btn_mask, wheel) only while recording
+        self.max_rec_mouse = 300000  # hard cap for long recordings (~20MB max)
+        self.mouse_rec_dropped = 0
         self.rec_t0 = None
         self.keys = {}               # index -> {"vk":..,"mm":..}
         self.recent = collections.deque(maxlen=12)
@@ -890,7 +892,16 @@ class Engine(object):
                 self._mouse_abs += 1
             if self.recording and (dx or dy or wheel or changed):
                 ts = time.perf_counter() if t is None else float(t)
+                if self.rec_t0 is None:
+                    self.rec_t0 = ts
                 self.rec_mouse.append((ts, int(dx), int(dy), self._mouse_btn_mask_locked(), int(wheel)))
+                if self.max_rec_mouse > 0 and len(self.rec_mouse) > self.max_rec_mouse:
+                    drop = max(1, self.max_rec_mouse // 5)
+                    del self.rec_mouse[:drop]
+                    self.mouse_rec_dropped += drop
+                    self.notice = ("\u9f20\u6807\u5f55\u5236\u7f13\u5b58\u5df2\u8fbe\u4e0a\u9650\uff0c"
+                                   "\u5df2\u6eda\u52a8\u88c1\u526a\u6700\u65e7 %d \u6761\u4e8b\u4ef6"
+                                   % self.mouse_rec_dropped)
 
     def run_mouse(self):
         """Passive read-only Windows Raw Input mouse listener (works in locked-cursor FPS games)."""
@@ -997,6 +1008,7 @@ class Engine(object):
         with self.lock:
             self.rec = []
             self.rec_mouse = []
+            self.mouse_rec_dropped = 0
             self.rec_t0 = None
             self.recording = True
             self.notice = "\u5f55\u5236\u4e2d"
@@ -1009,10 +1021,10 @@ class Engine(object):
             return self.save_recording()
         return None
 
-    def mouse_lines(self, t0=None):
+    def mouse_lines(self, t0=None, rows=None):
         """Yield synchronized mouse CSV aligned to the same perf_counter t0 as long/wide CSV."""
         with self.lock:
-            rows = list(self.rec_mouse)
+            rows = list(self.rec_mouse) if rows is None else list(rows)
             if t0 is None and self.rec:
                 t0 = self.rec[0][0]
             span = self.mouse_span
@@ -1032,30 +1044,49 @@ class Engine(object):
         if batch:
             yield "".join(batch)
 
-    def save_recording(self):
-        """Write the current recording to Documents\\depth-recordings and report the path."""
+    def save_recording(self, rec_rows=None, mouse_rows=None):
+        """Write the current (or provided snapshot) recording and report wide.csv path."""
         with self.lock:
-            n = len(self.rec)
-            t0 = self.rec[0][0] if self.rec else None
-            has_mouse = len(self.rec_mouse) > 0
-        if not n:
+            r_rows = list(self.rec) if rec_rows is None else list(rec_rows)
+            m_rows = list(self.rec_mouse) if mouse_rows is None else list(mouse_rows)
+        n = len(r_rows)
+        nm = len(m_rows)
+        has_mouse = nm > 0
+        if not n and not nm:
             with self.lock:
                 self.notice = "\u6ca1\u6709\u5f55\u5236\u6570\u636e"
             return None
+        starts = []
+        if r_rows:
+            starts.append(r_rows[0][0])
+        if m_rows:
+            starts.append(m_rows[0][0])
+        t0 = min(starts)
+        min_dur = max(0.02 if not r_rows else 0.0,
+                      (m_rows[-1][0] - t0) if m_rows else 0.0)
         base = recordings_dir()
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base_stamp = time.strftime("%Y%m%d-%H%M%S")
+        stamp = base_stamp
         version_dir = os.path.join(base, stamp)
+        suffix = 1
+        while os.path.exists(version_dir):
+            stamp = "%s-%d" % (base_stamp, suffix)
+            version_dir = os.path.join(base, stamp)
+            suffix += 1
         long_path = os.path.join(version_dir, "long.csv")
         wide_path = os.path.join(version_dir, "wide.csv")
         mouse_path = os.path.join(version_dir, "mouse.csv")
         try:
             if not os.path.isdir(version_dir):
                 os.makedirs(version_dir)
-            # both files are written inside one fresh directory; the manifest
-            # below is the only thing that makes the pair "committed"
-            pairs = [(long_path, self.long_lines()), (wide_path, self.wide_lines())]
+            # all files are written inside one fresh directory; the manifest
+            # below is the only thing that makes the recording "committed"
+            pairs = [
+                (long_path, self.long_lines(rows=r_rows, t0=t0)),
+                (wide_path, self.wide_lines(rows=r_rows, t0=t0, min_dur=min_dur)),
+            ]
             if has_mouse:
-                pairs.append((mouse_path, self.mouse_lines(t0)))
+                pairs.append((mouse_path, self.mouse_lines(t0=t0, rows=m_rows)))
             for path, chunks in pairs:
                 with io.open(path, "w", encoding="utf-8", newline="") as f:
                     for chunk in chunks:
@@ -1063,21 +1094,28 @@ class Engine(object):
                     f.flush()
                     os.fsync(f.fileno())
             integrity = {}
-            for key, path in (("long", long_path), ("wide", wide_path)):
+            check_list = [("long", long_path, 2), ("wide", wide_path, 2)]
+            if has_mouse:
+                check_list.append(("mouse", mouse_path, 3))
+            for key, path, min_lines in check_list:
                 with io.open(path, encoding="utf-8", errors="replace") as f:
                     lines = 0
                     for _ in f:
                         lines += 1
-                integrity[key] = {"lines": lines, "bytes": os.path.getsize(path)}
-            integrity["ok"] = all(v["lines"] > 1 and v["bytes"] > 0
-                                  for k, v in integrity.items() if k in ("long", "wide"))
+                sz = os.path.getsize(path)
+                integrity[key] = {"lines": lines, "bytes": sz,
+                                  "ok": (lines >= min_lines and sz > 0)}
+            integrity["ok"] = all(integrity[k]["ok"] for k, _, _ in check_list)
+            if not integrity["ok"]:
+                raise IOError("integrity check failed: %r" % (integrity,))
             manifest = {
                 "stamp": stamp,
-                "samples": n,
+                "samples": n or nm,
+                "mouse_samples": nm,
                 "long": os.path.relpath(long_path, base).replace("\\", "/"),
                 "wide": os.path.relpath(wide_path, base).replace("\\", "/"),
                 "mouse": (os.path.relpath(mouse_path, base).replace("\\", "/")
-                          if has_mouse and os.path.isfile(mouse_path) else ""),
+                          if has_mouse else ""),
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "integrity": integrity,
             }
@@ -1093,7 +1131,7 @@ class Engine(object):
             return None
         with self.lock:
             self.notice = ("\u5df2\u81ea\u52a8\u4fdd\u5b58 %d \u70b9\uff1a"
-                           "recordings\\%s\\wide.csv" % (n, stamp))
+                           "recordings\\%s\\wide.csv" % (n or nm, stamp))
         return wide_path
 
     def run_hold(self):
@@ -1127,7 +1165,7 @@ class Engine(object):
             if self.recording:
                 path = self.stop_recording(save=True)
                 with self.lock:
-                    pending = len(self.rec)
+                    pending = len(self.rec) + len(self.rec_mouse)
                 if pending and not path:
                     self.notice = "\u4fdd\u5b58\u5931\u8d25\uff0c\u672a\u9000\u51fa"
                     return False
@@ -1180,19 +1218,36 @@ class Engine(object):
                 self.shutdown_app(srv)          # same ordered path as /quit
                 return
 
+    def autosave_step(self, min_samples=20):
+        """Atomically swap recording buffers before saving; restore on failure."""
+        with self.lock:
+            if not self.recording:
+                return None
+            if len(self.rec) <= min_samples and len(self.rec_mouse) <= min_samples:
+                return None
+            seg_rec, self.rec = self.rec, []
+            seg_mouse, self.rec_mouse = self.rec_mouse, []
+            seg_t0, self.rec_t0 = self.rec_t0, None
+        saved = self.save_recording(rec_rows=seg_rec, mouse_rows=seg_mouse)
+        if not saved:
+            with self.lock:
+                self.rec = seg_rec + self.rec
+                self.rec_mouse = seg_mouse + self.rec_mouse
+                if seg_t0 is not None:
+                    self.rec_t0 = seg_t0
+                elif self.rec_t0 is None:
+                    if self.rec:
+                        self.rec_t0 = self.rec[0][0]
+                    elif self.rec_mouse:
+                        self.rec_t0 = self.rec_mouse[0][0]
+            return None
+        return saved
+
     def run_autosave(self, interval):
         """Auto mode: save a segment every `interval` seconds and keep going."""
         while True:
             time.sleep(max(15, interval))
-            with self.lock:
-                active = self.recording
-                n = len(self.rec)
-            if active and n > 20:
-                self.save_recording()
-                with self.lock:
-                    self.rec = []
-                    self.rec_mouse = []
-                    self.rec_t0 = None
+            self.autosave_step(min_samples=20)
 
     # ---- workbench -------------------------------------------------
     def _safe_stamp(self, stamp):
@@ -1356,25 +1411,44 @@ class Engine(object):
         if not evts:
             return None
         xs, ys, bs, ws, spds = [], [], [], [], []
+        clicks = []
+        wheels = []
         tx = ty = 0.0
-        btn = 0
+        btn = prev_btn = 0
+        down_at = {}
         last_move = -9.0
         prev_t = times[0]
         idx = 0
         n_ev = len(evts)
         step_x = 2.0 / max(500.0, float(span))
         aspect = (306.0 - 44.0) / (254.0 - 84.0)
+        btn_bits = (1, 2, 4, 8, 16)
         for t in times:
             dt = max(0.0, min(0.2, t - prev_t))
             prev_t = t
             sum_dx = sum_dy = w_acc = 0
-            while idx < n_ev and evts[idx][0] <= t:
+            b_hit = 0
+            while idx < n_ev and evts[idx][0] <= t + 1e-6:
                 et, dx, dy, bmask, wh = evts[idx]
                 sum_dx += dx
                 sum_dy += dy
+                rising = (~prev_btn) & bmask
+                if rising:
+                    for bit in btn_bits:
+                        if rising & bit:
+                            down_at[bit] = et
+                falling = prev_btn & (~bmask)
+                if falling:
+                    for bit in btn_bits:
+                        if falling & bit:
+                            t_dn = down_at.pop(bit, et)
+                            clicks.append([round(t_dn, 4), bit, round(max(0.0, (et - t_dn) * 1000.0), 1)])
+                b_hit |= bmask
+                prev_btn = bmask
                 btn = bmask
                 if wh:
-                    w_acc = wh
+                    w_acc += wh
+                    wheels.append([round(et, 4), int(wh)])
                 if dx or dy:
                     last_move = et
                 idx += 1
@@ -1389,10 +1463,15 @@ class Engine(object):
             spd = min(1.0, math.hypot(sum_dx, sum_dy) / max(1.0, span * max(0.015, dt) * 1.4))
             xs.append(round(tx, 3))
             ys.append(round(ty, 3))
-            bs.append(btn)
+            bs.append(btn | b_hit)
             ws.append(w_acc)
             spds.append(round(spd, 2))
-        return {"span": span, "x": xs, "y": ys, "b": bs, "w": ws, "spd": spds}
+        end_t = times[-1]
+        for bit, t_dn in down_at.items():
+            clicks.append([round(t_dn, 4), bit, round(max(0.0, (end_t - t_dn) * 1000.0), 1)])
+        clicks.sort(key=lambda c: c[0])
+        return {"span": span, "x": xs, "y": ys, "b": bs, "w": ws,
+                "spd": spds, "clicks": clicks, "wheels": wheels}
 
     def wb_series(self, step=0.02, limit=1600, stamp=None):
         manifest, _, _, wide = self._resolve_wide(stamp)
@@ -1402,15 +1481,17 @@ class Engine(object):
         keys = []
         try:
             with io.open(wide, encoding="utf-8") as f:
+                header_seen = False
                 for line in f:
                     if line.startswith("#"):
                         continue
                     parts = line.strip().split(",")
-                    if not keys:
-                        keys = parts[2:]
+                    if not header_seen:
+                        header_seen = True
+                        keys = [p for p in parts[2:] if p]
                         continue
                     # column 1 is a wall-clock stamp, not a number
-                    rows.append([float(parts[0])] + [float(x) for x in parts[2:]])
+                    rows.append([float(parts[0])] + [float(x) for x in parts[2:2 + len(keys)]])
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         if not rows:
@@ -1816,10 +1897,10 @@ class Engine(object):
         return out
 
     # ---- exports -----------------------------------------------------
-    def long_lines(self):
+    def long_lines(self, rows=None, t0=None):
         """Yield the long-format CSV line by line (no giant string in memory)."""
         with self.lock:
-            rows = list(self.rec)
+            rows = list(self.rec) if rows is None else list(rows)
             names = {i: (key_name(s["vk"]) if s["vk"] else "k%d" % i)
                      for i, s in self.keys.items()}
         yield "# tool=depth-live  device=ROG FALCHION ACE 75 HE (VID 0B05 PID 1C7D)\n"
@@ -1828,35 +1909,39 @@ class Engine(object):
         if not rows:
             yield "# nothing recorded -- press 开始录制 first\n"
             return
-        t0 = rows[0][0]
+        if t0 is None:
+            t0 = rows[0][0]
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         for i in range(0, len(rows), 500):
             chunk = []
             for t, idx, mm in rows[i:i + 500]:
                 chunk.append("%.6f,%s,%s,%d,%.2f\n"
-                             % (t - t0, stamp, names.get(idx, ""), idx, mm))
+                             % (max(0.0, t - t0), stamp, names.get(idx, ""), idx, mm))
             yield "".join(chunk)
 
-    def wide_lines(self, step=0.01):
+    def wide_lines(self, step=0.01, rows=None, t0=None, min_dur=0.0):
         """Yield the fixed-rate matrix CSV line by line."""
         with self.lock:
-            rows = list(self.rec)
+            rows = list(self.rec) if rows is None else list(rows)
             names = {i: (key_name(s["vk"]) if s["vk"] else "k%d" % i)
                      for i, s in self.keys.items()}
         yield "# tool=depth-live  wide matrix %.0f Hz  depth in mm\n" % (1.0 / step)
-        if not rows:
+        if not rows and min_dur <= 0.0:
             yield "# nothing recorded -- press 开始录制 first\nt_s\n"
             return
-        t0 = rows[0][0]
+        if t0 is None:
+            t0 = rows[0][0] if rows else 0.0
         series = {}
         for t, idx, mm in rows:
-            series.setdefault(idx, []).append((t - t0, mm))
+            series.setdefault(idx, []).append((max(0.0, t - t0), mm))
         # keys touched outside the recorded window have no samples: drop them,
         # otherwise they contribute empty columns and break the duration calc
         series = {k: v for k, v in series.items() if v}
         cols = sorted(series)
-        dur = max(v[-1][0] for v in series.values())
-        yield "t_s,wall," + ",".join(names.get(i, "k%d" % i) for i in cols) + "\n"
+        k_dur = max(v[-1][0] for v in series.values()) if series else 0.0
+        dur = max(k_dur, float(min_dur))
+        header = "t_s,wall" + (("," + ",".join(names.get(i, "k%d" % i) for i in cols)) if cols else "")
+        yield header + "\n"
         cur = dict((i, 0) for i in cols)
         n = int(dur / step) + 1
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -1881,7 +1966,8 @@ class Engine(object):
                     cells.append("%.2f" % (a[1] + (b[1] - a[1]) * f))
                 else:
                     cells.append("%.2f" % (arr[j][1] if ts - arr[j][0] < 0.12 else 0.0))
-            batch.append("%.3f,%s,%s\n" % (ts, stamp, ",".join(cells)))
+            line = ("%.3f,%s,%s\n" % (ts, stamp, ",".join(cells))) if cols else ("%.3f,%s\n" % (ts, stamp))
+            batch.append(line)
             if len(batch) >= 500:
                 yield "".join(batch)
                 batch = []
@@ -4690,9 +4776,9 @@ function draw() {
   }
 
   // Per-key tracks (+ optional bottom Mouse lane)
-  const keys = data.keys, n = keys.length;
+  const keys = data.keys || [], n = keys.length;
   const hasMouseLane = !!(showMouse && data.mouse && data.mouse.x && data.mouse.x.length);
-  const MOUSE_H = hasMouseLane ? 34 : 0;
+  const MOUSE_H = hasMouseLane ? (n ? 34 : (h - RULER_H - 6)) : 0;
   const keyAreaH = h - RULER_H - 6 - MOUSE_H;
   const rowH = keyAreaH / Math.max(1, n);
   const trackCols = ['#38bdf8', '#34d399', '#fbbf24', '#f472b6', '#a78bfa', '#fb7185'];
@@ -4748,16 +4834,37 @@ function draw() {
       ctx.fillStyle = 'rgba(56,189,248,0.14)';
       ctx.fill();
     }
-    for (let i = 0; i < nM; i++) {
-      const t = data.t[i];
-      if (t < view[0] || t > view[1]) continue;
-      const b = bs[i] || 0, wh = ws[i] || 0;
-      if (!b && !wh) continue;
-      const x0m = xOf(t), x1m = i + 1 < nM ? xOf(data.t[i + 1]) : x0m + 2;
-      const bw = Math.max(2, x1m - x0m);
-      if (b & 1) { ctx.fillStyle = 'rgba(244,63,94,0.78)'; ctx.fillRect(x0m, my + 2, bw, 5); }
-      if (b & 2) { ctx.fillStyle = 'rgba(251,191,36,0.78)'; ctx.fillRect(x0m, my + 8, bw, 4); }
-      if ((b & 28) || wh) { ctx.fillStyle = 'rgba(52,211,153,0.78)'; ctx.fillRect(x0m, my + 13, bw, 3); }
+    const clicks = m.clicks, wheels = m.wheels;
+    if (Array.isArray(clicks)) {
+      for (let i = 0; i < clicks.length; i++) {
+        const [ct, bit, durMs] = clicks[i];
+        const ctEnd = ct + (durMs || 0) / 1000;
+        if (ctEnd < view[0] || ct > view[1]) continue;
+        const x0m = xOf(ct), bw = Math.max(2, xOf(ctEnd) - x0m);
+        if (bit === 1) { ctx.fillStyle = 'rgba(244,63,94,0.84)'; ctx.fillRect(x0m, my + 2, bw, 5); }
+        else if (bit === 2) { ctx.fillStyle = 'rgba(251,191,36,0.84)'; ctx.fillRect(x0m, my + 8, bw, 4); }
+        else { ctx.fillStyle = 'rgba(52,211,153,0.84)'; ctx.fillRect(x0m, my + 13, bw, 3); }
+      }
+      if (Array.isArray(wheels)) {
+        ctx.fillStyle = 'rgba(125,211,252,0.88)';
+        for (let i = 0; i < wheels.length; i++) {
+          const tw = wheels[i][0];
+          if (tw < view[0] || tw > view[1]) continue;
+          ctx.fillRect(xOf(tw), my + 13, 2, 4);
+        }
+      }
+    } else {
+      for (let i = 0; i < nM; i++) {
+        const t = data.t[i];
+        if (t < view[0] || t > view[1]) continue;
+        const b = bs[i] || 0, wh = ws[i] || 0;
+        if (!b && !wh) continue;
+        const x0m = xOf(t), x1m = i + 1 < nM ? xOf(data.t[i + 1]) : x0m + 2;
+        const bw = Math.max(2, x1m - x0m);
+        if (b & 1) { ctx.fillStyle = 'rgba(244,63,94,0.78)'; ctx.fillRect(x0m, my + 2, bw, 5); }
+        if (b & 2) { ctx.fillStyle = 'rgba(251,191,36,0.78)'; ctx.fillRect(x0m, my + 8, bw, 4); }
+        if ((b & 28) || wh) { ctx.fillStyle = 'rgba(52,211,153,0.78)'; ctx.fillRect(x0m, my + 13, bw, 3); }
+      }
     }
   }
 
@@ -4994,8 +5101,8 @@ function renderPreviewAt(t) {
       if (b & 4) chips.push('<span class="hk m">MMB</span>');
       if (b & 8) chips.push('<span class="hk m">X1</span>');
       if (b & 16) chips.push('<span class="hk m">X2</span>');
-      if (ms.w > 0) chips.push('<span class="hk m">滚轮↑</span>');
-      if (ms.w < 0) chips.push('<span class="hk m">滚轮↓</span>');
+      if (ms.w > 0) chips.push('<span class="hk m">滚轮↑' + (ms.w > 1 ? ('×' + ms.w) : '') + '</span>');
+      if (ms.w < 0) chips.push('<span class="hk m">滚轮↓' + (ms.w < -1 ? ('×' + (-ms.w)) : '') + '</span>');
     }
     hr.innerHTML = chips.length ? chips.join('') : '<span style="color:var(--dim)">当前时刻无按下键</span>';
   }

@@ -954,6 +954,104 @@ def t_sync_mouse_record_and_wb_replay():
     assert ser2["ok"] and ser2.get("mouse") is None, ser2
 
 
+def t_autosave_preserves_inflight_events():
+    """New keyboard/mouse events arriving during autosave must never be wiped."""
+    e = make_engine()
+    e.start_recording()
+    t0 = time.perf_counter()
+    for i in range(25):
+        e.on_depth(t0 + i * 0.01, 31, 2.0)
+        e.on_mouse(10, 0, t=t0 + i * 0.01)
+    orig_save = e.save_recording
+
+    def hooked_save(rec_rows=None, mouse_rows=None):
+        # Simulate live input arriving while disk I/O is in progress
+        e.on_depth(t0 + 1.0, 31, 3.3)
+        e.on_mouse(77, -33, btns={"l": True}, t=t0 + 1.0)
+        return orig_save(rec_rows=rec_rows, mouse_rows=mouse_rows)
+
+    e.save_recording = hooked_save
+    saved = e.autosave_step(min_samples=20)
+    assert saved and os.path.isfile(saved), saved
+    assert len(e.rec) == 1 and e.rec[0][2] == 3.3, e.rec
+    assert len(e.rec_mouse) == 1 and e.rec_mouse[0][1] == 77, e.rec_mouse
+
+
+def t_autosave_failure_restores_buffers():
+    """If autosave fails on disk error, segment + new events must all be preserved."""
+    e = make_engine()
+    e.start_recording()
+    t0 = time.perf_counter()
+    for i in range(25):
+        e.on_depth(t0 + i * 0.01, 31, 1.5)
+        e.on_mouse(5, 0, t=t0 + i * 0.01)
+
+    def failing_save(rec_rows=None, mouse_rows=None):
+        e.on_depth(t0 + 2.0, 31, 3.1)
+        e.on_mouse(99, 0, t=t0 + 2.0)
+        return None
+
+    e.save_recording = failing_save
+    assert e.autosave_step(min_samples=20) is None
+    assert len(e.rec) == 26 and e.rec[0][2] == 1.5 and e.rec[-1][2] == 3.1
+    assert len(e.rec_mouse) == 26 and e.rec_mouse[0][1] == 5 and e.rec_mouse[-1][1] == 99
+
+
+def t_rapid_click_and_wheel_preserved():
+    """Sub-10ms clicks and multiple wheel ticks inside one sampling bucket must survive."""
+    e = make_engine()
+    e.start_recording()
+    t0 = time.perf_counter()
+    for i in range(10):
+        e.on_depth(t0 + i * 0.02, 31, 2.0 if i == 2 else 0.0)
+    # 5ms rapid LMB click entirely between 0.020s and 0.040s samples
+    e.on_mouse(0, 0, btns={"l": True}, t=t0 + 0.024)
+    e.on_mouse(0, 0, btns={"l": False}, t=t0 + 0.029)
+    # 3 rapid wheel-up ticks inside one 10ms wide.csv bucket (0.060s..0.070s)
+    e.on_mouse(0, 0, wheel=1, t=t0 + 0.062)
+    e.on_mouse(0, 0, wheel=1, t=t0 + 0.065)
+    e.on_mouse(0, 0, wheel=1, t=t0 + 0.068)
+    out = e.save_recording()
+    assert out
+    stamp = os.path.basename(os.path.dirname(out))
+    ser = e.wb_series(step=0.02, stamp=stamp)
+    m = ser["mouse"]
+    assert m and m["clicks"], m
+    c0 = m["clicks"][0]
+    assert abs(c0[0] - 0.024) < 0.002 and c0[1] == 1 and abs(c0[2] - 5.0) < 1.0, c0
+    assert any((b & 1) for b in m["b"]), "rapid click missing from bucket mask"
+    assert sum(m["w"]) == 3 and max(m["w"]) == 3, m["w"]
+    assert len(m["wheels"]) == 3, m["wheels"]
+
+
+def t_mouse_memory_cap_and_mouse_only_and_integrity():
+    """Memory cap bounds rec_mouse, mouse-only recordings replay, and bad mouse.csv fails."""
+    e = make_engine()
+    e.max_rec_mouse = 200
+    e.start_recording()
+    t0 = time.perf_counter()
+    for i in range(600):
+        e.on_mouse(4, 1, btns={"l": (i == 550)}, t=t0 + i * 0.002)
+    assert len(e.rec_mouse) <= 200 and e.mouse_rec_dropped > 0, (len(e.rec_mouse), e.mouse_rec_dropped)
+    assert "\u4e0a\u9650" in e.notice, e.notice
+
+    # Mouse-only recording (zero keyboard events) saves and replays cleanly
+    out = e.save_recording()
+    assert out and os.path.isfile(out), out
+    stamp = os.path.basename(os.path.dirname(out))
+    info = e.wb_info(stamp)
+    assert info["ok"] and info["has_mouse"] is True and info["keys"] == [], info
+    ser = e.wb_series(step=0.02, stamp=stamp)
+    assert ser["ok"] and ser["keys"] == [] and ser["mouse"] and len(ser["t"]) > 5, ser
+
+    # Corrupt mouse.csv write must fail integrity and NOT commit latest.json
+    latest_p = os.path.join(dl.recordings_dir(), "latest.json")
+    before = open(latest_p, encoding="utf-8").read()
+    e.mouse_lines = lambda t0=None, rows=None: iter(["# truncated only\n"])
+    assert e.save_recording() is None
+    assert open(latest_p, encoding="utf-8").read() == before
+
+
 def main():
     print("depth pipeline tests")
     for name, fn in [
@@ -1003,6 +1101,10 @@ def main():
         ("workbench info + series", t_wb_info_and_series),
         ("frames loader (wide csv)", t_frames_from_wide),
         ("synced mouse record + wb replay", t_sync_mouse_record_and_wb_replay),
+        ("autosave preserves inflight events", t_autosave_preserves_inflight_events),
+        ("autosave failure restores buffers", t_autosave_failure_restores_buffers),
+        ("rapid click and wheel preserved", t_rapid_click_and_wheel_preserved),
+        ("mouse cap, mouse-only & integrity", t_mouse_memory_cap_and_mouse_only_and_integrity),
     ]:
         check(name, fn)
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
