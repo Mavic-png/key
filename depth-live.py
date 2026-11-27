@@ -127,7 +127,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.16.2"
+VERSION = "1.16.3"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -3465,8 +3465,10 @@ OVERLAY_PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="p-row">
     <label for="pKeys">自定义键</label>
-    <input id="pKeys" type="text" placeholder="留空用预设，如 W,A,S,D,Space">
+    <input id="pKeys" type="text" placeholder="留空用预设，如 Tab,W,A,S,D,Shift,Alt,Space">
+    <button id="pCap" class="chip" type="button" title="点击后直接按键盘按键（含 Tab/Shift/Alt）加入列表" style="flex-shrink:0">按键录入</button>
   </div>
+  <div class="chips" id="pQuickKeys" style="margin-top:-2px"></div>
   <div class="p-row" style="margin-bottom:4px"><label>主题</label></div>
   <div class="chips" id="pThemes"></div>
   <div class="p-row">
@@ -3535,6 +3537,33 @@ const CLUSTERS = {
 const LOWER_KEY_MAP = {};
 for (const item of FULL_LAYOUT) LOWER_KEY_MAP[item.k.toLowerCase()] = item.k;
 for (const alias in ALIAS) LOWER_KEY_MAP[alias.toLowerCase()] = ALIAS[alias];
+const EXTRA_ALIASES = {
+  tap:'Tab', '制表':'Tab', '制表键':'Tab',
+  '上档':'LShift', '上档键':'LShift', '左shift':'LShift', '右shift':'RShift', '右上档':'RShift',
+  '左alt':'LAlt', '右alt':'RAlt', '换档':'LAlt',
+  control:'LCtrl', '控制':'LCtrl', '左ctrl':'LCtrl', '右ctrl':'RCtrl',
+  '空格':'Space', '空格键':'Space', spacebar:'Space',
+  capslock:'Caps', '大写':'Caps', '大小写':'Caps',
+  '回车':'Enter', return:'Enter',
+  escape:'Esc', '退出':'Esc',
+  '退格':'Bksp', delete:'Del', super:'LWin',
+  up:'\u2191', down:'\u2193', left:'\u2190', right:'\u2192'
+};
+for (const k in EXTRA_ALIASES) LOWER_KEY_MAP[k] = EXTRA_ALIASES[k];
+
+function parseCustomKeys(raw) {
+  const out = [], seen = new Set();
+  for (const part of String(raw || '').split(/[\s,，、;；+]+/)) {
+    const s = part.trim();
+    if (!s) continue;
+    const mapped = LOWER_KEY_MAP[s.toLowerCase()] || norm(s);
+    if (FULL_LAYOUT.some(it => it.k === mapped) && !seen.has(mapped)) {
+      seen.add(mapped);
+      out.push(mapped);
+    }
+  }
+  return out;
+}
 
 function clamp(v, lo, hi, def) {
   const n = parseFloat(v);
@@ -3577,13 +3606,7 @@ let els = {}, lastRatio = {}, lastHeld = {};
 
 function resolveItems() {
   if (cfg.keys) {
-    const wanted = new Set();
-    for (const part of cfg.keys.split(',')) {
-      const s = part.trim();
-      if (!s) continue;
-      const mapped = LOWER_KEY_MAP[s.toLowerCase()] || norm(s);
-      wanted.add(mapped);
-    }
+    const wanted = new Set(parseCustomKeys(cfg.keys));
     const picked = FULL_LAYOUT.filter(item => wanted.has(item.k));
     if (picked.length) {
       let minX = Infinity, minR = Infinity;
@@ -3670,10 +3693,69 @@ for (const id in FILL_PRESETS) {
   pThemes.appendChild(b);
 }
 
+const QUICK_KEYS = [
+  ['Tab', 'Tab'], ['Caps', 'Caps'], ['LShift', 'Shift'], ['LCtrl', 'Ctrl'],
+  ['LAlt', 'Alt'], ['Space', 'Space'], ['Esc', 'Esc'], ['Enter', 'Enter']
+];
+const pQuickKeys = document.getElementById('pQuickKeys');
+const pKeysEl = document.getElementById('pKeys');
+const pCapBtn = document.getElementById('pCap');
+let capturingKeys = false;
+
+function toggleCustomKey(k, forceAdd) {
+  let list = cfg.keys ? parseCustomKeys(cfg.keys) : (CLUSTERS[cfg.cluster] || CLUSTERS.hud).map(it => it.k);
+  const idx = list.indexOf(k);
+  if (idx >= 0) {
+    if (!forceAdd) list.splice(idx, 1);
+  } else {
+    list.push(k);
+  }
+  cfg.keys = list.join(',');
+  pKeysEl.value = cfg.keys;
+  applyConfig();
+}
+
+for (const [k, label] of QUICK_KEYS) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'chip';
+  b.dataset.qk = k;
+  b.textContent = '+ ' + label;
+  b.addEventListener('click', () => toggleCustomKey(k, false));
+  pQuickKeys.appendChild(b);
+}
+
+const CODE_KEY_MAP = {
+  Tab:'Tab', CapsLock:'Caps', ShiftLeft:'LShift', ShiftRight:'RShift',
+  ControlLeft:'LCtrl', ControlRight:'RCtrl', AltLeft:'LAlt', AltRight:'RAlt',
+  Space:'Space', Escape:'Esc', Enter:'Enter', Backspace:'Bksp', Delete:'Del',
+  MetaLeft:'LWin', MetaRight:'RWin', Home:'Home', End:'End', PageUp:'PgUp', PageDown:'PgDn',
+  ArrowUp:'\u2191', ArrowDown:'\u2193', ArrowLeft:'\u2190', ArrowRight:'\u2192',
+  Backquote:'`', Minus:'-', Equal:'=', BracketLeft:'[', BracketRight:']',
+  Backslash:'\\', Semicolon:';', Quote:"'", Comma:',', Period:'.', Slash:'/'
+};
+function eventToLayoutKey(e) {
+  if (CODE_KEY_MAP[e.code]) return CODE_KEY_MAP[e.code];
+  if (/^Key([A-Z])$/.test(e.code)) return e.code.slice(3);
+  if (/^Digit([0-9])$/.test(e.code)) return e.code.slice(5);
+  if (/^F([1-9]|1[0-2])$/.test(e.code)) return e.code;
+  const k = (e.key || '').toLowerCase();
+  return LOWER_KEY_MAP[k] || null;
+}
+
 function syncPanelUI() {
   setFullMm(cfg.full);
   document.getElementById('pCluster').value = cfg.cluster;
-  document.getElementById('pKeys').value = cfg.keys;
+  if (document.activeElement !== pKeysEl) pKeysEl.value = cfg.keys;
+  const activeSet = new Set(cfg.keys ? parseCustomKeys(cfg.keys) : (CLUSTERS[cfg.cluster] || CLUSTERS.hud).map(it => it.k));
+  for (const ch of pQuickKeys.children) {
+    const on = activeSet.has(ch.dataset.qk);
+    ch.classList.toggle('on', on);
+  }
+  if (pCapBtn) {
+    pCapBtn.classList.toggle('on', capturingKeys);
+    pCapBtn.textContent = capturingKeys ? '录入中…(点此停止)' : '按键录入';
+  }
   document.getElementById('pScale').value = cfg.scale;
   document.getElementById('pScaleVal').textContent = cfg.scale.toFixed(2);
   document.getElementById('pOpacity').value = cfg.opacity;
@@ -3694,7 +3776,12 @@ function applyConfig() {
 }
 
 document.getElementById('pCluster').addEventListener('change', e => { cfg.cluster = e.target.value; applyConfig(); });
-document.getElementById('pKeys').addEventListener('input', e => { cfg.keys = e.target.value.trim(); applyConfig(); });
+pKeysEl.addEventListener('input', e => { cfg.keys = e.target.value.trim(); applyConfig(); });
+if (pCapBtn) pCapBtn.addEventListener('click', () => {
+  capturingKeys = !capturingKeys;
+  if (capturingKeys) pCapBtn.blur();
+  syncPanelUI();
+});
 document.getElementById('pScale').addEventListener('input', e => { cfg.scale = parseFloat(e.target.value); applyConfig(); });
 document.getElementById('pOpacity').addEventListener('input', e => { cfg.opacity = parseFloat(e.target.value); applyConfig(); });
 document.getElementById('pFull').addEventListener('input', e => { cfg.full = parseFloat(e.target.value); cfg.hasFullQ = true; applyConfig(); });
@@ -3703,12 +3790,14 @@ document.getElementById('pAlign').addEventListener('change', e => { cfg.align = 
 document.getElementById('pChecker').addEventListener('change', e => { document.body.classList.toggle('checker', e.target.checked); });
 document.getElementById('pClose').addEventListener('click', () => {
   cfg.panel = false;
+  capturingKeys = false;
   document.body.classList.remove('checker');
   document.getElementById('pChecker').checked = false;
   syncPanelUI();
   try { history.replaceState(null, '', buildObsUrl(false)); } catch (e) {}
 });
 document.getElementById('pReset').addEventListener('click', () => {
+  capturingKeys = false;
   cfg = { cluster:'hud', keys:'', theme:'ramp', full:3.5, hasThemeQ:false, hasFullQ:false, scale:1.0, opacity:0.85, mm:'1', align:'center', panel:cfg.panel };
   applyConfig();
 });
@@ -3725,18 +3814,26 @@ document.getElementById('pCopy').addEventListener('click', () => {
   }
 });
 addEventListener('keydown', e => {
+  if (capturingKeys) {
+    e.preventDefault();
+    e.stopPropagation();
+    const k = eventToLayoutKey(e);
+    if (k) toggleCustomKey(k, true);
+    return;
+  }
   const tag = (document.activeElement && document.activeElement.tagName) || '';
   if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
   if (e.code === 'KeyC' && !e.ctrlKey && !e.altKey && !e.metaKey) {
     cfg.panel = !cfg.panel;
     if (!cfg.panel) {
+      capturingKeys = false;
       document.body.classList.remove('checker');
       document.getElementById('pChecker').checked = false;
     }
     syncPanelUI();
     try { history.replaceState(null, '', buildObsUrl(cfg.panel)); } catch (e2) {}
   }
-});
+}, true);
 
 let live = {}, nameIdx = {}, held = new Set();
 let lastMsg = Date.now();
