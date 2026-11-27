@@ -53,7 +53,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.10.1"
+VERSION = "1.10.2"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -360,7 +360,7 @@ class Engine(object):
             self.key_state.clear()
             self.press_state.clear()
             self.pending_bind = False
-            self.bump_mapping()
+            self.bump_mapping(invalidate=True)
         self._save_mapping()
 
     def bind_by_press(self):
@@ -430,21 +430,27 @@ class Engine(object):
                     pass
             time.sleep(0.6)
 
-    def bump_mapping(self):
-        """The index<->vk table changed: old physical state must not be trusted."""
+    def bump_mapping(self, invalidate=False):
+        """The index<->vk table changed.
+
+        Learning or binding a new key must NOT invalidate the physical state of
+        keys that are still held: the hold writer relies on that state, and a
+        blanket invalidation silently disabled multi-key recording.
+        Only an explicit reset (user pressed 重新识别) drops everything.
+        """
         self.mapping_gen += 1
-        for st in self.key_state.values():
-            st["gen"] = -1
+        if invalidate:
+            self.key_state.clear()
 
     def os_key_down(self, vk):
-        """True only if the OS says the key is down AND that reading belongs to
-        the current mapping generation."""
-        if not self.vk_held.get(vk):
-            return False
-        st = self.key_state.get(vk)
-        if st is None:
-            return True
-        return st.get("gen") == self.mapping_gen
+        """Is this key physically down right now?
+
+        This is OS state, independent of which matrix index the key maps to, so
+        it must not be tied to the mapping generation: doing that made every
+        "learn a new key" invalidate the keys you were still holding, which
+        silently disabled multi-key recording.
+        """
+        return bool(self.vk_held.get(vk))
 
     def learn_candidate(self, now, min_delta=0.12):
         """Pick the index that is *rising* right now, never an already-bound one.

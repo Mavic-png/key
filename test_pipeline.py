@@ -178,30 +178,76 @@ def t_learning_key_keeps_state():
 
 
 def t_refresh_does_not_resurrect_others():
-    """Re-stamping one key must not re-validate state from the old mapping."""
+    """Re-stamping one key must not make a released key look pressed."""
     e = dl.Engine()
     for idx, vk in ((31, 0x41), (33, 0x44)):
         e.keys[idx] = {"vk": vk, "mm": 1.0, "count": 0, "speeds": []}
-    e.mark_key(0x41, True, 1.0)
-    e.mark_key(0x44, True, 1.0)
+    e.mark_key(0x41, True, 1.0)            # A held
+    e.mark_key(0x44, False, 1.0)           # D released
     e.bump_mapping()
     e.refresh_key_state(0x41, True, 1.0)
-    assert e.os_key_down(0x41)
-    assert not e.os_key_down(0x44), "old-generation key must stay invalid"
+    assert e.os_key_down(0x41), "held key stays held"
+    assert not e.os_key_down(0x44), "released key must not be resurrected"
+
+
+def t_learning_keeps_held_state():
+    """Learning a new key must not invalidate a key that is still held.
+
+    This is the regression that silently disabled multi-key recording: every
+    learn bumped the generation and wiped the held state, so run_hold emitted
+    nothing for the key you were still holding.
+    """
+    e = dl.Engine()
+    e.keys[18] = {"vk": 0x57, "mm": 3.5, "count": 0, "speeds": []}
+    e.mark_key(0x57, True, 1.0)
+    assert e.os_key_down(0x57)
+    e.keys[31] = {"vk": None, "mm": 2.0, "count": 0, "speeds": []}
+    e.mapping[31] = 0x41
+    e.bump_mapping()                       # what learning/binding does
+    assert e.os_key_down(0x57), "held key must survive a learn"
+
+
+def t_reset_still_invalidates():
+    """An explicit reset must still drop the physical state."""
+    e = dl.Engine()
+    e.keys[18] = {"vk": 0x57, "mm": 3.5, "count": 0, "speeds": []}
+    e.mark_key(0x57, True, 1.0)
+    e.reset_mapping()
+    assert not e.os_key_down(0x57)
+
+
+def t_hold_writer_survives_learning():
+    """run_hold must keep emitting for a held key after another key is learnt."""
+    import threading, time as _t
+    e = dl.Engine()
+    e.keys[18] = {"vk": 0x57, "mm": 3.5, "count": 0, "speeds": []}
+    e.mark_key(0x57, True, 1.0)
+    e.recording = True
+    th = threading.Thread(target=e.run_hold)
+    th.daemon = True
+    th.start()
+    _t.sleep(0.12)
+    before = e.hold_n
+    e.keys[31] = {"vk": None, "mm": 2.0, "count": 0, "speeds": []}
+    e.mapping[31] = 0x41
+    e.bump_mapping()                        # learn while W is still held
+    _t.sleep(0.2)
+    e.recording = False
+    assert e.hold_n > before, "hold writer stopped emitting after a learn"
 
 
 def t_stale_state_after_mapping_change():
-    """A physical state captured under an older mapping must not suppress a zero."""
+    """Learning a key must not turn a held key into a released one (v1.10.2),
+    while a genuinely released key stays released."""
     e = dl.Engine()
     e.keys[31] = {"vk": 0x41, "mm": 0.0, "count": 0, "speeds": []}
     e.on_depth(1.0, 31, 2.5)
     e.vk_held[0x41] = True
-    e.key_state[0x41] = {"gen": e.mapping_gen, "ts": 1.0}
-    assert e.os_key_down(0x41), "fresh state should count"
-    e.bump_mapping()                       # mapping changed while the key is held
-    assert not e.os_key_down(0x41), "stale state must be ignored"
-    e.on_depth(1.1, 31, 0.0)               # so the zero is a real release
-    assert e.keys[31]["mm"] == 0.0, e.keys[31]["mm"]
+    e.bump_mapping()                       # mapping change while still held
+    assert e.os_key_down(0x41), "held key must survive a mapping change"
+    e.vk_held.pop(0x41, None)              # real release
+    e.bump_mapping()
+    assert not e.os_key_down(0x41), "released key must stay released"
 
 
 def t_suppressed_counter():
@@ -821,6 +867,9 @@ def main():
         ("physical release zeroes", t_physical_release_zeroes),
         ("learning key keeps its state", t_learning_key_keeps_state),
         ("refresh does not resurrect others", t_refresh_does_not_resurrect_others),
+        ("learning keeps held state", t_learning_keeps_held_state),
+        ("reset still invalidates", t_reset_still_invalidates),
+        ("hold writer survives learning", t_hold_writer_survives_learning),
         ("stale state after mapping change", t_stale_state_after_mapping_change),
         ("suppressed counter", t_suppressed_counter),
         ("reset mapping clears state", t_reset_mapping_clears_state),
