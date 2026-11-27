@@ -53,7 +53,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.10.2"
+VERSION = "1.10.3"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -656,7 +656,8 @@ class Engine(object):
                 self.notice = "\u4fdd\u5b58\u5931\u8d25\uff1a%s" % exc
             return None
         with self.lock:
-            self.notice = "\u5df2\u4fdd\u5b58 %d \u70b9\uff1a%s" % (n, stamp)
+            self.notice = ("\u5df2\u81ea\u52a8\u4fdd\u5b58 %d \u70b9\uff1a"
+                           "recordings\\%s\\wide.csv" % (n, stamp))
         return wide_path
 
     def run_hold(self):
