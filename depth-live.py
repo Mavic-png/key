@@ -127,12 +127,23 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.17.2"
+VERSION = "1.17.3"
 GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
 OPEN_EXISTING = 3
+FILE_FLAG_OVERLAPPED = 0x40000000
+ERROR_IO_PENDING = 997
+WAIT_OBJECT_0 = 0
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class _OVERLAPPED(ctypes.Structure):
+    _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
+                ("Offset", wt.DWORD), ("OffsetHigh", wt.DWORD),
+                ("hEvent", ctypes.c_void_p)]
+
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -148,6 +159,16 @@ kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, wt.DWORD, wt.DWORD, ctypes.c_
                                  wt.DWORD, wt.DWORD, ctypes.c_void_p]
 kernel32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.DWORD,
                               ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
+kernel32.WriteFile.restype = wt.BOOL
+kernel32.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.DWORD,
+                               ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
+kernel32.CreateEventW.restype = ctypes.c_void_p
+kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.BOOL, wt.LPCWSTR]
+kernel32.WaitForSingleObject.restype = wt.DWORD
+kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, wt.DWORD]
+kernel32.GetOverlappedResult.restype = wt.BOOL
+kernel32.GetOverlappedResult.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.POINTER(wt.DWORD), wt.BOOL]
 kernel32.CancelIoEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 kernel32.CancelIoEx.restype = wt.BOOL
 kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
@@ -430,14 +451,16 @@ def probe(path):
         if not hid.HidD_GetAttributes(h, ctypes.byref(attrs)):
             return None
         info = {"path": path, "vid": attrs.VendorID, "pid": attrs.ProductID,
-                "in_len": 0, "usage_page": 0}
+                "in_len": 0, "out_len": 0, "usage_page": 0, "usage": 0}
         pre = ctypes.c_void_p()
         caps = HIDP_CAPS()
         if hid.HidD_GetPreparsedData(h, ctypes.byref(pre)):
             try:
                 if hid.HidP_GetCaps(pre, ctypes.byref(caps)):
                     info["in_len"] = caps.InputReportByteLength
+                    info["out_len"] = caps.OutputReportByteLength
                     info["usage_page"] = caps.UsagePage
+                    info["usage"] = caps.Usage
             finally:
                 hid.HidD_FreePreparsedData(pre)
         return info
@@ -458,6 +481,109 @@ def find_depth_collection(vid=0x0B05, pid=0x1C7D):
         if info["in_len"] in (21, 22, 23):
             return info
     return cands[0] if cands else None
+
+
+def build_key_travel_notify_report(enable, out_len=65):
+    """Build ROG Gear Link WebHID setKeyTravelNotify output report (ID 0x00 + 51 61 <01|00>)."""
+    size = max(65, int(out_len or 65))
+    buf = bytearray(size)
+    buf[0] = 0x00
+    buf[1] = 0x51
+    buf[2] = 0x61
+    buf[3] = 0x01 if enable else 0x00
+    return bytes(buf)
+
+
+def find_control_collection(vid=0x0B05, pid=0x1C7D):
+    """Locate the vendor control HID collection (0xFF00:0x0001) with >=65B output reports."""
+    cands = []
+    for path in interface_paths():
+        low = path.lower()
+        if ("vid_%04x" % vid) not in low or ("pid_%04x" % pid) not in low:
+            continue
+        info = probe(path)
+        if info and info.get("usage_page") == 0xFF00 and info.get("out_len", 0) >= 65:
+            cands.append(info)
+    for info in cands:
+        if info.get("usage") == 0x0001:
+            return info
+    return cands[0] if cands else None
+
+
+def _hid_xfer_overlapped(h, payload, in_len=65, timeout_ms=400):
+    """Send an output report via overlapped WriteFile and drain an optional ACK reply."""
+    ev_w = kernel32.CreateEventW(None, True, False, None)
+    ev_r = kernel32.CreateEventW(None, True, False, None)
+    try:
+        if not ev_w:
+            return False, b""
+        ov_w = _OVERLAPPED()
+        ov_w.hEvent = ev_w
+        n_pay = len(payload)
+        wbuf = (ctypes.c_ubyte * n_pay).from_buffer_copy(payload)
+        nw = wt.DWORD(0)
+        ok_w = bool(kernel32.WriteFile(h, wbuf, n_pay, ctypes.byref(nw), ctypes.byref(ov_w)))
+        if not ok_w:
+            if ctypes.get_last_error() != ERROR_IO_PENDING:
+                return False, b""
+            if kernel32.WaitForSingleObject(ev_w, int(timeout_ms)) != WAIT_OBJECT_0:
+                kernel32.CancelIoEx(h, ctypes.byref(ov_w))
+                return False, b""
+            if not kernel32.GetOverlappedResult(h, ctypes.byref(ov_w), ctypes.byref(nw), False):
+                return False, b""
+        if nw.value <= 0:
+            return False, b""
+        if not in_len or in_len <= 0 or not ev_r:
+            return True, b""
+        ov_r = _OVERLAPPED()
+        ov_r.hEvent = ev_r
+        rsize = max(65, int(in_len))
+        rbuf = (ctypes.c_ubyte * rsize)()
+        nr = wt.DWORD(0)
+        ok_r = bool(kernel32.ReadFile(h, rbuf, rsize, ctypes.byref(nr), ctypes.byref(ov_r)))
+        if not ok_r:
+            if ctypes.get_last_error() != ERROR_IO_PENDING:
+                return True, b""
+            if kernel32.WaitForSingleObject(ev_r, min(int(timeout_ms), 250)) != WAIT_OBJECT_0:
+                kernel32.CancelIoEx(h, ctypes.byref(ov_r))
+                return True, b""
+            if not kernel32.GetOverlappedResult(h, ctypes.byref(ov_r), ctypes.byref(nr), False):
+                return True, b""
+        return True, bytes(rbuf[:nr.value])
+    finally:
+        if ev_w:
+            kernel32.CloseHandle(ev_w)
+        if ev_r:
+            kernel32.CloseHandle(ev_r)
+
+
+def set_key_travel_notify(enable, vid=0x0B05, pid=0x1C7D, timeout_ms=400):
+    """Toggle ROG analog depth streaming (03 7E) without opening Gear Link Web."""
+    if os.environ.get("DEPTH_MONITOR_NO_WAKE") == "1":
+        return False, "disabled"
+    try:
+        info = find_control_collection(vid, pid)
+        if not info:
+            return False, "no-control-hid"
+        payload = build_key_travel_notify_report(enable, info.get("out_len") or 65)
+        h = kernel32.CreateFileW(
+            info["path"], GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED, None,
+        )
+        if h == INVALID_HANDLE_VALUE:
+            return False, "open-err-%d" % ctypes.get_last_error()
+        try:
+            ok, ack = _hid_xfer_overlapped(h, payload, info.get("in_len") or 65, timeout_ms)
+            if not ok:
+                return False, "write-err-%d" % ctypes.get_last_error()
+            if ack[:4] == payload[:4]:
+                return True, "ack"
+            return True, "sent"
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception as exc:
+        return False, "exc-%s" % exc
 
 
 def decode(report):
@@ -682,6 +808,10 @@ class Engine(object):
         self._last_raw_mouse_t = 0.0
         self.mouse_uipi_fallback = False
         self._cursor_raw_ratio = cursor_to_raw_scale()
+        self.hid_wake = False
+        self.hid_wake_msg = ""
+        self._hid_wake_sent = False
+        self._last_wake_t = 0.0
         self._load_settings()
         self._load_mapping()
 
@@ -930,9 +1060,29 @@ class Engine(object):
         cur = self.keys.get(idx, {}).get("mm", 0.0)
         return 0.0 if first is None else cur - first
 
+    def _ensure_hid_wake(self, force=False):
+        now = time.perf_counter()
+        if not force and (now - self._last_wake_t) < 5.0:
+            return False
+        self._last_wake_t = now
+        ok, msg = set_key_travel_notify(True)
+        with self.lock:
+            self.hid_wake = bool(ok)
+            self.hid_wake_msg = msg
+            if ok:
+                self._hid_wake_sent = True
+        return ok
+
+    def _disable_hid_wake(self):
+        with self.lock:
+            if not self._hid_wake_sent:
+                return
+            self._hid_wake_sent = False
+        set_key_travel_notify(False)
+
     # ---- reader -----------------------------------------------------
     def run_reader(self):
-        while True:
+        while not self.stop_io.is_set():
             info = find_depth_collection()
             if not info:
                 self.connected = False
@@ -947,6 +1097,7 @@ class Engine(object):
                 continue
             self.connected = True
             self.io_handle = h
+            self._ensure_hid_wake(force=True)
             length = max(info.get("in_len") or 21, 21)
             buf = (ctypes.c_ubyte * length)()
             nread = wt.DWORD(0)
@@ -970,6 +1121,8 @@ class Engine(object):
             finally:
                 self.connected = False
                 self.opened = False
+                if self.stop_io.is_set():
+                    self._disable_hid_wake()
                 try:
                     kernel32.CancelIoEx(h, None)
                 except Exception:
@@ -978,7 +1131,8 @@ class Engine(object):
                     kernel32.CloseHandle(h)
                 except Exception:
                     pass
-            time.sleep(0.6)
+            if not self.stop_io.is_set():
+                time.sleep(0.6)
 
     def bump_mapping(self, invalidate=False):
         """The index<->vk table changed.
@@ -1495,6 +1649,7 @@ class Engine(object):
     def shutdown_app(self, srv, defer=False):
         """Stop the HID reader, then the HTTP server -- same path for every exit."""
         self.stop_io.set()
+        self._disable_hid_wake()
         h = getattr(self, "io_handle", None)
         if h:
             try:
@@ -2228,6 +2383,13 @@ class Engine(object):
                 self.event_rate = float(self.n_event)
                 self.n_depth = 0
                 self.n_event = 0
+                should_rewake = (
+                    self.connected and not self.stop_io.is_set() and bool(self.vk_held)
+                    and (self._last_depth_t is None or (time.perf_counter() - self._last_depth_t) > 1.5)
+                    and (time.perf_counter() - self._last_wake_t) > 5.0
+                )
+            if should_rewake:
+                self._ensure_hid_wake(force=False)
 
     # ---- key mapping + event depths ---------------------------------
     def run_keys(self):
@@ -2471,6 +2633,8 @@ class Engine(object):
                 "kb_hud_rev": self.kb_hud_rev,
                 "mouse_uipi": self.mouse_uipi_fallback,
                 "mouse_ratio": round(self._cursor_raw_ratio, 2),
+                "hid_wake": self.hid_wake,
+                "hid_wake_msg": self.hid_wake_msg,
                 "binding": self.pending_label,
                 "bind_msg": self.bind_msg,
                 "recording": self.recording,
@@ -6686,9 +6850,13 @@ def main():
     ap.add_argument("--auto", action="store_true", help="start recording immediately")
     ap.add_argument("--full", type=float, default=None,
                     help="full switch travel in mm (default 3.50, range 1.0-5.0)")
+    ap.add_argument("--no-wake", action="store_true",
+                    help="do not send automatic setKeyTravelNotify wake report")
     ap.add_argument("--idle-exit", type=int, default=90,
                     help="exit after N seconds with no page open (0 = never)")
     args = ap.parse_args()
+    if args.no_wake:
+        os.environ["DEPTH_MONITOR_NO_WAKE"] = "1"
     if args.full is not None:
         ENGINE.update_settings(full_mm=args.full, save=False)
 
@@ -6760,6 +6928,8 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        ENGINE.shutdown_app(srv)
 
 
 if __name__ == "__main__":

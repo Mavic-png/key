@@ -40,9 +40,10 @@ def load(name, path):
     return mod
 
 
-# tests must never read or write the real mapping file
+# tests must never read or write the real mapping file or toggle physical keyboard
 _TEST_HOME = tempfile.mkdtemp(prefix="dl-test-")
 os.environ["DEPTH_MONITOR_HOME"] = _TEST_HOME
+os.environ["DEPTH_MONITOR_NO_WAKE"] = "1"
 
 dl = load("dl", os.path.join(HERE, "depth-live.py"))
 
@@ -1431,10 +1432,61 @@ def t_mouse_overlay_cef_compat_and_uipi_fallback():
         dl.user32.GetAsyncKeyState = orig_gaks
 
 
+def t_hid_auto_wake_protocol():
+    """setKeyTravelNotify packet format, control interface selection, and disable guard."""
+    on = dl.build_key_travel_notify_report(True, 65)
+    off = dl.build_key_travel_notify_report(False, 65)
+    assert len(on) == 65 and len(off) == 65
+    assert on[:4] == b"\x00\x51\x61\x01" and on[4:] == b"\x00" * 61
+    assert off[:4] == b"\x00\x51\x61\x00" and off[4:] == b"\x00" * 61
+
+    orig_if = dl.interface_paths
+    orig_pr = dl.probe
+    orig_fc = dl.find_control_collection
+    orig_nw = os.environ.get("DEPTH_MONITOR_NO_WAKE")
+    try:
+        fake = {
+            r"\\?\hid#vid_0b05&pid_1c7d&mi_02&col03#1": {
+                "path": r"\\?\hid#vid_0b05&pid_1c7d&mi_02&col03#1",
+                "vid": 0x0B05, "pid": 0x1C7D,
+                "in_len": 21, "out_len": 0, "usage_page": 0xFFC0, "usage": 0x0001,
+            },
+            r"\\?\hid#vid_0b05&pid_1c7d&mi_00&col01#2": {
+                "path": r"\\?\hid#vid_0b05&pid_1c7d&mi_00&col01#2",
+                "vid": 0x0B05, "pid": 0x1C7D,
+                "in_len": 9, "out_len": 2, "usage_page": 0x0001, "usage": 0x0006,
+            },
+            r"\\?\hid#vid_0b05&pid_1c7d&mi_01#3": {
+                "path": r"\\?\hid#vid_0b05&pid_1c7d&mi_01#3",
+                "vid": 0x0B05, "pid": 0x1C7D,
+                "in_len": 65, "out_len": 65, "usage_page": 0xFF00, "usage": 0x0001,
+            },
+        }
+        dl.interface_paths = lambda: list(fake.keys())
+        dl.probe = lambda p: fake.get(p)
+        chosen = dl.find_control_collection()
+        assert chosen and chosen["usage_page"] == 0xFF00 and chosen["out_len"] == 65, chosen
+
+        os.environ["DEPTH_MONITOR_NO_WAKE"] = "1"
+        assert dl.set_key_travel_notify(True) == (False, "disabled")
+        os.environ.pop("DEPTH_MONITOR_NO_WAKE", None)
+        dl.find_control_collection = lambda vid=0x0B05, pid=0x1C7D: None
+        assert dl.set_key_travel_notify(True) == (False, "no-control-hid")
+    finally:
+        dl.interface_paths = orig_if
+        dl.probe = orig_pr
+        dl.find_control_collection = orig_fc
+        if orig_nw is None:
+            os.environ.pop("DEPTH_MONITOR_NO_WAKE", None)
+        else:
+            os.environ["DEPTH_MONITOR_NO_WAKE"] = orig_nw
+
+
 def main():
     print("depth monitor user-workflow gate tests")
     for name, fn in [
         # 1. 主监测页 / 实时行程、RT/SOCD、改绑与设置持久化、关页自动退出
+        ("HID auto-wake protocol + control interface select", t_hid_auto_wake_protocol),
         ("RT release preserves true travel", t_rt_release_preserves_true_travel),
         ("SOCD hold + silent fallback zero", t_socd_hold_and_silent_fallback),
         ("multi-key hold writer + firmware switch-zero", t_hold_without_mapping),
