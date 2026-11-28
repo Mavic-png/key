@@ -127,7 +127,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.17.0"
+VERSION = "1.17.1"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -3626,9 +3626,10 @@ OVERLAY_PAGE = r"""<!DOCTYPE html>
     border: 1px solid rgba(255, 255, 255, 0.13);
     backdrop-filter: blur(8px);
     user-select: none;
-    will-change: transform;
+    contain: layout style paint;
     transition: transform 0.05s linear, border-color 0.08s linear;
   }
+  #kb.many .k { backdrop-filter: none; }
   .k .fill {
     position: absolute; left: 0; right: 0; bottom: 0; height: 0%;
     pointer-events: none;
@@ -3913,8 +3914,10 @@ function buildLayout() {
   document.body.classList.remove('mm-0', 'mm-1', 'mm-always');
   document.body.classList.add('mm-' + cfg.mm);
 
-  kb.innerHTML = '';
+  kb.classList.toggle('many', items.length > 24);
+  kb.textContent = '';
   els = {}; lastRatio = {}; lastHeld = {};
+  const frag = document.createDocumentFragment();
   for (const it of items) {
     const d = document.createElement('div');
     d.className = 'k';
@@ -3933,9 +3936,10 @@ function buildLayout() {
     d.appendChild(fill);
     d.appendChild(lbl);
     d.appendChild(mm);
-    kb.appendChild(d);
+    frag.appendChild(d);
     els[it.k] = { box: d, fill, mm };
   }
+  kb.appendChild(frag);
 }
 
 function buildObsUrl(includePanel) {
@@ -3961,7 +3965,7 @@ for (const id in FILL_PRESETS) {
   b.className = 'chip';
   b.dataset.theme = id;
   b.innerHTML = '<span class="sw" style="background:' + FILL_PRESETS[id].acc + '"></span>' + FILL_PRESETS[id].label;
-  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(); });
+  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(false); });
   pThemes.appendChild(b);
 }
 
@@ -4041,24 +4045,49 @@ function syncPanelUI() {
   panelEl.classList.toggle('open', cfg.panel);
 }
 
-function applyConfig() {
-  buildLayout();
-  syncPanelUI();
-  try { history.replaceState(null, '', buildObsUrl(cfg.panel)); } catch (e) {}
+let _urlTimer = null;
+function scheduleUrlSync() {
+  if (_urlTimer) clearTimeout(_urlTimer);
+  _urlTimer = setTimeout(() => {
+    _urlTimer = null;
+    try { history.replaceState(null, '', buildObsUrl(cfg.panel)); } catch (e) {}
+  }, 120);
 }
 
-document.getElementById('pCluster').addEventListener('change', e => { cfg.cluster = e.target.value; applyConfig(); });
-pKeysEl.addEventListener('input', e => { cfg.keys = e.target.value.trim(); applyConfig(); });
+function applyConfig(rebuild) {
+  if (rebuild !== false) {
+    buildLayout();
+  } else {
+    document.documentElement.style.setProperty('--op', cfg.opacity.toFixed(2));
+    stage.className = 'align-' + cfg.align;
+    document.body.classList.remove('mm-0', 'mm-1', 'mm-always');
+    document.body.classList.add('mm-' + cfg.mm);
+    lastRatio = {};
+    lastHeld = {};
+  }
+  syncPanelUI();
+  if (typeof drawOnce === 'function') drawOnce();
+  scheduleUrlSync();
+}
+
+document.getElementById('pCluster').addEventListener('change', e => {
+  capturingKeys = false;
+  cfg.cluster = e.target.value;
+  cfg.keys = '';
+  pKeysEl.value = '';
+  applyConfig(true);
+});
+pKeysEl.addEventListener('input', e => { cfg.keys = e.target.value.trim(); applyConfig(true); });
 if (pCapBtn) pCapBtn.addEventListener('click', () => {
   capturingKeys = !capturingKeys;
   if (capturingKeys) pCapBtn.blur();
   syncPanelUI();
 });
-document.getElementById('pScale').addEventListener('input', e => { cfg.scale = parseFloat(e.target.value); applyConfig(); });
-document.getElementById('pOpacity').addEventListener('input', e => { cfg.opacity = parseFloat(e.target.value); applyConfig(); });
-document.getElementById('pFull').addEventListener('input', e => { cfg.full = parseFloat(e.target.value); cfg.hasFullQ = true; applyConfig(); });
-document.getElementById('pMm').addEventListener('change', e => { cfg.mm = e.target.value; applyConfig(); });
-document.getElementById('pAlign').addEventListener('change', e => { cfg.align = e.target.value; applyConfig(); });
+document.getElementById('pScale').addEventListener('input', e => { cfg.scale = parseFloat(e.target.value); applyConfig(true); });
+document.getElementById('pOpacity').addEventListener('input', e => { cfg.opacity = parseFloat(e.target.value); applyConfig(false); });
+document.getElementById('pFull').addEventListener('input', e => { cfg.full = parseFloat(e.target.value); cfg.hasFullQ = true; applyConfig(false); });
+document.getElementById('pMm').addEventListener('change', e => { cfg.mm = e.target.value; applyConfig(false); });
+document.getElementById('pAlign').addEventListener('change', e => { cfg.align = e.target.value; applyConfig(false); });
 document.getElementById('pChecker').addEventListener('change', e => { document.body.classList.toggle('checker', e.target.checked); });
 document.getElementById('pClose').addEventListener('click', () => {
   cfg.panel = false;
@@ -4139,7 +4168,7 @@ es.onmessage = ev => {
   }
 };
 
-function draw() {
+function drawOnce() {
   const stale = Date.now() - lastMsg > 2000;
   const heldNow = stale ? EMPTY_SET : held;
   const preset = FILL_PRESETS[cfg.theme] || FILL_PRESETS.ramp;
@@ -4156,6 +4185,7 @@ function draw() {
     lastRatio[name] = r;
     lastHeld[name] = isHeld;
     const el = els[name];
+    if (!el || !el.box) continue;
     const st = preset.style(r);
     const hot = r > 0.06;
     const active = r > 0.04;
@@ -4168,10 +4198,19 @@ function draw() {
     el.box.style.transform = active ? ('scale(' + (1 - r * 0.035).toFixed(3) + ')') : '';
     el.mm.textContent = (cfg.mm === 'always' || r > 0.08) ? mm.toFixed(1) : '';
   }
-  requestAnimationFrame(draw);
 }
 
-applyConfig();
+function draw() {
+  try {
+    drawOnce();
+  } catch (e) {
+    /* keep rAF loop alive */
+  } finally {
+    requestAnimationFrame(draw);
+  }
+}
+
+applyConfig(true);
 requestAnimationFrame(draw);
 </script>
 </body></html>
@@ -4477,7 +4516,7 @@ for (const id in FILL_PRESETS) {
   const b = document.createElement('button');
   b.type = 'button'; b.className = 'chip'; b.dataset.theme = id;
   b.innerHTML = '<span class="sw" style="background:' + FILL_PRESETS[id].acc + '"></span>' + FILL_PRESETS[id].label;
-  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(); });
+  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(false); });
   pThemes.appendChild(b);
 }
 
