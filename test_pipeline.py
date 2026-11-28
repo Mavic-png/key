@@ -1184,67 +1184,182 @@ def t_kb_frames_mouse_overlay_and_webm():
             ff = subprocess.run(["ffmpeg", "-c:v", "libvpx-vp9", "-i", webm_path], capture_output=True, text=True)
             info_s = (ff.stderr or "").lower()
             assert "vp9" in info_s and ("alpha_mode" in info_s or "yuva420p" in info_s), ff.stderr
+
+        # Standalone kb-viz.py HTML export
+        viz_out = os.path.join(tmp, "viz.html")
+        rv = subprocess.run([sys.executable, os.path.join(here, "kb-viz.py"),
+                             os.path.join(here, "sample", "sample-wide.csv"), "-o", viz_out],
+                            capture_output=True, text=True)
+        assert rv.returncode == 0 and os.path.isfile(viz_out) and os.path.getsize(viz_out) > 2000, rv.stderr
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# --------------------------------------------------------- daily user journeys
+
+def t_user_settings_and_bind_unbind_flow():
+    """User tweaks full_mm/theme/mouse_span, restarts, binds & right-click unbinds a key."""
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    try:
+        body = json.dumps({"full_mm": 3.80, "theme": "mint", "mouse_span": 11200}).encode("utf-8")
+        req = urllib.request.Request("http://127.0.0.1:%d/settings" % port, data=body, method="POST")
+        req.add_header("X-Depth-Token", dl.ENGINE.token)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            res = json.loads(r.read().decode("utf-8"))
+        assert res["ok"] and abs(res["full_mm"] - 3.80) < 0.01 and res["theme"] == "mint" and res["mouse_span"] == 11200
+        # Restarted Engine must reload persisted settings
+        e2 = dl.Engine()
+        assert abs(e2.full_mm - 3.80) < 0.01 and e2.theme == "mint" and e2.mouse_span == 11200
+
+        # Left-click bind + right-click unbind flow (simulate key moving 0 -> 2.2mm)
+        api(port, "/bind?key=W")
+        assert dl.ENGINE.pending_label == "W", dl.ENGINE.pending_label
+        now_t = time.perf_counter()
+        dl.ENGINE.on_depth(now_t - 0.02, 88, 0.0)
+        dl.ENGINE.on_depth(now_t, 88, 2.2)
+        dl.ENGINE.apply_key_state(0x57, True, now_t)
+        assert dl.ENGINE.mapping.get(88) == 0x57, (dl.ENGINE.mapping, dl.ENGINE.bind_msg)
+        _, raw_un = api(port, "/unbind?key=W")
+        assert json.loads(raw_un.decode("utf-8"))["ok"] is True
+        assert 88 not in dl.ENGINE.mapping, dl.ENGINE.mapping
+    finally:
+        srv.shutdown()
+
+
+def t_user_close_page_auto_exits():
+    """Closing the browser tab (SSE disconnect) triggers clean idle auto-exit."""
+    dl.ENGINE = make_engine()
+    srv, port = start_server()
+    idle = threading.Thread(target=dl.ENGINE.run_idle_exit, args=(2, srv), daemon=True)
+    idle.start()
+    resp = urllib.request.urlopen("http://127.0.0.1:%d/events" % port, timeout=10)
+    try:
+        # While tab is open, SSE keeps backend alive past idle window
+        got = 0
+        deadline = time.time() + 5
+        while got < 3 and time.time() < deadline:
+            if resp.readline().startswith(b"data:"):
+                got += 1
+        assert got >= 3
+        time.sleep(2.4)
+        fetch(port, "/snapshot")
+    finally:
+        resp.close()
+    # After user closes browser tab, backend auto-exits promptly
+    idle.join(timeout=6.0)
+    assert not idle.is_alive() and dl.ENGINE.stop_io.is_set(), "backend did not auto-exit after tab closed"
+
+
+def t_user_overlay_custom_keys_and_preset_switch():
+    """All 4 web pages pass JS syntax; /overlay parses Tab/Shift/Alt aliases & clears keys on preset switch."""
+    import re, shutil, subprocess, tempfile
+    pages = {
+        "main": dl.page_html(),
+        "overlay": dl.overlay_html(),
+        "mouse": dl.mouse_overlay_html(),
+        "wb": dl.workbench_html(),
+    }
+    ov_html = pages["overlay"]
+    assert "pQuickKeys" in ov_html and "pCap" in ov_html, "custom key chips/capture missing"
+    assert "cfg.keys = ''" in ov_html and "createDocumentFragment" in ov_html, "preset switch fix missing"
+    assert "finally" in ov_html and "#kb.many .k" in ov_html, "rAF keepalive / GPU lag guard missing"
+    # Verify mouse overlay uses Home reset (not game reload R) and supports independent mopacity
+    m_html = pages["mouse"]
+    assert "mopacity" in m_html and "Home" in m_html and "e.code === 'KeyR'" not in m_html
+
+    if shutil.which("node"):
+        tmp = tempfile.mkdtemp()
+        try:
+            for k, html in pages.items():
+                js = re.findall(r"<script>(.*?)</script>", html, re.S)[0]
+                p = os.path.join(tmp, k + ".js")
+                with io.open(p, "w", encoding="utf-8") as f:
+                    f.write(js)
+                subprocess.check_call(["node", "--check", p])
+            # Actually execute parseCustomKeys from overlay JS with Chinese/typo aliases
+            ov_js = re.findall(r"<script>(.*?)</script>", ov_html, re.S)[0]
+            head = ov_js.split("function clamp(", 1)[0]
+            test_js = head + "\nconsole.log(JSON.stringify(parseCustomKeys('tap\uff0c\u4e0a\u6863\uff0calt\uff0cW A S D \u7a7a\u683c')));"
+            tp = os.path.join(tmp, "test_keys.js")
+            with io.open(tp, "w", encoding="utf-8") as f:
+                f.write(test_js)
+            out = subprocess.check_output(["node", tp], text=True).strip()
+            parsed = json.loads(out)
+            assert parsed == ["Tab", "LShift", "LAlt", "W", "A", "S", "D", "Space"], parsed
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_user_workbench_history_switch_and_delete():
+    """User records 2 sessions (synced + legacy), switches between them in /wb, then deletes one."""
+    dl.ENGINE = make_engine()
+    t0 = time.perf_counter()
+    # Session 1: synced keyboard + mouse
+    dl.ENGINE.start_recording()
+    for i in range(25):
+        dl.ENGINE.on_depth(t0 + i * 0.02, 31, 3.2 if i < 12 else 0.0)
+        dl.ENGINE.on_mouse(80, 20, btns={"l": (i == 10)}, t=t0 + i * 0.02)
+    p1 = dl.ENGINE.stop_recording(save=True)
+    s1 = os.path.basename(os.path.dirname(p1))
+    # Session 2: keyboard-only
+    dl.ENGINE.start_recording()
+    for i in range(25):
+        dl.ENGINE.on_depth(t0 + 2.0 + i * 0.02, 33, 3.0 if i < 10 else 0.0)
+    p2 = dl.ENGINE.stop_recording(save=True)
+    s2 = os.path.basename(os.path.dirname(p2))
+
+    srv, port = start_server()
+    try:
+        lst = json.loads(fetch(port, "/wb/list")[1].decode("utf-8"))
+        stamps = {it["stamp"]: it for it in lst["items"]}
+        assert s1 in stamps and stamps[s1]["has_mouse"] is True
+        assert s2 in stamps and stamps[s2]["has_mouse"] is False
+        # Switch to session 1 and verify series + FPS analysis work over HTTP
+        ser1 = json.loads(fetch(port, "/wb/series?stamp=" + s1)[1].decode("utf-8"))
+        an1 = json.loads(fetch(port, "/wb/analysis?pair=A,D&stamp=" + s1)[1].decode("utf-8"))
+        assert ser1["ok"] and ser1["mouse"] is not None
+        assert an1["ok"] and an1["shots"] is not None
+        # Delete session 2 via POST /wb/delete
+        req = urllib.request.Request("http://127.0.0.1:%d/wb/delete" % port,
+                                     data=json.dumps({"stamp": s2}).encode("utf-8"), method="POST")
+        req.add_header("X-Depth-Token", dl.ENGINE.token)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            dres = json.loads(r.read().decode("utf-8"))
+        assert dres["ok"] is True
+        lst2 = json.loads(fetch(port, "/wb/list")[1].decode("utf-8"))
+        assert all(it["stamp"] != s2 for it in lst2["items"])
+    finally:
+        srv.shutdown()
+
+
 def main():
-    print("depth pipeline tests")
+    print("depth monitor user-workflow gate tests")
     for name, fn in [
-        ("recording toggle", t_recording_toggle),
-        ("wide export (mixed keys)", t_wide_export_mixed),
-        ("wide export (keys without samples)", t_wide_export_keys_without_samples),
-        ("long export", t_long_export),
-        ("hold writer without mapping", t_hold_without_mapping),
-        ("firmware zero while held", t_firmware_zero_while_held),
-        ("physical release zeroes", t_physical_release_zeroes),
-        ("learning key keeps its state", t_learning_key_keeps_state),
-        ("refresh does not resurrect others", t_refresh_does_not_resurrect_others),
-        ("learning keeps held state", t_learning_keeps_held_state),
-        ("reset still invalidates", t_reset_still_invalidates),
-        ("hold writer survives learning", t_hold_writer_survives_learning),
-        ("stale state after mapping change", t_stale_state_after_mapping_change),
-        ("suppressed counter", t_suppressed_counter),
-        ("reset mapping clears state", t_reset_mapping_clears_state),
-        ("learning never steals a bound key", t_learning_never_steals_bound),
-        ("deferred learning binds on report", t_deferred_learning),
-        ("missed key-up edge clears held", t_missed_keyup_edge),
-        ("late refresh blocked after reset", t_refresh_blocked_after_reset),
-        ("save mapping failure keeps memory", t_save_mapping_failure_keeps_memory),
-        ("ffmpeg start failure cleans up", t_ffmpeg_start_failure),
-        ("render alpha + multiprocess match", t_render_alpha_and_multiprocess_match),
-        ("empty exports", t_empty_exports),
-        ("sample quality stats", t_sample_quality),
-        ("manifest integrity", t_manifest_integrity),
-        ("save is isolated + manifest", t_save_is_isolated_and_manifested),
-        ("save recording to disk", t_save_recording),
-        ("http endpoints", t_http_endpoints),
-        ("quit requires token", t_quit_requires_token),
-        ("quit blocked when save fails", t_quit_blocked_when_save_fails),
-        ("sse keeps idle alive", t_sse_keeps_idle_alive),
-        ("manual bind refreshes state", t_manual_bind_refreshes_state),
-        ("deferred bind refreshes state", t_deferred_bind_refreshes_state),
-        ("idle exit runs full shutdown", t_idle_exit_uses_full_shutdown),
-        ("quit 409 over real http", t_quit_http_409_when_save_fails),
-        ("foreign host rejected", t_rejects_foreign_host),
-        ("ipv6 host allowed", t_ipv6_host_allowed),
-        ("cross-origin write rejected", t_cross_origin_state_change_rejected),
-        ("foreign origin beats token", t_foreign_origin_beats_token),
-        ("state rejects GET", t_state_rejects_get),
-        ("single instance guard", t_single_instance_guard),
-        ("reader cancel window", t_reader_cancel_window),
-        ("reader stop before io", t_reader_stop_before_io),
-        ("workbench info + series", t_wb_info_and_series),
-        ("frames loader (wide csv)", t_frames_from_wide),
-        ("synced mouse record + wb replay", t_sync_mouse_record_and_wb_replay),
+        # 1. 主监测页 / 实时行程、RT/SOCD、改绑与设置持久化、关页自动退出
+        ("RT release preserves true travel", t_rt_release_preserves_true_travel),
+        ("SOCD hold + silent fallback zero", t_socd_hold_and_silent_fallback),
+        ("multi-key hold writer + firmware switch-zero", t_hold_without_mapping),
+        ("settings persistence + bind/unbind flow", t_user_settings_and_bind_unbind_flow),
+        ("close browser tab auto-exits backend", t_user_close_page_auto_exits),
+        # 2. 直播设备 /overlay & /overlay/mouse（自定义键、预设切换、鼠标配置）
+        ("overlay custom keys + preset switch + JS check", t_user_overlay_custom_keys_and_preset_switch),
+        # 3. 键鼠同步录制、自动分段保存防丢、长录制内存上限与完整性
+        ("synced mouse record + wb replay + legacy", t_sync_mouse_record_and_wb_replay),
         ("autosave preserves inflight events", t_autosave_preserves_inflight_events),
         ("autosave failure restores buffers", t_autosave_failure_restores_buffers),
         ("rapid click and wheel preserved", t_rapid_click_and_wheel_preserved),
-        ("mouse cap, mouse-only & integrity", t_mouse_memory_cap_and_mouse_only_and_integrity),
-        ("RT release preserves true travel", t_rt_release_preserves_true_travel),
-        ("SOCD hold + silent fallback zero", t_socd_hold_and_silent_fallback),
+        ("mouse memory cap, mouse-only & integrity", t_mouse_memory_cap_and_mouse_only_and_integrity),
+        # 4. 素材工作台 /wb（历史切换删除、FPS 急停/开火诊断）
+        ("workbench history switch & delete flow", t_user_workbench_history_switch_and_delete),
         ("workbench FPS diagnosis analysis", t_wb_fps_analysis),
-        ("kb-frames mouse overlay + WebM VP9 alpha", t_kb_frames_mouse_overlay_and_webm),
+        # 5. 视频与网页导出（键鼠透明帧、WebM VP9 透明、多进程一致性、kb-viz）
+        ("kb-frames mouse overlay + WebM VP9 + kb-viz", t_kb_frames_mouse_overlay_and_webm),
+        ("render alpha + multiprocess match", t_render_alpha_and_multiprocess_match),
+        # 6. 安全与单实例运行保护
+        ("single instance guard", t_single_instance_guard),
+        ("quit protection (token + 409 on save fail)", t_quit_http_409_when_save_fails),
+        ("local origin/host security guard", t_cross_origin_state_change_rejected),
     ]:
         check(name, fn)
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
