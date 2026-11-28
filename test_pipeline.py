@@ -1482,6 +1482,276 @@ def t_hid_auto_wake_protocol():
             os.environ["DEPTH_MONITOR_NO_WAKE"] = orig_nw
 
 
+def t_wb_long_file_lod_and_fast_meta():
+    """Fast tail-seek metadata, peak-preserving overview, viewport LOD, & offscreen canvas cache."""
+    import re, shutil, subprocess, tempfile
+    dl.ENGINE = dl.Engine()
+    base = dl.recordings_dir()
+    stamp = "20261129-000001-lod"
+    rdir = os.path.join(base, stamp)
+    os.makedirs(rdir)
+    wide_p = os.path.join(rdir, "wide.csv")
+    mouse_p = os.path.join(rdir, "mouse.csv")
+    # Write >600KB wide.csv (4001 rows, 40s at 100Hz, 26 keys) with one brief 30ms 3.5mm spike at t=20.00s
+    keys = ["1", "2", "3", "4", "Tab", "Q", "W", "E", "R", "T", "A", "S", "D", "F", "G",
+            "Shift", "Z", "X", "B", "LWin", "Alt", "Space", "RAlt", "Esc", "F2", "k120"]
+    w_idx = keys.index("W")
+    zero_tail = ["0.00"] * len(keys)
+    with io.open(wide_p, "w", encoding="utf-8") as f:
+        f.write("# tool=depth-live  wide matrix 100 Hz  depth in mm\n")
+        f.write("t_s,wall," + ",".join(keys) + "\n")
+        for i in range(4001):
+            t = i * 0.01
+            vals = list(zero_tail)
+            if 2000 <= i <= 2002:
+                vals[w_idx] = "3.50"
+            f.write("%.3f,2026-11-29T00:00:00,%s\n" % (t, ",".join(vals)))
+    assert os.path.getsize(wide_p) > 512 * 1024
+    with io.open(mouse_p, "w", encoding="utf-8") as f:
+        f.write("# tool=depth-live  mouse_span=14800  btn_mask=1:L,2:R,4:M,8:X1,16:X2\n")
+        f.write("t_s,dx,dy,btn,wheel\n")
+        f.write("20.000000,40,-10,1,0\n20.040000,0,0,0,0\n")
+
+    k_meta, dur_meta, n_meta = dl.ENGINE._read_wide_meta(wide_p)
+    assert k_meta == keys and abs(dur_meta - 40.0) < 0.02 and n_meta == 4001, (dur_meta, n_meta)
+
+    srv, port = start_server()
+    try:
+        ov = json.loads(fetch(port, "/wb/series?limit=300&stamp=" + stamp)[1].decode("utf-8"))
+        assert ov["ok"] and ov["lod"] is False and abs(ov["duration"] - 40.0) < 0.02
+        assert max(ov["v"]["W"]) == 3.5, "brief 30ms peak dropped in overview: %r" % max(ov["v"]["W"])
+
+        hd = json.loads(fetch(port, "/wb/series?limit=1600&start=19.5&end=21.5&stamp=" + stamp)[1].decode("utf-8"))
+        assert hd["ok"] and hd["lod"] is True and hd["step"] <= 0.015
+        assert len(hd["t"]) >= 180 and abs(hd["duration"] - 40.0) < 0.02
+        assert max(hd["v"]["W"]) == 3.5, "binary-seek slice missed 3.5mm peak"
+        assert hd["mouse"] and len(hd["mouse"]["clicks"]) == 1
+
+        tail_hd = json.loads(fetch(port, "/wb/series?limit=1600&start=38.5&end=40.0&stamp=" + stamp)[1].decode("utf-8"))
+        assert tail_hd["ok"] and tail_hd["t"][0] >= 38.49 and tail_hd["t"][-1] >= 39.98, tail_hd["t"][:3]
+
+        wb_html = fetch(port, "/wb")[1].decode("utf-8")
+        assert "renderWaveCache" in wb_html and "lowerBound" in wb_html
+        assert "scheduleLodFetch" in wb_html and "ensurePlaybackHd" in wb_html
+        k_css = wb_html.split(".k {", 1)[1].split("}", 1)[0]
+        assert "backdrop-filter" not in k_css, "workbench .k still has expensive blur"
+        xof_body = wb_html.split("function xOf(", 1)[1].split("function sampleAt(", 1)[0]
+        assert "getBoundingClientRect" not in xof_body, "xOf/tOf still triggers reflow"
+        js = re.findall(r"<script>(.*?)</script>", wb_html, re.S)[0]
+        tmp = tempfile.mkdtemp(prefix="wb-js-")
+        try:
+            jp = os.path.join(tmp, "wb.js")
+            with io.open(jp, "w", encoding="utf-8") as f:
+                f.write(js)
+            subprocess.check_call(["node", "--check", jp])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        srv.shutdown()
+        shutil.rmtree(rdir, ignore_errors=True)
+
+
+def t_wb_video_align_and_range_stream():
+    """Video timestamp parser, Range 206 stream, audio-click fine align, & draggable HUD layout."""
+    import re, shutil, subprocess, tempfile, urllib.error
+    sp_ep = dl.parse_filename_wall_epoch("Valorant 2026.11.28 - 23.19.31.04.mp4")
+    obs_ep = dl.parse_filename_wall_epoch("2026-11-28 23-19-31.mkv")
+    assert sp_ep and obs_ep and abs(sp_ep - obs_ep) < 1e-6, (sp_ep, obs_ep)
+
+    dl.ENGINE = dl.Engine()
+    ff = dl.find_ffmpeg_bin("ffmpeg")
+    assert ff, "ffmpeg not found for video gate test"
+    tmp = tempfile.mkdtemp(prefix="wb-vid-")
+    stamp = "20261129-040020"
+    rdir = os.path.join(dl.recordings_dir(), stamp)
+    os.makedirs(rdir)
+    try:
+        import math, struct, wave
+        vid_path = os.path.join(tmp, "test_2026.11.29 - 04.00.00.mp4")
+        wav_path = os.path.join(tmp, "impulses.wav")
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(8000)
+            pcm = bytearray()
+            for si in range(8000 * 25 // 10):
+                t = si / 8000.0
+                amp = 24000.0 if (0.60 <= t <= 0.68 or 1.40 <= t <= 1.48) else 0.0
+                pcm += struct.pack("<h", int(amp * math.sin(2.0 * math.pi * 1000.0 * t)))
+            wf.writeframes(pcm)
+        subprocess.check_call([
+            ff, "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x180:r=30:d=2.5",
+            "-i", wav_path,
+            "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", "-y", vid_path,
+        ])
+        with io.open(os.path.join(rdir, "wide.csv"), "w", encoding="utf-8") as f:
+            f.write("# tool=depth-live\nt_s,wall,W\n")
+            for i in range(1501):
+                f.write("%.3f,2026-11-29T04:00:00,%.2f\n" % (i * 0.01, 3.5 if 1000 <= i <= 1250 else 0.0))
+        with io.open(os.path.join(rdir, "mouse.csv"), "w", encoding="utf-8") as f:
+            f.write("# tool=depth-live  mouse_span=14800\nt_s,dx,dy,btn,wheel\n")
+            f.write("10.900000,0,0,1,0\n10.980000,0,0,0,0\n11.700000,0,0,1,0\n11.780000,0,0,0,0\n")
+
+        srv, port = start_server()
+        try:
+            code = None
+            try:
+                fetch(port, "/wb/video/load", method="POST")
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+            assert code == 403, "expected 403 without token"
+
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/wb/video/load" % port,
+                data=json.dumps({"path": vid_path, "stamp": stamp}).encode("utf-8"), method="POST",
+            )
+            req.add_header("X-Depth-Token", dl.ENGINE.token)
+            res = json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
+            assert res["ok"] and res["matched_stamp"] == stamp and res["video"]["has_audio"], res
+
+            sreq = urllib.request.Request("http://127.0.0.1:%d/wb/video/stream" % port)
+            sreq.add_header("Range", "bytes=0-1023")
+            with urllib.request.urlopen(sreq, timeout=5) as sr:
+                assert sr.status == 206 and sr.headers.get("Accept-Ranges") == "bytes"
+                chunk = sr.read()
+                with open(vid_path, "rb") as vf:
+                    assert chunk == vf.read(1024)
+
+            areq = urllib.request.Request(
+                "http://127.0.0.1:%d/wb/video/align" % port,
+                data=json.dumps({"stamp": stamp, "video_t": 1.0, "offset": 9.8, "search_s": 1.5}).encode("utf-8"),
+                method="POST",
+            )
+            areq.add_header("X-Depth-Token", dl.ENGINE.token)
+            ares = json.loads(urllib.request.urlopen(areq, timeout=15).read().decode("utf-8"))
+            assert ares["ok"] and abs(ares["offset"] - 10.30) <= 0.08, ares
+
+            lreq = urllib.request.Request(
+                "http://127.0.0.1:%d/wb/video/layout" % port,
+                data=json.dumps({"kb": {"x": 0.12, "y": 0.72, "scale": 1.1}}).encode("utf-8"),
+                method="POST",
+            )
+            lreq.add_header("X-Depth-Token", dl.ENGINE.token)
+            lres = json.loads(urllib.request.urlopen(lreq, timeout=5).read().decode("utf-8"))
+            assert lres["ok"] and abs(lres["stage"]["kb"]["x"] - 0.12) < 1e-4
+
+            wb_html = fetch(port, "/wb")[1].decode("utf-8")
+            assert "initHudDrag" in wb_html and "fineAlignVideo" in wb_html
+            assert "selValidForVideo" in wb_html and "loopSelection" in wb_html
+            js = re.findall(r"<script>(.*?)</script>", wb_html, re.S)[0]
+            jp = os.path.join(tmp, "wb.js")
+            with io.open(jp, "w", encoding="utf-8") as f:
+                f.write(js)
+            subprocess.check_call(["node", "--check", jp])
+        finally:
+            srv.shutdown()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(rdir, ignore_errors=True)
+
+
+def t_wb_phase2_video_composite_and_tracks_export():
+    """WYSIWYG composite MP4 and synced 3-track (clip + kb + mouse) export end-to-end."""
+    import re, shutil, subprocess, tempfile
+    dl.ENGINE = dl.Engine()
+    ff = dl.find_ffmpeg_bin("ffmpeg")
+    fp = dl.find_ffmpeg_bin("ffprobe")
+    assert ff and fp, "ffmpeg/ffprobe required"
+    tmp = tempfile.mkdtemp(prefix="wb-p2-")
+    stamp = "20261129-043000"
+    rdir = os.path.join(dl.recordings_dir(), stamp)
+    os.makedirs(rdir)
+    try:
+        vid_path = os.path.join(tmp, "game_2026.11.29 - 04.29.50.mp4")
+        subprocess.check_call([
+            ff, "-v", "error", "-f", "lavfi", "-i", "color=c=#182030:s=320x180:r=30:d=1.8",
+            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=1.8",
+            "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", "-y", vid_path,
+        ])
+        with io.open(os.path.join(rdir, "wide.csv"), "w", encoding="utf-8") as f:
+            f.write("# tool=depth-live\nt_s,wall,W,A,D,Shift,Space\n")
+            for i in range(401):
+                t = i * 0.01
+                w = 3.5 if 2.0 <= t <= 3.5 else 0.0
+                a = 2.8 if 2.2 <= t <= 2.9 else 0.0
+                f.write("%.3f,2026-11-29T04:29:50,%.2f,%.2f,0.00,0.00,0.00\n" % (t, w, a))
+        with io.open(os.path.join(rdir, "mouse.csv"), "w", encoding="utf-8") as f:
+            f.write("# tool=depth-live  mouse_span=14800\nt_s,dx,dy,btn,wheel\n")
+            for i in range(20):
+                f.write("%.6f,25,-10,%d,0\n" % (2.0 + i * 0.05, 1 if i % 4 == 0 else 0))
+
+        srv, port = start_server()
+        try:
+            def _post(path, payload):
+                req = urllib.request.Request(
+                    "http://127.0.0.1:%d%s" % (port, path),
+                    data=json.dumps(payload).encode("utf-8"), method="POST",
+                )
+                req.add_header("X-Depth-Token", dl.ENGINE.token)
+                return json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+
+            def _wait_export():
+                for _ in range(180):
+                    st = json.loads(fetch(port, "/wb/status")[1].decode("utf-8"))
+                    if not st["running"]:
+                        return st
+                    time.sleep(0.25)
+                raise AssertionError("export timed out")
+
+            vres = _post("/wb/video/load", {"path": vid_path, "stamp": stamp})
+            assert vres["ok"], vres
+
+            # 1. One-click composite MP4 export with custom stage boxes
+            cres = _post("/wb/export", {
+                "mode": "composite", "offset": 2.0, "stamp": stamp,
+                "start": 2.2, "end": 3.0, "fps": 30, "size": "640x360",
+                "layout": "hud", "theme": "ramp", "mouse": True, "mm": "press",
+                "kb_box": [0.04, 0.62, 0.34, 0.28], "mouse_box": [0.74, 0.62, 0.22, 0.28],
+                "kb_alpha": 0.72, "mouse_alpha": 0.55, "mopacity": 0.85,
+                "keys": ["W", "A", "D", "LShift", "Space"], "out": "p2comp",
+            })
+            assert cres["ok"], cres
+            st1 = _wait_export()
+            assert st1["pct"] == 100 and os.path.isfile(st1["out"]), st1
+            p1 = subprocess.check_output([fp, "-v", "error", "-show_entries", "stream=codec_type,width,height",
+                                          "-of", "json", st1["out"]]).decode("utf-8")
+            s1 = json.loads(p1)["streams"]
+            assert any(x.get("codec_type") == "video" and x.get("width") == 640 for x in s1), s1
+            assert any(x.get("codec_type") == "audio" for x in s1), s1
+
+            # 2. 3-track synchronized export (clip.mp4 + kb.webm + mouse.webm)
+            tres = _post("/wb/export", {
+                "mode": "tracks", "offset": 2.0, "stamp": stamp,
+                "start": 2.2, "end": 3.0, "fps": 30, "size": "640x360",
+                "layout": "hud", "theme": "ramp", "fmt": "webm", "mouse": True, "mm": "press",
+                "kb_box": [0.04, 0.62, 0.34, 0.28], "mouse_box": [0.74, 0.62, 0.22, 0.28],
+                "kb_alpha": 0.72, "mouse_alpha": 0.55, "mopacity": 0.85,
+                "keys": ["W", "A", "D", "LShift", "Space"], "out": "p2trk",
+            })
+            assert tres["ok"], tres
+            st2 = _wait_export()
+            assert st2["pct"] == 100 and os.path.isdir(st2["out"]), st2
+            for fn in ("clip.mp4", "kb.webm", "mouse.webm"):
+                fp_out = os.path.join(st2["out"], fn)
+                assert os.path.isfile(fp_out) and os.path.getsize(fp_out) > 1000, fp_out
+                if fn.endswith(".webm"):
+                    pr = json.loads(subprocess.check_output(
+                        [fp, "-v", "error", "-show_entries", "stream_tags=alpha_mode", "-of", "json", fp_out]
+                    ).decode("utf-8"))
+                    assert pr["streams"][0].get("tags", {}).get("alpha_mode") == "1", (fn, pr)
+
+            wb_html = fetch(port, "/wb")[1].decode("utf-8")
+            assert "getStageBoxes" in wb_html and "expMode" in wb_html
+            js = re.findall(r"<script>(.*?)</script>", wb_html, re.S)[0]
+            jp = os.path.join(tmp, "wb.js")
+            with io.open(jp, "w", encoding="utf-8") as f:
+                f.write(js)
+            subprocess.check_call(["node", "--check", jp])
+        finally:
+            srv.shutdown()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(rdir, ignore_errors=True)
+
+
 def main():
     print("depth monitor user-workflow gate tests")
     for name, fn in [
@@ -1501,9 +1771,12 @@ def main():
         ("autosave failure restores buffers", t_autosave_failure_restores_buffers),
         ("rapid click and wheel preserved", t_rapid_click_and_wheel_preserved),
         ("mouse memory cap, mouse-only & integrity", t_mouse_memory_cap_and_mouse_only_and_integrity),
-        # 4. 素材工作台 /wb（历史切换删除、FPS 急停/开火诊断）
+        # 4. 素材工作台 /wb（历史切换删除、FPS 急停/开火诊断、长文件 LOD 与离屏缓存）
         ("workbench history switch & delete flow", t_user_workbench_history_switch_and_delete),
         ("workbench FPS diagnosis analysis", t_wb_fps_analysis),
+        ("workbench long-file LOD + offscreen cache", t_wb_long_file_lod_and_fast_meta),
+        ("workbench video align + Range 206 stream", t_wb_video_align_and_range_stream),
+        ("workbench Phase 2 composite & 3-track export", t_wb_phase2_video_composite_and_tracks_export),
         # 5. 视频与网页导出（键鼠透明帧、WebM VP9 透明、多进程一致性、kb-viz）
         ("kb-frames mouse overlay + WebM VP9 + kb-viz", t_kb_frames_mouse_overlay_and_webm),
         ("render alpha + multiprocess match", t_render_alpha_and_multiprocess_match),

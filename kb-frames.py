@@ -148,35 +148,58 @@ _W = {}          # per-worker state
 
 # ------------------------------------------------------------------ data
 
-def load_csv(path, hold=True):
+def load_csv(path, hold=True, start=0.0, end=0.0):
+    header = None
+    lower = None
+    keycols = None
+    frames, t0 = [], None
+    long_rows = []
     with open(path, encoding="utf-8-sig") as f:
-        lines = [ln for ln in f if not ln.lstrip().startswith("#")]
-    if not lines:
-        return {}, 0.0
-    header = [h.strip() for h in lines[0].strip().split(",")]
-    lower = [h.lower() for h in header]
-
-    if "key" not in lower and "mm" not in lower and len(header) >= 3:
-        keycols = [(i, header[i]) for i in range(1, len(header))
-                   if lower[i] not in ("wall", "t_s", "t")]
-        frames, t0 = [], None
-        for ln in lines[1:]:
-            parts = ln.strip().split(",")
-            if len(parts) < len(header):
+        for ln in f:
+            if not ln.strip() or ln.lstrip().startswith("#"):
                 continue
-            try:
-                t = float(parts[0])
-            except ValueError:
+            if header is None:
+                header = [h.strip() for h in ln.strip().split(",")]
+                lower = [h.lower() for h in header]
+                if "key" not in lower and "mm" not in lower and len(header) >= 3:
+                    keycols = [(i, header[i]) for i in range(1, len(header))
+                               if lower[i] not in ("wall", "t_s", "t")]
                 continue
-            if t0 is None:
-                t0 = t
-            row = {}
-            for idx, name in keycols:
+            if keycols is not None:
+                c1 = ln.find(",")
+                if c1 <= 0:
+                    continue
                 try:
-                    row[name] = float(parts[idx])
-                except (ValueError, IndexError):
-                    row[name] = 0.0
-            frames.append((t - t0, row))
+                    t = float(ln[:c1])
+                except ValueError:
+                    continue
+                if t0 is None:
+                    t0 = t
+                rel = t - t0
+                if start > 0.0 and rel < start - 0.25:
+                    continue
+                if end > 0.0 and rel > end + 0.25:
+                    break
+                parts = ln.rstrip("\r\n").split(",")
+                if len(parts) < len(header):
+                    continue
+                row = {}
+                for idx, name in keycols:
+                    tok = parts[idx]
+                    if tok == "0.00":
+                        row[name] = 0.0
+                    else:
+                        try:
+                            row[name] = float(tok)
+                        except ValueError:
+                            row[name] = 0.0
+                frames.append((rel, row))
+            else:
+                long_rows.append(ln)
+    if header is None:
+        return {}, 0.0
+
+    if keycols is not None:
         if hold:
             prev = {}
             for _, row in frames:
@@ -195,7 +218,7 @@ def load_csv(path, hold=True):
             return {}, 0.0
         return series, max(v[-1][0] for v in series.values())
 
-    rd = csv.DictReader(lines)
+    rd = csv.DictReader([",".join(header)] + long_rows)
     cols = {c.lower(): c for c in (rd.fieldnames or [])}
     tcol = cols.get("t_s") or cols.get("t")
     rows = []
@@ -859,6 +882,10 @@ def main():
                     help="full switch travel in mm (default 3.50)")
     ap.add_argument("--ffmpeg", default="", help="path to ffmpeg executable")
     ap.add_argument("--alpha", type=float, default=0.86)
+    ap.add_argument("--kb-alpha", type=float, default=-1.0,
+                    help="override keyboard HUD opacity (defaults to --alpha)")
+    ap.add_argument("--mouse-alpha", type=float, default=-1.0,
+                    help="override mousepad HUD opacity (defaults to --alpha)")
     ap.add_argument("--mopacity", type=float, default=0.90,
                     help="independent mouse body opacity (default 0.90)")
     ap.add_argument("--mm", default="off", choices=("off", "press", "always"),
@@ -871,8 +898,10 @@ def main():
     ap.add_argument("--jobs", type=int, default=0, help="worker processes (0 = all cores)")
     ap.add_argument("--bg", default="", help="solid background colour, e.g. #101014")
     ap.add_argument("--mouse", default="", help="optional mouse.csv for synced mousepad overlay")
-    ap.add_argument("--mouse-layout", default="side", choices=("side", "stack", "only"),
-                    help="keyboard + mouse placement: side | stack | only")
+    ap.add_argument("--mouse-layout", default="side", choices=("side", "stack", "only", "stage"),
+                    help="keyboard + mouse placement: side | stack | only | stage")
+    ap.add_argument("--kb-box", default="", help="normalized stage rect x,y,w,h for keyboard")
+    ap.add_argument("--mouse-box", default="", help="normalized stage rect x,y,w,h for mouse")
     ap.add_argument("--format", default="prores", choices=("prores", "webm", "png"),
                     help="output format: prores (.mov) | webm (VP9 alpha) | png")
     ap.add_argument("--png-only", action="store_true")
@@ -887,10 +916,13 @@ def main():
     full_mm = max(1.0, min(5.0, float(args.full)))
 
     W, H = [int(v) for v in args.size.lower().split("x")]
-    series, dur = load_csv(args.csv)
+    series, dur = load_csv(args.csv, start=args.start, end=args.end)
     if not series and not args.mouse:
         print("no usable rows in %s" % args.csv)
         return 2
+    for src_m, dst_m in (("Shift", "LShift"), ("Alt", "LAlt"), ("Ctrl", "LCtrl")):
+        if src_m in series and dst_m not in series:
+            series[dst_m] = series[src_m]
     if args.alias:
         for pair in args.alias.split(","):
             if "=" in pair:
@@ -933,17 +965,59 @@ def main():
         print("no matching keys for layout %s" % args.layout)
         return 2
 
+    def _parse_box(spec):
+        if not spec:
+            return None
+        try:
+            vals = [float(v) for v in spec.split(",")]
+            if len(vals) == 4 and vals[2] > 0.01 and vals[3] > 0.01:
+                return (max(0.0, min(0.95, vals[0])), max(0.0, min(0.95, vals[1])),
+                        max(0.04, min(1.0, vals[2])), max(0.04, min(1.0, vals[3])))
+        except Exception:
+            pass
+        return None
+
+    kb_box = _parse_box(args.kb_box)
+    ms_box = _parse_box(args.mouse_box)
+    kb_alpha = args.alpha if args.kb_alpha < 0.0 else max(0.05, min(1.0, float(args.kb_alpha)))
+    ms_alpha = args.alpha if args.mouse_alpha < 0.0 else max(0.05, min(1.0, float(args.mouse_alpha)))
+
     mouse_art = None
     slots = []
     pad_ratio = 470.0 / 390.0
     if mlay == "only":
-        ph = min(H * 0.78, (W * 0.82) / pad_ratio)
-        pw = ph * pad_ratio
-        mouse_art = build_mouse_art((W - pw) / 2.0, (H - ph) / 2.0, pw, ph, args.alpha, theme, args.mopacity)
+        if ms_box is not None:
+            mw, mh = ms_box[2] * W, ms_box[3] * H
+            ph = min(mh, mw / pad_ratio)
+            pw = ph * pad_ratio
+            mouse_art = build_mouse_art(ms_box[0] * W, ms_box[1] * H, pw, ph, ms_alpha, theme, args.mopacity)
+        else:
+            ph = min(H * 0.78, (W * 0.82) / pad_ratio)
+            pw = ph * pad_ratio
+            mouse_art = build_mouse_art((W - pw) / 2.0, (H - ph) / 2.0, pw, ph, ms_alpha, theme, args.mopacity)
     else:
         maxx = max(x + w for _, x, y, w in slots_def)
         maxy = max(y + 1 for _, x, y, w in slots_def)
-        if mlay == "side":
+        if mlay == "stage":
+            if kb_box is not None:
+                bw, bh = kb_box[2] * W, kb_box[3] * H
+                unit = args.u or min(bw / maxx, bh / (maxy * 1.11 - 0.11))
+                ox, oy = kb_box[0] * W, kb_box[1] * H
+            else:
+                unit = args.u or min((W * 0.34) / maxx, (H * 0.28) / (maxy * 1.11 - 0.11))
+                ox, oy = W * 0.03, H * 0.66
+            gap = unit * 0.11
+            if mouse_samples:
+                bx, by, bwu, bhu = ms_box if ms_box is not None else (0.76, 0.64, 0.21, 0.27)
+                ph = min(bhu * H, (bwu * W) / pad_ratio)
+                pw = ph * pad_ratio
+                mouse_art = build_mouse_art(bx * W, by * H, pw, ph, ms_alpha, theme, args.mopacity)
+        elif kb_box is not None:
+            bw, bh = kb_box[2] * W, kb_box[3] * H
+            unit = args.u or min(bw / maxx, bh / (maxy * 1.11 - 0.11))
+            gap = unit * 0.11
+            ox, oy = kb_box[0] * W, kb_box[1] * H
+        elif mlay == "side":
             kb_box_w, kb_box_h = W * 0.56, H * 0.76
             unit = args.u or min(kb_box_w / maxx, kb_box_h / maxy)
             gap = unit * 0.11
@@ -958,7 +1032,7 @@ def main():
                 tot_w = kb_w + sep + pw
             ox = (W - tot_w) / 2.0
             oy = (H - kb_h) / 2.0
-            mouse_art = build_mouse_art(ox + kb_w + sep, (H - ph) / 2.0, pw, ph, args.alpha, theme, args.mopacity)
+            mouse_art = build_mouse_art(ox + kb_w + sep, (H - ph) / 2.0, pw, ph, ms_alpha, theme, args.mopacity)
         elif mlay == "stack":
             kb_box_w, kb_box_h = W * 0.80, H * 0.42
             unit = args.u or min(kb_box_w / maxx, kb_box_h / maxy)
@@ -970,7 +1044,7 @@ def main():
             tot_h = kb_h + sep + ph
             ox = (W - kb_w) / 2.0
             oy = (H - tot_h) / 2.0
-            mouse_art = build_mouse_art((W - pw) / 2.0, oy + kb_h + sep, pw, ph, args.alpha, theme, args.mopacity)
+            mouse_art = build_mouse_art((W - pw) / 2.0, oy + kb_h + sep, pw, ph, ms_alpha, theme, args.mopacity)
         else:
             unit = args.u or min(W * 0.82 / maxx, H * 0.78 / maxy)
             gap = unit * 0.11
@@ -978,7 +1052,7 @@ def main():
             oy = (H - (maxy * (unit + gap) - gap)) / 2.0
         width_px = max(1, int(unit * 0.014))
         slots = [build_slot(label, (ox + x * unit) / unit, (oy + y * (unit + gap)) / (unit + gap),
-                            w, unit, gap, theme, args.alpha, width_px)
+                            w, unit, gap, theme, kb_alpha, width_px)
                  for label, x, y, w in slots_def]
 
     out_dir = args.out or (os.path.splitext(os.path.basename(args.csv))[0] + "-frames")

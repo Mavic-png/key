@@ -42,12 +42,12 @@ FULL = 3.50
 
 
 def find_kb_frames():
-    """Locate kb-frames.py: next to the exe, then the cwd, then this file."""
+    """Locate kb-frames.py: next to the exe, then next to this file, then cwd."""
     here = []
     if getattr(sys, "frozen", False):
         here.append(os.path.dirname(os.path.abspath(sys.executable)))
-    here.append(os.getcwd())
     here.append(os.path.dirname(os.path.abspath(__file__)))
+    here.append(os.getcwd())
     for folder in here:
         path = os.path.join(folder, "kb-frames.py")
         if os.path.isfile(path):
@@ -60,8 +60,8 @@ def find_kb_viz():
     here = []
     if getattr(sys, "frozen", False):
         here.append(os.path.dirname(os.path.abspath(sys.executable)))
-    here.append(os.getcwd())
     here.append(os.path.dirname(os.path.abspath(__file__)))
+    here.append(os.getcwd())
     for folder in here:
         path = os.path.join(folder, "kb-viz.py")
         if os.path.isfile(path):
@@ -112,6 +112,29 @@ def find_python(kb_path=None):
     return None
 
 
+def find_ffmpeg_bin(name="ffmpeg"):
+    """Locate ffmpeg or ffprobe across PATH, standard Windows installs, or next to exe."""
+    exe = name if name.lower().endswith(".exe") else (name + ".exe")
+    cands = [shutil.which(name), shutil.which(exe)]
+    here = []
+    if getattr(sys, "frozen", False):
+        here.append(os.path.dirname(os.path.abspath(sys.executable)))
+    here.append(os.getcwd())
+    here.append(os.path.dirname(os.path.abspath(__file__)))
+    for d in here:
+        cands.append(os.path.join(d, exe))
+    home = os.path.expanduser("~")
+    cands += [
+        os.path.join(home, "ffmpeg", "bin", exe),
+        os.path.join("C:\\", "ffmpeg", "bin", exe),
+        os.path.join("F:\\", "tools", "ffmpeg", "bin", exe),
+    ]
+    for p in cands:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
 def data_home():
     """Where mapping/logs live.  Tests point this at a temp dir."""
     h = os.environ.get("DEPTH_MONITOR_HOME")
@@ -127,7 +150,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.17.3"
+VERSION = "1.19.0"
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
 FILE_SHARE_READ = 0x00000001
@@ -737,6 +760,102 @@ def key_name(vk):
         return "0x%02X" % vk
 
 
+WB_STAGE_DEFAULTS = {
+    "kb": {"x": 0.03, "y": 0.66, "scale": 0.85, "alpha": 0.72},
+    "mouse": {"x": 0.76, "y": 0.64, "scale": 0.90, "alpha": 0.55, "mopacity": 0.85},
+}
+
+
+def _sanitize_wb_stage(raw, base=None):
+    b = base if isinstance(base, dict) else WB_STAGE_DEFAULTS
+    out = {
+        "kb": dict(b.get("kb", WB_STAGE_DEFAULTS["kb"])),
+        "mouse": dict(b.get("mouse", WB_STAGE_DEFAULTS["mouse"])),
+    }
+    if not isinstance(raw, dict):
+        return out
+    for part, keys in (("kb", (("x", 0.0, 0.95), ("y", 0.0, 0.95), ("scale", 0.35, 2.5), ("alpha", 0.1, 1.0))),
+                       ("mouse", (("x", 0.0, 0.95), ("y", 0.0, 0.95), ("scale", 0.35, 2.5), ("alpha", 0.1, 0.95), ("mopacity", 0.15, 1.0)))):
+        src = raw.get(part)
+        if not isinstance(src, dict):
+            continue
+        for k, lo, hi in keys:
+            if k in src:
+                try:
+                    v = float(src[k])
+                    if lo <= v <= hi:
+                        out[part][k] = round(v, 4 if k in ("x", "y") else 2)
+                except (TypeError, ValueError):
+                    pass
+    return out
+
+
+def parse_filename_wall_epoch(name):
+    """Extract local wall-clock epoch from ShadowPlay/OBS/compact video filenames."""
+    import re
+    base = os.path.basename(name or "")
+    pats = (
+        r"(20\d{2})[.\-_](\d{2})[.\-_](\d{2})\s*[-_ ]\s*(\d{2})[.\-_:](\d{2})[.\-_:](\d{2})",
+        r"(20\d{2})(\d{2})(\d{2})[-_](\d{2})(\d{2})(\d{2})",
+    )
+    for pat in pats:
+        m = re.search(pat, base)
+        if m:
+            try:
+                vals = [int(x) for x in m.groups()]
+                return time.mktime((vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], 0, 0, -1))
+            except Exception:
+                pass
+    return None
+
+
+def _parse_iso_utc_epoch(text):
+    import calendar, re
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})", (text or "").strip())
+    if not m:
+        return None
+    try:
+        vals = [int(x) for x in m.groups()]
+        return float(calendar.timegm((vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], 0, 0, 0)))
+    except Exception:
+        return None
+
+
+def pick_video_file_win32(initial_dir=None):
+    """Open native Windows file picker for local recordings without changing CWD."""
+    try:
+        comdlg = ctypes.WinDLL("comdlg32")
+    except Exception:
+        return None
+    class _OPENFILENAMEW(ctypes.Structure):
+        _fields_ = [
+            ("lStructSize", wt.DWORD), ("hwndOwner", wt.HWND), ("hInstance", wt.HINSTANCE),
+            ("lpstrFilter", wt.LPCWSTR), ("lpstrCustomFilter", wt.LPWSTR),
+            ("nMaxCustFilter", wt.DWORD), ("nFilterIndex", wt.DWORD),
+            ("lpstrFile", wt.LPWSTR), ("nMaxFile", wt.DWORD),
+            ("lpstrFileTitle", wt.LPWSTR), ("nMaxFileTitle", wt.DWORD),
+            ("lpstrInitialDir", wt.LPCWSTR), ("lpstrTitle", wt.LPCWSTR),
+            ("Flags", wt.DWORD), ("nFileOffset", wt.WORD), ("nFileExtension", wt.WORD),
+            ("lpstrDefExt", wt.LPCWSTR), ("lCustData", wt.LPARAM),
+            ("lpfnHook", ctypes.c_void_p), ("lpTemplateName", wt.LPCWSTR),
+            ("pvReserved", ctypes.c_void_p), ("dwReserved", wt.DWORD), ("FlagsEx", wt.DWORD),
+        ]
+    buf = ctypes.create_unicode_buffer(1024)
+    ofn = _OPENFILENAMEW()
+    ofn.lStructSize = ctypes.sizeof(_OPENFILENAMEW)
+    ofn.lpstrFilter = "视频文件 (*.mp4;*.mkv;*.mov;*.webm;*.avi)\0*.mp4;*.mkv;*.mov;*.webm;*.avi;*.m4v\0所有文件 (*.*)\0*.*\0\0"
+    ofn.nFilterIndex = 1
+    ofn.lpstrFile = ctypes.cast(buf, wt.LPWSTR)
+    ofn.nMaxFile = 1024
+    if initial_dir and os.path.isdir(initial_dir):
+        ofn.lpstrInitialDir = initial_dir
+    ofn.lpstrTitle = "选择游戏录像文件"
+    ofn.Flags = 0x00001000 | 0x00000800 | 0x00000008  # FILEMUSTEXIST | PATHMUSTEXIST | NOCHANGEDIR
+    if comdlg.GetOpenFileNameW(ctypes.byref(ofn)):
+        return buf.value
+    return None
+
+
 class Engine(object):
     def __init__(self):
         self.lock = threading.RLock()   # re-entrant: run_keys holds it while _depth_near locks again
@@ -777,6 +896,7 @@ class Engine(object):
         self._key_events = []
         self.export = {"running": False, "pct": 0, "msg": "", "out": "",
                        "proc": None, "t0": 0.0, "eta": 0, "error": ""}
+        self._export_cancel = threading.Event()
         self.gaps = collections.deque(maxlen=8000)   # inter-arrival seconds
         self._last_depth_t = None
         self._gap_anomalies = 0
@@ -812,6 +932,11 @@ class Engine(object):
         self.hid_wake_msg = ""
         self._hid_wake_sent = False
         self._last_wake_t = 0.0
+        self._wb_meta_cache = {}
+        self._wb_mouse_cache = {}
+        self._wb_analysis_cache = {}
+        self.wb_video = None
+        self.wb_stage = _sanitize_wb_stage(WB_STAGE_DEFAULTS)
         self._load_settings()
         self._load_mapping()
 
@@ -842,10 +967,13 @@ class Engine(object):
             else:
                 self.kb_hud["theme"] = self.theme
                 self.kb_hud["full"] = self.full_mm
+            ws = raw.get("wb_stage")
+            if isinstance(ws, dict):
+                self.wb_stage = _sanitize_wb_stage(ws, WB_STAGE_DEFAULTS)
         except Exception:
             pass
 
-    def update_settings(self, full_mm=None, theme=None, mouse_span=None, mouse_hud=None, kb_hud=None, save=True):
+    def update_settings(self, full_mm=None, theme=None, mouse_span=None, mouse_hud=None, kb_hud=None, wb_stage=None, save=True):
         with self.lock:
             if full_mm is not None:
                 try:
@@ -871,12 +999,15 @@ class Engine(object):
             if isinstance(kb_hud, dict):
                 self.kb_hud = _sanitize_kb_hud(kb_hud, self.kb_hud)
                 self.kb_hud_rev += 1
+            if isinstance(wb_stage, dict):
+                self.wb_stage = _sanitize_wb_stage(wb_stage, self.wb_stage)
             snap = {
                 "full_mm": self.full_mm,
                 "theme": self.theme,
                 "mouse_span": self.mouse_span,
                 "mouse_hud": dict(self.mouse_hud),
                 "kb_hud": dict(self.kb_hud),
+                "wb_stage": dict(self.wb_stage),
             }
             out = dict(snap)
             out["mouse_hud_rev"] = self.mouse_hud_rev
@@ -1591,6 +1722,17 @@ class Engine(object):
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "integrity": integrity,
             }
+            now_wall = time.time()
+            now_perf = time.perf_counter()
+            end_candidates = [min_dur]
+            if r_rows:
+                end_candidates.append(max(0.0, r_rows[-1][0] - t0))
+            rec_dur = max(end_candidates)
+            t0_ep = now_wall - max(0.0, now_perf - t0)
+            meta_obj = {"stamp": stamp, "t0_epoch": round(t0_ep, 3),
+                        "t1_epoch": round(t0_ep + rec_dur, 3), "duration": round(rec_dur, 3)}
+            self._write_atomic(os.path.join(version_dir, "meta.json"),
+                               json.dumps(meta_obj, ensure_ascii=False, indent=1))
             tmp = os.path.join(base, ".latest.tmp")
             with io.open(tmp, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, ensure_ascii=False, indent=1)
@@ -1740,20 +1882,69 @@ class Engine(object):
         except Exception:
             return None, base
 
+    def _wb_file_sig(self, path):
+        try:
+            st = os.stat(path)
+            return (getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)), st.st_size)
+        except Exception:
+            return None
+
     def _read_wide_meta(self, wide_path):
+        sig = self._wb_file_sig(wide_path)
+        if sig is not None:
+            cached = self._wb_meta_cache.get(wide_path)
+            if cached and cached[0] == sig:
+                return cached[1]
         keys, dur, samples = [], 0.0, 0
-        with io.open(wide_path, encoding="utf-8") as f:
-            header = None
-            for line in f:
-                if line.startswith("#"):
+        with io.open(wide_path, "rb") as f:
+            header_line = None
+            while True:
+                raw = f.readline()
+                if not raw:
+                    break
+                if raw.startswith(b"#"):
                     continue
-                if header is None:
-                    header = [h.strip() for h in line.strip().split(",")]
-                    keys = header[2:]
-                    continue
-                samples += 1
-                dur = float(line.split(",")[0])
-        return keys, dur, samples
+                header_line = raw.decode("utf-8", "replace").strip()
+                break
+            if header_line is None:
+                return [], 0.0, 0
+            header = [h.strip() for h in header_line.split(",")]
+            keys = header[2:]
+            data_off = f.tell()
+            fsize = sig[1] if sig else os.path.getsize(wide_path)
+            if fsize <= 512 * 1024:
+                for raw in f:
+                    s = raw.strip()
+                    if not s or s.startswith(b"#"):
+                        continue
+                    c1 = s.find(b",")
+                    if c1 > 0:
+                        samples += 1
+                        dur = float(s[:c1])
+            else:
+                first_raw = f.readline()
+                t_first = 0.0
+                if first_raw:
+                    c1 = first_raw.find(b",")
+                    if c1 > 0:
+                        t_first = float(first_raw[:c1])
+                f.seek(max(data_off, fsize - 8192))
+                tail = f.read().splitlines()
+                for raw in reversed(tail):
+                    s = raw.strip()
+                    if not s or s.startswith(b"#"):
+                        continue
+                    c1 = s.find(b",")
+                    if c1 > 0:
+                        dur = float(s[:c1])
+                        break
+                samples = max(1, int(round(max(0.0, dur - t_first) * 100.0)) + 1)
+        res = (keys, dur, samples)
+        if sig is not None:
+            if len(self._wb_meta_cache) > 128:
+                self._wb_meta_cache.clear()
+            self._wb_meta_cache[wide_path] = (sig, res)
+        return res
 
     def _resolve_wide(self, stamp=None):
         base = recordings_dir()
@@ -1813,6 +2004,11 @@ class Engine(object):
             shutil.rmtree(target)
         except Exception as exc:
             return False, "删除失败：%s" % exc
+        for cache in (self._wb_meta_cache, self._wb_mouse_cache, self._wb_analysis_cache):
+            for k in list(cache):
+                kp = k[0] if isinstance(k, tuple) else k
+                if isinstance(kp, str) and kp.startswith(target + os.sep):
+                    cache.pop(k, None)
         manifest, _ = self.wb_manifest()
         if manifest and manifest.get("stamp") == safe:
             remaining = self.wb_list().get("items") or []
@@ -1852,12 +2048,17 @@ class Engine(object):
                 "wide": manifest.get("wide"), "long": manifest.get("long"),
                 "integrity": manifest.get("integrity")}
 
-    def _load_wb_mouse(self, wide_path, times):
-        """Integrate mouse.csv onto `times` with smart lift-off recenter for scrub-safe replay."""
+    def _load_mouse_events(self, wide_path):
+        """Parse and cache (span, evts) from sibling mouse.csv keyed by file mtime+size."""
         mouse_p = os.path.join(os.path.dirname(wide_path), "mouse.csv")
-        if not os.path.isfile(mouse_p) or not times:
-            return None
-        import math, re
+        if not os.path.isfile(mouse_p):
+            return None, None
+        sig = self._wb_file_sig(mouse_p)
+        if sig is not None:
+            cached = self._wb_mouse_cache.get(mouse_p)
+            if cached and cached[0] == sig:
+                return cached[1]
+        import re
         span = self.mouse_span
         evts = []
         try:
@@ -1880,9 +2081,23 @@ class Engine(object):
                     evts.append((float(parts[0]), int(parts[1]), int(parts[2]),
                                  int(parts[3]), int(parts[4])))
         except Exception:
+            return None, None
+        if not evts:
+            return None, None
+        if sig is not None:
+            if len(self._wb_mouse_cache) >= 2:
+                self._wb_mouse_cache.clear()
+            self._wb_mouse_cache[mouse_p] = (sig, (span, evts))
+        return span, evts
+
+    def _load_wb_mouse(self, wide_path, times, start=None, end=None):
+        """Integrate mouse.csv onto `times` with smart lift-off recenter for scrub-safe replay."""
+        if not times:
             return None
+        span, evts = self._load_mouse_events(wide_path)
         if not evts:
             return None
+        import bisect, math
         xs, ys, bs, ws, spds = [], [], [], [], []
         clicks = []
         wheels = []
@@ -1890,8 +2105,11 @@ class Engine(object):
         btn = prev_btn = 0
         down_at = {}
         last_move = -9.0
-        prev_t = times[0]
-        idx = 0
+        t0_out = times[0]
+        t1_out = times[-1]
+        warmup_t = max(0.0, t0_out - 3.0) if t0_out > 0.0 else 0.0
+        idx = bisect.bisect_left([e[0] for e in evts], warmup_t) if warmup_t > 0.0 else 0
+        prev_t = evts[idx][0] if idx < len(evts) else t0_out
         n_ev = len(evts)
         step_x = 2.0 / max(500.0, float(span))
         aspect = (306.0 - 44.0) / (254.0 - 84.0)
@@ -1915,13 +2133,15 @@ class Engine(object):
                     for bit in btn_bits:
                         if falling & bit:
                             t_dn = down_at.pop(bit, et)
-                            clicks.append([round(t_dn, 4), bit, round(max(0.0, (et - t_dn) * 1000.0), 1)])
+                            if et >= t0_out - 1e-6 and t_dn <= t1_out + 1e-6:
+                                clicks.append([round(t_dn, 4), bit, round(max(0.0, (et - t_dn) * 1000.0), 1)])
                 b_hit |= bmask
                 prev_btn = bmask
                 btn = bmask
                 if wh:
                     w_acc += wh
-                    wheels.append([round(et, 4), int(wh)])
+                    if et >= t0_out - 1e-6 and et <= t1_out + 1e-6:
+                        wheels.append([round(et, 4), int(wh)])
                 if dx or dy:
                     last_move = et
                 idx += 1
@@ -1941,7 +2161,8 @@ class Engine(object):
             spds.append(round(spd, 2))
         end_t = times[-1]
         for bit, t_dn in down_at.items():
-            clicks.append([round(t_dn, 4), bit, round(max(0.0, (end_t - t_dn) * 1000.0), 1)])
+            if t_dn <= end_t + 1e-6:
+                clicks.append([round(t_dn, 4), bit, round(max(0.0, (end_t - t_dn) * 1000.0), 1)])
         clicks.sort(key=lambda c: c[0])
         return {"span": span, "x": xs, "y": ys, "b": bs, "w": ws,
                 "spd": spds, "clicks": clicks, "wheels": wheels}
@@ -2057,31 +2278,10 @@ class Engine(object):
         return out
 
     def _wb_analyze_mouse(self, wide_path, ts, keys, cols):
-        import bisect, math, re
-        mouse_p = os.path.join(os.path.dirname(wide_path), "mouse.csv")
-        if not os.path.isfile(mouse_p) or not ts:
+        import bisect, math
+        if not ts:
             return None, None
-        span = self.mouse_span
-        evts = []
-        try:
-            with io.open(mouse_p, encoding="utf-8") as f:
-                hdr = False
-                for line in f:
-                    if line.startswith("#"):
-                        m = re.search(r"mouse_span\s*=\s*(\d+)", line)
-                        if m:
-                            v = int(m.group(1))
-                            if 500 <= v <= 200000:
-                                span = v
-                        continue
-                    if not hdr:
-                        hdr = True
-                        continue
-                    p = line.strip().split(",")
-                    if len(p) >= 5:
-                        evts.append((float(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4])))
-        except Exception:
-            return None, None
+        span, evts = self._load_mouse_events(wide_path)
         if not evts:
             return None, None
 
@@ -2153,6 +2353,12 @@ class Engine(object):
         manifest, _, _, wide = self._resolve_wide(stamp)
         if not manifest or not wide:
             return {"ok": False, "error": "no recording"}
+        mouse_p = os.path.join(os.path.dirname(wide), "mouse.csv")
+        w_sig = self._wb_file_sig(wide)
+        m_sig = self._wb_file_sig(mouse_p) if os.path.isfile(mouse_p) else None
+        ck = (wide, w_sig, m_sig, tuple(pair))
+        if w_sig is not None and ck in self._wb_analysis_cache:
+            return self._wb_analysis_cache[ck]
         ts = []
         keys = []
         cols = []
@@ -2169,8 +2375,10 @@ class Engine(object):
                         cols = [[] for _ in keys]
                         continue
                     ts.append(float(parts[0]))
+                    n_p = len(parts)
                     for ci in range(len(keys)):
-                        cols[ci].append(float(parts[2 + ci]) if 2 + ci < len(parts) else 0.0)
+                        tok = parts[2 + ci] if 2 + ci < n_p else "0.00"
+                        cols[ci].append(0.0 if tok == "0.00" else float(tok))
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         if not ts:
@@ -2186,7 +2394,7 @@ class Engine(object):
                        "avg_gap_ms": 0.0, "events": [], "worst": []}
         key_stats = self._wb_analyze_keys(ts, keys, cols)
         shots, heat = self._wb_analyze_mouse(wide, ts, keys, cols)
-        return {
+        res = {
             "ok": True,
             "stamp": manifest.get("stamp"),
             "duration": round(ts[-1], 3),
@@ -2197,40 +2405,396 @@ class Engine(object):
             "key_stats": key_stats,
             "mouse_heat": heat,
         }
+        if w_sig is not None:
+            if len(self._wb_analysis_cache) >= 4:
+                self._wb_analysis_cache.clear()
+            self._wb_analysis_cache[ck] = res
+        return res
 
-    def wb_series(self, step=0.02, limit=1600, stamp=None):
+    def _seek_wide_before(self, f, data_off, fsize, target_t):
+        """Binary-search wide.csv to the start of a line shortly before `target_t`."""
+        lo = data_off
+        hi = fsize
+        while hi - lo > 4096:
+            mid = (lo + hi) // 2
+            f.seek(mid)
+            f.readline()                  # advance to next complete line boundary
+            pos = f.tell()
+            if pos >= hi:
+                break
+            line = f.readline()
+            if not line:
+                break
+            c1 = line.find(b",")
+            if c1 <= 0:
+                lo = pos
+                continue
+            try:
+                t = float(line[:c1])
+            except Exception:
+                lo = pos
+                continue
+            if t < target_t:
+                lo = pos
+            else:
+                hi = mid
+        f.seek(lo)
+
+    def wb_series(self, step=0.02, limit=1600, stamp=None, start=None, end=None):
         manifest, _, _, wide = self._resolve_wide(stamp)
         if not manifest or not wide:
             return {"ok": False, "error": "no recording"}
-        rows = []
-        keys = []
         try:
-            with io.open(wide, encoding="utf-8") as f:
-                header_seen = False
-                for line in f:
-                    if line.startswith("#"):
-                        continue
-                    parts = line.strip().split(",")
-                    if not header_seen:
-                        header_seen = True
-                        keys = [p for p in parts[2:] if p]
-                        continue
-                    # column 1 is a wall-clock stamp, not a number
-                    rows.append([float(parts[0])] + [float(x) for x in parts[2:2 + len(keys)]])
+            keys, full_dur, _ = self._read_wide_meta(wide)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-        if not rows:
+        limit = max(200, min(4000, int(limit or 1600)))
+        is_lod = (start is not None or end is not None)
+        w_start = max(0.0, float(start or 0.0)) if is_lod else 0.0
+        w_end = float(end) if (is_lod and end is not None) else full_dur
+        if w_end <= w_start:
+            w_start, w_end, is_lod = 0.0, full_dur, False
+        win_dur = max(0.01, w_end - w_start)
+        bucket_s = win_dur / float(limit)
+        downsample = bucket_s > 0.012
+        ts = []
+        v_cols = []
+        b_idx = None
+        b_t = 0.0
+        b_max = []
+        n_keys = 0
+        try:
+            with io.open(wide, "rb") as f:
+                header_line = None
+                while True:
+                    raw = f.readline()
+                    if not raw:
+                        break
+                    if raw.startswith(b"#"):
+                        continue
+                    header_line = raw.decode("utf-8", "replace").strip()
+                    break
+                if header_line is None:
+                    return {"ok": False, "error": "empty recording"}
+                keys = [p for p in header_line.split(",")[2:] if p]
+                n_keys = len(keys)
+                v_cols = [[] for _ in range(n_keys)]
+                b_max = [0.0] * n_keys
+                data_off = f.tell()
+                if is_lod and w_start > 0.5:
+                    fsize = os.path.getsize(wide)
+                    if fsize > 128 * 1024:
+                        self._seek_wide_before(f, data_off, fsize, max(0.0, w_start - 0.05))
+                for raw in f:
+                    if not raw or raw.startswith(b"#"):
+                        continue
+                    c1 = raw.find(b",")
+                    if c1 <= 0:
+                        continue
+                    t = float(raw[:c1])
+                    if t < w_start - 1e-6:
+                        continue
+                    if is_lod and t > w_end + 1e-6:
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    parts = line.rstrip("\r\n").split(",")
+                    if not downsample:
+                        ts.append(round(t, 3))
+                        for ci in range(n_keys):
+                            tok = parts[2 + ci] if 2 + ci < len(parts) else "0.00"
+                            v_cols[ci].append(0.0 if tok == "0.00" else round(float(tok), 2))
+                    else:
+                        bi = int((t - w_start) / bucket_s)
+                        if b_idx is None:
+                            b_idx = bi
+                            b_t = t
+                            for ci in range(n_keys):
+                                tok = parts[2 + ci] if 2 + ci < len(parts) else "0.00"
+                                b_max[ci] = 0.0 if tok == "0.00" else float(tok)
+                        elif bi != b_idx:
+                            ts.append(round(b_t, 3))
+                            for ci in range(n_keys):
+                                v_cols[ci].append(round(b_max[ci], 2))
+                                tok = parts[2 + ci] if 2 + ci < len(parts) else "0.00"
+                                b_max[ci] = 0.0 if tok == "0.00" else float(tok)
+                            b_idx = bi
+                            b_t = t
+                        else:
+                            b_t = t
+                            for ci in range(n_keys):
+                                tok = parts[2 + ci] if 2 + ci < len(parts) else "0.00"
+                                if tok != "0.00":
+                                    val = float(tok)
+                                    if val > b_max[ci]:
+                                        b_max[ci] = val
+                if downsample and b_idx is not None:
+                    ts.append(round(b_t, 3))
+                    for ci in range(n_keys):
+                        v_cols[ci].append(round(b_max[ci], 2))
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if not ts:
             return {"ok": False, "error": "empty recording"}
-        stride = max(1, int(len(rows) / limit))
-        rows = rows[::stride]
-        ts = [round(r[0], 3) for r in rows]
-        mouse = self._load_wb_mouse(wide, ts)
-        return {"ok": True, "stamp": manifest.get("stamp"), "keys": keys, "duration": rows[-1][0],
-                "step": round(rows[1][0] - rows[0][0], 4) if len(rows) > 1 else step,
-                "t": ts,
-                "v": {keys[i]: [round(r[1 + i], 2) for r in rows]
-                      for i in range(len(keys))},
-                "mouse": mouse}
+        dur_out = full_dur if full_dur > 0.0 else ts[-1]
+        mouse = self._load_wb_mouse(wide, ts, start=w_start, end=w_end)
+        return {
+            "ok": True, "stamp": manifest.get("stamp"), "keys": keys,
+            "duration": round(dur_out, 3),
+            "view_start": round(ts[0], 3), "view_end": round(ts[-1], 3), "lod": is_lod,
+            "step": round((ts[-1] - ts[0]) / max(1, len(ts) - 1), 4) if len(ts) > 1 else step,
+            "t": ts, "v": {keys[i]: v_cols[i] for i in range(n_keys)},
+            "mouse": mouse,
+        }
+
+    def _recording_wall_span(self, wide_path, stamp, dur):
+        """Return (t0_epoch, t1_epoch, src) for a recording folder."""
+        rdir = os.path.dirname(wide_path)
+        meta_p = os.path.join(rdir, "meta.json")
+        if os.path.isfile(meta_p):
+            try:
+                with io.open(meta_p, encoding="utf-8") as f:
+                    m = json.load(f)
+                t0 = float(m["t0_epoch"])
+                t1 = float(m.get("t1_epoch") or (t0 + dur))
+                return t0, t1, "meta"
+            except Exception:
+                pass
+        fn_t1 = parse_filename_wall_epoch(stamp)
+        if fn_t1 is not None:
+            return fn_t1 - float(dur), fn_t1, "stamp"
+        try:
+            mt = os.path.getmtime(wide_path)
+            return mt - float(dur), mt, "mtime"
+        except Exception:
+            return None, None, "none"
+
+    def _probe_video(self, path):
+        ffp = find_ffmpeg_bin("ffprobe")
+        if not ffp:
+            return None, "未找到 ffprobe.exe（请安装 ffmpeg 或放在同目录）"
+        cmd = [ffp, "-v", "error", "-show_entries",
+               "format=duration,size:format_tags=creation_time:stream=codec_type,width,height,r_frame_rate",
+               "-of", "json", path]
+        try:
+            si = None
+            if os.name == "nt":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            raw = subprocess.check_output(cmd, stderr=subprocess.STDOUT, startupinfo=si, timeout=15)
+            info = json.loads(raw.decode("utf-8", "replace"))
+        except Exception as exc:
+            return None, "读取视频信息失败：%s" % exc
+        fmt = info.get("format") or {}
+        dur = float(fmt.get("duration") or 0.0)
+        if dur <= 0.0:
+            return None, "视频时长无效"
+        tags = fmt.get("tags") or {}
+        w = h = 0
+        fps = 60.0
+        has_audio = False
+        for st in (info.get("streams") or []):
+            ct = st.get("codec_type")
+            if ct == "video" and not w:
+                w = int(st.get("width") or 0)
+                h = int(st.get("height") or 0)
+                fr = st.get("r_frame_rate") or "60/1"
+                if "/" in fr:
+                    a, b = fr.split("/", 1)
+                    if float(b) > 0:
+                        fps = round(float(a) / float(b), 3)
+            elif ct == "audio":
+                has_audio = True
+        ct_ep = _parse_iso_utc_epoch(tags.get("creation_time") or "")
+        fn_ep = parse_filename_wall_epoch(os.path.basename(path))
+        mt_ep = os.path.getmtime(path)
+        if ct_ep is not None:
+            if fn_ep is not None and abs(ct_ep - fn_ep) < 120.0:
+                start_ep, src = ct_ep, "creation_time_start"
+            elif fn_ep is not None and abs((ct_ep - dur) - fn_ep) < 120.0:
+                start_ep, src = ct_ep - dur, "creation_time_end"
+            elif abs(ct_ep - mt_ep) < 120.0:
+                start_ep, src = ct_ep - dur, "creation_time_mtime"
+            else:
+                start_ep, src = ct_ep - dur, "creation_time"
+        elif fn_ep is not None:
+            if abs(mt_ep - fn_ep) < 120.0 and dur > 120.0:
+                start_ep, src = fn_ep - dur, "filename_end"
+            else:
+                start_ep, src = fn_ep, "filename_start"
+        else:
+            start_ep, src = mt_ep - dur, "mtime"
+        return {
+            "path": os.path.abspath(path),
+            "name": os.path.basename(path),
+            "size": os.path.getsize(path),
+            "duration": round(dur, 3),
+            "width": w, "height": h, "fps": fps,
+            "has_audio": has_audio,
+            "start_epoch": round(start_ep, 3),
+            "end_epoch": round(start_ep + dur, 3),
+            "time_src": src,
+        }, None
+
+    def wb_video_load(self, path, preferred_stamp=None):
+        p = (path or "").strip().strip('"').strip("'")
+        if not p or not os.path.isfile(p):
+            return {"ok": False, "error": "视频文件不存在"}
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"):
+            return {"ok": False, "error": "不支持的视频格式：%s" % (ext or "未知")}
+        meta, err = self._probe_video(p)
+        if not meta:
+            return {"ok": False, "error": err or "无法解析视频"}
+        with self.lock:
+            self.wb_video = meta
+        v0, v1 = meta["start_epoch"], meta["end_epoch"]
+        best = None
+        pref = None
+        base = recordings_dir()
+        for it in (self.wb_list().get("items") or []):
+            st = it["stamp"]
+            wide = os.path.join(base, st, "wide.csv")
+            r0, r1, rsrc = self._recording_wall_span(wide, st, it.get("duration") or 0.0)
+            if r0 is None:
+                continue
+            ov = min(v1, r1) - max(v0, r0)
+            cand = {"stamp": st, "overlap": round(ov, 2), "offset": round(v0 - r0, 3), "rec_src": rsrc}
+            if best is None or ov > best["overlap"]:
+                best = cand
+            if preferred_stamp and st == preferred_stamp:
+                pref = cand
+        chosen = pref if (pref and pref["overlap"] > 0.0) else (best if (best and best["overlap"] > 0.0) else pref or best)
+        pub = {k: meta[k] for k in ("name", "size", "duration", "width", "height", "fps", "has_audio", "time_src")}
+        pub["start_str"] = time.strftime("%H:%M:%S", time.localtime(v0))
+        pub["end_str"] = time.strftime("%H:%M:%S", time.localtime(v1))
+        return {
+            "ok": True,
+            "video": pub,
+            "matched_stamp": chosen["stamp"] if chosen else None,
+            "overlap_s": chosen["overlap"] if chosen else 0.0,
+            "offset": chosen["offset"] if chosen else 0.0,
+            "stage": _sanitize_wb_stage(self.wb_stage),
+        }
+
+    def wb_video_fine_align(self, stamp=None, video_t=None, coarse_offset=0.0, search_s=3.0):
+        with self.lock:
+            vid = dict(self.wb_video) if self.wb_video else None
+        if not vid or not os.path.isfile(vid.get("path") or ""):
+            return {"ok": False, "error": "请先导入录像"}
+        if not vid.get("has_audio"):
+            return {"ok": False, "error": "该录像没有音轨，请使用手动微调"}
+        ff = find_ffmpeg_bin("ffmpeg")
+        if not ff:
+            return {"ok": False, "error": "未找到 ffmpeg.exe"}
+        manifest, _, _, wide = self._resolve_wide(stamp)
+        if not manifest or not wide:
+            return {"ok": False, "error": "没有可用录制"}
+        _, evts = self._load_mouse_events(wide)
+        if not evts:
+            return {"ok": False, "error": "该录制无鼠标左键点击数据"}
+        clicks = []
+        pb = 0
+        for et, _, _, bm, _ in evts:
+            if ((~pb) & bm) & 1:
+                if not clicks or et - clicks[-1] >= 0.04:
+                    clicks.append(et)
+            pb = bm
+        if len(clicks) < 2:
+            return {"ok": False, "error": "录制中左键开火样本不足"}
+        import bisect, math, struct
+        vdur = float(vid["duration"])
+        off0 = float(coarse_offset or 0.0)
+        sr_s = max(0.5, min(6.0, float(search_s or 3.0)))
+        win_len = 24.0
+        va = None
+        if video_t is not None:
+            vt = max(0.0, min(vdur, float(video_t)))
+            a0 = max(0.0, vt - win_len * 0.5)
+            b0 = min(vdur, a0 + win_len)
+            ra, rb = a0 + off0, b0 + off0
+            if bisect.bisect_right(clicks, rb) - bisect.bisect_left(clicks, ra) >= 2:
+                va = a0
+        if va is None:
+            r_lo = max(0.0, off0)
+            r_hi = min(clicks[-1], vdur + off0)
+            best_c = (0, 0.0)
+            j = 0
+            for i, ct in enumerate(clicks):
+                if ct < r_lo or ct > r_hi:
+                    continue
+                while j < len(clicks) and clicks[j] - ct <= win_len:
+                    j += 1
+                cnt = j - i
+                if cnt > best_c[0]:
+                    best_c = (cnt, max(0.0, ct - off0 - 4.0))
+            if best_c[0] < 2:
+                return {"ok": False, "offset": round(off0, 3), "confidence": 0.0,
+                        "message": "重叠区间内缺少足够左键开火样本，已保留粗对齐"}
+            va = best_c[1]
+        vb = min(vdur, va + win_len)
+        seg_d = max(4.0, vb - va)
+        cmd = [ff, "-v", "error", "-ss", "%.3f" % va, "-t", "%.3f" % seg_d,
+               "-i", vid["path"], "-map", "0:a:0", "-ac", "1", "-ar", "8000", "-f", "s16le", "-"]
+        try:
+            si = None
+            if os.name == "nt":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            pcm = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, startupinfo=si, timeout=20)
+        except Exception as exc:
+            return {"ok": False, "error": "提取音频失败：%s" % exc}
+        n_samp = len(pcm) // 2
+        if n_samp < 8000:
+            return {"ok": False, "error": "音频片段过短"}
+        bin_s = 0.02
+        spb = int(8000 * bin_s)
+        n_bins = n_samp // spb
+        rms = [0.0] * n_bins
+        for bi in range(n_bins):
+            chunk = struct.unpack_from("<%dh" % spb, pcm, bi * spb * 2)
+            rms[bi] = math.sqrt(sum(x * x for x in chunk) / float(spb))
+        onset = [0.0] * n_bins
+        for bi in range(1, n_bins):
+            d = rms[bi] - rms[bi - 1]
+            if d > 0.0:
+                onset[bi] = d
+        c_lo = va + off0 - sr_s
+        c_hi = vb + off0 + sr_s
+        rel_clicks = [c - (va + off0) for c in clicks if c_lo <= c <= c_hi]
+        if len(rel_clicks) < 2:
+            return {"ok": False, "offset": round(off0, 3), "confidence": 0.0,
+                    "message": "当前位置附近无左键点击，请拖到交火处或点自动窗口"}
+        k_max = int(round(sr_s / bin_s))
+        scores = []
+        for k in range(-k_max, k_max + 1):
+            sh = k * bin_s
+            sc = 0.0
+            for rc in rel_clicks:
+                bi = int(round((rc - sh) / bin_s))
+                if 0 <= bi < n_bins:
+                    sc += onset[bi]
+                    if bi + 1 < n_bins:
+                        sc += 0.5 * onset[bi + 1]
+                    if bi - 1 >= 0:
+                        sc += 0.3 * onset[bi - 1]
+            scores.append((sc, sh))
+        mean_s = sum(s for s, _ in scores) / float(len(scores))
+        var_s = sum((s - mean_s) ** 2 for s, _ in scores) / float(len(scores))
+        std_s = math.sqrt(var_s) if var_s > 0.0 else 1.0
+        best_sc, best_sh = max(scores, key=lambda x: x[0])
+        z = (best_sc - mean_s) / std_s if std_s > 0.0 else 0.0
+        if z < 2.2:
+            return {"ok": False, "offset": round(off0, 3), "confidence": round(z, 2),
+                    "clicks": len(rel_clicks), "window": [round(va, 2), round(vb, 2)],
+                    "message": "枪声与左键脉冲相关性较弱 (z=%.1f)，建议微调或换到开火片段再试" % z}
+        return {
+            "ok": True,
+            "offset": round(off0 + best_sh, 3),
+            "delta": round(best_sh, 3),
+            "confidence": round(z, 2),
+            "clicks": len(rel_clicks),
+            "window": [round(va, 2), round(vb, 2)],
+        }
 
     def export_status(self):
         with self.lock:
@@ -2239,17 +2803,121 @@ class Engine(object):
         return job
 
     def cancel_export(self):
+        self._export_cancel.set()
         with self.lock:
             proc = self.export.get("proc")
+            was_running = bool(self.export.get("running"))
         if proc is not None and proc.poll() is None:
             try:
                 proc.kill()
             except Exception:
                 pass
+        if proc is not None or was_running:
             with self.lock:
-                self.export.update(running=False, msg="\u5df2\u53d6\u6d88", pct=0)
+                self.export.update(running=False, msg="\u5df2\u53d6\u6d88", pct=0, proc=None)
             return True
         return False
+
+    def _atempo_chain(self, speed):
+        s = max(0.25, min(2.0, float(speed or 1.0)))
+        parts = []
+        while s < 0.5:
+            parts.append("atempo=0.5")
+            s *= 2.0
+        if abs(s - 1.0) > 1e-4:
+            parts.append("atempo=%.4f" % s)
+        return ",".join(parts)
+
+    def _run_subproc(self, argv, cwd=None, pct_lo=0, pct_hi=100, label=""):
+        si = None
+        if os.name == "nt":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        proc = subprocess.Popen(
+            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, encoding="utf-8", errors="replace", startupinfo=si,
+        )
+        with self.lock:
+            self.export["proc"] = proc
+            if label:
+                self.export["msg"] = label
+        span = max(1, pct_hi - pct_lo)
+        for line in proc.stdout:
+            if self._export_cancel.is_set():
+                break
+            line = line.strip()
+            if not line:
+                continue
+            pct = None
+            if "/" in line and ("frames" in line or "fps" in line):
+                try:
+                    part = [w for w in line.split() if "/" in w][0]
+                    done, total = part.split("/", 1)
+                    pct = pct_lo + int(float(done) * span / max(1.0, float(total)))
+                except Exception:
+                    pct = None
+            with self.lock:
+                if pct is not None:
+                    self.export["pct"] = min(99, max(self.export["pct"], pct))
+                    elapsed = time.time() - self.export["t0"]
+                    p = self.export["pct"]
+                    if p > 2:
+                        self.export["eta"] = int(elapsed * (100 - p) / p)
+                self.export["msg"] = (("%s · %s" % (label, line)) if label else line)[:120]
+        rc = proc.wait()
+        with self.lock:
+            if self.export.get("proc") is proc:
+                self.export["proc"] = None
+        return rc
+
+    def _trim_video_clip(self, ff, src_vid, v_start, v_dur, out_mp4, speed=1.0, pct_lo=0, pct_hi=25):
+        pre = max(0.0, float(v_start) - 10.0)
+        fine = float(v_start) - pre
+        spd = float(speed or 1.0)
+        atempo = self._atempo_chain(spd)
+        for enc in (["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "17"],
+                    ["-c:v", "libx264", "-preset", "fast", "-crf", "17"]):
+            cmd = [ff, "-y", "-hide_banner", "-loglevel", "error",
+                   "-ss", "%.3f" % pre, "-i", src_vid,
+                   "-ss", "%.3f" % fine, "-t", "%.3f" % float(v_dur),
+                   "-map", "0:v:0", "-map", "0:a?"]
+            if abs(spd - 1.0) > 1e-4:
+                cmd += ["-vf", "setpts=PTS/%.4f" % spd]
+                if atempo:
+                    cmd += ["-af", atempo]
+            cmd += enc + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_mp4]
+            rc = self._run_subproc(cmd, pct_lo=pct_lo, pct_hi=pct_hi, label="裁剪游戏录像")
+            if rc == 0 and os.path.isfile(out_mp4):
+                return 0
+            if self._export_cancel.is_set():
+                return rc
+        return 1
+
+    def _composite_video_with_pngs(self, ff, src_vid, v_start, v_dur, png_dir, fps, out_mp4, W, H, speed=1.0, pct_lo=68, pct_hi=100):
+        pre = max(0.0, float(v_start) - 10.0)
+        fine = float(v_start) - pre
+        spd = float(speed or 1.0)
+        vchain = "[0:v:0]" + (("setpts=PTS/%.4f," % spd) if abs(spd - 1.0) > 1e-4 else "")
+        vchain += "scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black[bg];" % (W, H, W, H)
+        fgraph = vchain + "[1:v]format=rgba[hud];[bg][hud]overlay=0:0:shortest=1:format=auto[outv]"
+        atempo = self._atempo_chain(spd)
+        pat = os.path.join(png_dir, "frame_%05d.png")
+        for enc in (["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "17"],
+                    ["-c:v", "libx264", "-preset", "fast", "-crf", "17"]):
+            cmd = [ff, "-y", "-hide_banner", "-loglevel", "error",
+                   "-ss", "%.3f" % pre, "-i", src_vid,
+                   "-ss", "%.3f" % fine, "-t", "%.3f" % float(v_dur),
+                   "-framerate", str(fps), "-i", pat,
+                   "-filter_complex", fgraph, "-map", "[outv]", "-map", "0:a?"]
+            if atempo:
+                cmd += ["-af", atempo]
+            cmd += enc + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_mp4]
+            rc = self._run_subproc(cmd, pct_lo=pct_lo, pct_hi=pct_hi, label="合成 HUD 视频")
+            if rc == 0 and os.path.isfile(out_mp4):
+                return 0
+            if self._export_cancel.is_set():
+                return rc
+        return 1
 
     def start_export(self, params):
         with self.lock:
@@ -2277,11 +2945,38 @@ class Engine(object):
         fmt = (params.get("fmt") or ("png" if params.get("png") else "prores")).strip().lower()
         if fmt not in ("prores", "webm", "png"):
             fmt = "prores"
+        mode = (params.get("mode") or "hud").strip().lower()
+        if mode not in ("hud", "composite", "tracks"):
+            mode = "hud"
+        offset = float(params.get("offset") or 0.0)
+        mm_mode = (params.get("mm") or "press").strip().lower()
+        if mm_mode not in ("off", "press", "always"):
+            mm_mode = "press"
         inc_mouse = bool(params.get("mouse"))
         mlay = (params.get("mouse_layout") or "side").strip().lower()
-        if mlay not in ("side", "stack", "only"):
+        if mlay not in ("side", "stack", "only", "stage"):
             mlay = "side"
         mouse_csv = os.path.join(os.path.dirname(wide), "mouse.csv")
+        has_mouse = inc_mouse and os.path.isfile(mouse_csv)
+        ff = find_ffmpeg_bin("ffmpeg")
+        if mode in ("composite", "tracks"):
+            with self.lock:
+                vid = dict(self.wb_video) if self.wb_video else None
+            if not vid or not os.path.isfile(vid.get("path") or ""):
+                return False, "该导出模式需要先导入录像"
+            if not ff:
+                return False, "未找到 ffmpeg.exe"
+            if end <= start:
+                return False, "请先选择有效的导出区间"
+        def _box_str(val):
+            if isinstance(val, (list, tuple)) and len(val) == 4:
+                return "%.4f,%.4f,%.4f,%.4f" % tuple(float(x) for x in val)
+            return ""
+        kb_box = _box_str(params.get("kb_box"))
+        ms_box = _box_str(params.get("mouse_box"))
+        kb_alpha = params.get("kb_alpha")
+        ms_alpha = params.get("mouse_alpha")
+        mopacity = params.get("mopacity")
         out_name = params.get("out") or ("depth-%s" % time.strftime("%Y%m%d-%H%M%S"))
         exports = os.path.join(base, "exports")
         try:
@@ -2290,66 +2985,123 @@ class Engine(object):
         except Exception:
             exports = base
         out_path = os.path.join(exports, out_name)
-        argv = [py, kb, wide, "--fps", str(fps), "--size", size,
-                "--layout", layout, "--theme", theme, "--full", "%.2f" % full_mm,
-                "--speed", str(speed), "--format", fmt, "-o", out_path]
-        if keys:
-            argv += ["--keys"] + keys
-        if start > 0:
-            argv += ["--start", "%.3f" % start]
-        if end > 0:
-            argv += ["--end", "%.3f" % end]
-        if bg:
-            argv += ["--bg", bg]
-        if inc_mouse and os.path.isfile(mouse_csv):
-            argv += ["--mouse", mouse_csv, "--mouse-layout", mlay]
-        if fmt == "png":
-            argv += ["--png-only", "--keep-frames"]
-        final_out = (out_path + ".webm") if fmt == "webm" else ((out_path + ".mov") if fmt == "prores" else out_path)
-        try:
-            proc = subprocess.Popen(argv, cwd=os.path.dirname(kb),
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    universal_newlines=True, encoding="utf-8",
-                                    errors="replace")
-        except Exception as exc:
-            return False, "\u542f\u52a8\u6e32\u67d3\u5668\u5931\u8d25\uff1a%s" % exc
-        with self.lock:
-            self.export = {"running": True, "pct": 0, "msg": "\u6b63\u5728\u6e32\u67d3",
-                           "out": final_out, "proc": proc, "t0": time.time(),
-                           "eta": 0, "error": "", "argv": " ".join(argv)}
 
-        def pump():
-            last = 0
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                pct = None
-                if "frames encoded" in line or "frames" in line and "/" in line:
-                    try:
-                        part = [w for w in line.split() if "/" in w][0]
-                        done, total = part.split("/")
-                        pct = int(float(done) * 100 / max(1.0, float(total)))
-                    except Exception:
-                        pct = None
+        def _base_kb_argv(target, extra_fmt=None):
+            a = [py, kb, wide, "--fps", str(fps), "--size", size,
+                 "--layout", layout, "--theme", theme, "--full", "%.2f" % full_mm,
+                 "--speed", str(speed), "--mm", mm_mode,
+                 "--format", extra_fmt or fmt, "-o", target]
+            if ff:
+                a += ["--ffmpeg", ff]
+            if keys:
+                a += ["--keys"] + keys
+            if start > 0:
+                a += ["--start", "%.3f" % start]
+            if end > 0:
+                a += ["--end", "%.3f" % end]
+            if bg and mode == "hud":
+                a += ["--bg", bg]
+            if kb_alpha is not None:
+                a += ["--kb-alpha", "%.2f" % float(kb_alpha)]
+            if ms_alpha is not None:
+                a += ["--mouse-alpha", "%.2f" % float(ms_alpha)]
+            if mopacity is not None:
+                a += ["--mopacity", "%.2f" % float(mopacity)]
+            return a
+
+        self._export_cancel.clear()
+        if mode == "hud":
+            argv = _base_kb_argv(out_path)
+            if has_mouse:
+                argv += ["--mouse", mouse_csv, "--mouse-layout", mlay]
+            elif mlay == "stage":
+                argv += ["--mouse-layout", "stage"]
+            if kb_box:
+                argv += ["--kb-box", kb_box]
+            if ms_box:
+                argv += ["--mouse-box", ms_box]
+            if fmt == "png":
+                argv += ["--png-only", "--keep-frames"]
+            final_out = (out_path + ".webm") if fmt == "webm" else ((out_path + ".mov") if fmt == "prores" else out_path)
+            with self.lock:
+                self.export = {"running": True, "pct": 0, "msg": "正在渲染 HUD",
+                               "out": final_out, "proc": None, "t0": time.time(),
+                               "eta": 0, "error": "", "argv": " ".join(argv)}
+            def pump_hud():
+                rc = self._run_subproc(argv, cwd=os.path.dirname(kb), pct_lo=0, pct_hi=100, label="渲染 HUD")
                 with self.lock:
-                    if pct is not None:
-                        self.export["pct"] = min(99, pct)
-                        elapsed = time.time() - self.export["t0"]
-                        if pct > 2:
-                            self.export["eta"] = int(elapsed * (100 - pct) / pct)
-                    self.export["msg"] = line[:120]
-                last = pct or last
-            rc = proc.wait()
+                    self.export.update(running=False, pct=100 if rc == 0 else 0,
+                                       msg="完成" if rc == 0 else ("已取消" if self._export_cancel.is_set() else ("失败 (rc=%d)" % rc)),
+                                       error="" if rc == 0 else "rc=%d" % rc)
+            t = threading.Thread(target=pump_hud); t.daemon = True; t.start()
+            return True, final_out
+
+        v_start = max(0.0, start - offset)
+        v_dur = max(0.1, end - start)
+        W, H = [int(x) for x in size.lower().split("x")]
+        if mode == "composite":
+            final_out = out_path + "_hud.mp4"
+            with self.lock:
+                self.export = {"running": True, "pct": 0, "msg": "准备合成成片",
+                               "out": final_out, "proc": None, "t0": time.time(),
+                               "eta": 0, "error": ""}
+            def pump_comp():
+                import tempfile
+                tmp_png = tempfile.mkdtemp(prefix="dl-comp-")
+                rc = 1
+                try:
+                    argv = _base_kb_argv(tmp_png, "png") + ["--png-only", "--keep-frames"]
+                    if has_mouse:
+                        argv += ["--mouse", mouse_csv, "--mouse-layout", "stage"]
+                    else:
+                        argv += ["--mouse-layout", "stage"]
+                    if kb_box:
+                        argv += ["--kb-box", kb_box]
+                    if ms_box:
+                        argv += ["--mouse-box", ms_box]
+                    rc = self._run_subproc(argv, cwd=os.path.dirname(kb), pct_lo=0, pct_hi=68, label="渲染透明 HUD 序列")
+                    if rc == 0 and not self._export_cancel.is_set():
+                        rc = self._composite_video_with_pngs(ff, vid["path"], v_start, v_dur, tmp_png, fps, final_out, W, H, speed, 68, 100)
+                finally:
+                    for _ in range(4):
+                        shutil.rmtree(tmp_png, ignore_errors=True)
+                        if not os.path.isdir(tmp_png):
+                            break
+                        time.sleep(0.3)
+                    with self.lock:
+                        self.export.update(running=False, pct=100 if rc == 0 else 0,
+                                           msg="合成完成" if rc == 0 else ("已取消" if self._export_cancel.is_set() else ("失败 (rc=%d)" % rc)),
+                                           error="" if rc == 0 else "rc=%d" % rc)
+            t = threading.Thread(target=pump_comp); t.daemon = True; t.start()
+            return True, final_out
+
+        tdir = out_path + "_tracks"
+        if not os.path.isdir(tdir):
+            os.makedirs(tdir)
+        ext_hud = ".webm" if fmt == "webm" else ".mov"
+        use_fmt = "webm" if fmt == "webm" else "prores"
+        with self.lock:
+            self.export = {"running": True, "pct": 0, "msg": "准备三轨分开导出",
+                           "out": tdir, "proc": None, "t0": time.time(),
+                           "eta": 0, "error": ""}
+        def pump_tracks():
+            rc = self._trim_video_clip(ff, vid["path"], v_start, v_dur, os.path.join(tdir, "clip.mp4"), speed, 0, 25)
+            if rc == 0 and not self._export_cancel.is_set():
+                a_kb = _base_kb_argv(os.path.join(tdir, "kb"), use_fmt)
+                if kb_box:
+                    a_kb += ["--kb-box", kb_box]
+                rc = self._run_subproc(a_kb, cwd=os.path.dirname(kb), pct_lo=25, pct_hi=(62 if has_mouse else 100), label="渲染键盘透明轨")
+            if rc == 0 and has_mouse and not self._export_cancel.is_set():
+                a_ms = _base_kb_argv(os.path.join(tdir, "mouse"), use_fmt) + ["--mouse", mouse_csv, "--mouse-layout", "only"]
+                if ms_box:
+                    a_ms += ["--mouse-box", ms_box]
+                rc = self._run_subproc(a_ms, cwd=os.path.dirname(kb), pct_lo=62, pct_hi=100, label="渲染鼠标透明轨")
             with self.lock:
                 self.export.update(running=False, pct=100 if rc == 0 else 0,
-                                   msg="\u5b8c\u6210" if rc == 0 else "\u5931\u8d25 (rc=%d)" % rc,
+                                   msg="三轨导出完成" if rc == 0 else ("已取消" if self._export_cancel.is_set() else ("失败 (rc=%d)" % rc)),
                                    error="" if rc == 0 else "rc=%d" % rc)
-
-        t = threading.Thread(target=pump)
-        t.daemon = True
-        t.start()
-        return True, out_path
+        t = threading.Thread(target=pump_tracks); t.daemon = True; t.start()
+        return True, tdir
 
     def sample_quality(self):
         """How healthy is the HID stream right now (or during the last N packets)."""
@@ -2771,7 +3523,63 @@ class Handler(BaseHTTPRequestHandler):
 
     STATE_PATHS = ("/rec/start", "/rec/stop", "/rec/clear", "/auto", "/bind",
                    "/unbind", "/strafe", "/settings", "/resetmap", "/reset",
-                   "/openfolder", "/quit", "/wb/export", "/wb/cancel", "/wb/delete")
+                   "/openfolder", "/quit", "/wb/export", "/wb/cancel", "/wb/delete",
+                   "/wb/export/open", "/wb/video/pick", "/wb/video/load",
+                   "/wb/video/clear", "/wb/video/align", "/wb/video/layout")
+
+    def _send_video_stream(self):
+        with ENGINE.lock:
+            vid = dict(ENGINE.wb_video) if ENGINE.wb_video else None
+        path = vid.get("path") if vid else None
+        if not path or not os.path.isfile(path):
+            self._send_text(404, "no video loaded")
+            return
+        size = os.path.getsize(path)
+        ext = os.path.splitext(path)[1].lower()
+        ctype = {".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+                 ".mov": "video/quicktime", ".mkv": "video/x-matroska",
+                 ".avi": "video/x-msvideo"}.get(ext, "application/octet-stream")
+        rng = self.headers.get("Range")
+        start = 0
+        end = size - 1
+        status = 200
+        if rng and rng.startswith("bytes="):
+            spec = rng[6:].split(",", 1)[0].strip()
+            a_s, b_s = (spec.split("-", 1) + [""])[:2]
+            if a_s == "" and b_s:
+                n = min(size, int(b_s))
+                start = max(0, size - n)
+                end = size - 1
+            else:
+                start = max(0, int(a_s or 0))
+                end = min(size - 1, int(b_s)) if b_s else size - 1
+            if start >= size or end < start:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.end_headers()
+                return
+            status = 206
+        length = max(0, end - start + 1)
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        if status == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+        rem = length
+        with io.open(path, "rb") as f:
+            f.seek(start)
+            while rem > 0:
+                chunk = f.read(min(262144, rem))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    break
+                rem -= len(chunk)
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -2994,8 +3802,13 @@ class Handler(BaseHTTPRequestHandler):
             step = float((q.get("step") or ["0.02"])[0] or 0.02)
             limit = int((q.get("limit") or ["1600"])[0] or 1600)
             stamp = (q.get("stamp") or [None])[0]
+            start = (q.get("start") or [None])[0]
+            end = (q.get("end") or [None])[0]
+            start_v = float(start) if start not in (None, "") else None
+            end_v = float(end) if end not in (None, "") else None
             try:
-                self._send_json(ENGINE.wb_series(step, limit=limit, stamp=stamp))
+                self._send_json(ENGINE.wb_series(step, limit=limit, stamp=stamp,
+                                                 start=start_v, end=end_v))
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)})
         elif url.path == "/wb/analysis":
@@ -3049,6 +3862,65 @@ class Handler(BaseHTTPRequestHandler):
                 params = {}
             ok, msg = ENGINE.start_export(params)
             self._send_json({"ok": ok, "message": msg})
+        elif url.path == "/wb/export/open":
+            exports = os.path.join(recordings_dir(), "exports")
+            out = (ENGINE.export.get("out") or "")
+            target = out if os.path.isdir(out) else (os.path.dirname(out) if out and os.path.isfile(out) else exports)
+            if not os.path.isdir(target):
+                try:
+                    os.makedirs(target)
+                except Exception:
+                    target = recordings_dir()
+            try:
+                os.startfile(target)
+            except Exception:
+                pass
+            self._send_json({"ok": True, "path": target})
+        elif url.path == "/wb/video/info":
+            with ENGINE.lock:
+                vid = dict(ENGINE.wb_video) if ENGINE.wb_video else None
+            self._send_json({"ok": True, "video": vid and {
+                k: vid[k] for k in ("name", "size", "duration", "width", "height", "fps", "has_audio", "time_src")
+            }, "stage": _sanitize_wb_stage(ENGINE.wb_stage)})
+        elif url.path == "/wb/video/stream":
+            self._send_video_stream()
+        elif url.path == "/wb/video/pick":
+            p = pick_video_file_win32(r"F:\录屏" if os.path.isdir(r"F:\录屏") else None)
+            if not p:
+                self._send_json({"ok": False, "cancelled": True})
+            else:
+                self._send_json(ENGINE.wb_video_load(p))
+        elif url.path == "/wb/video/load":
+            raw = getattr(self, "_body", b"") or b"{}"
+            try:
+                params = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                params = {}
+            self._send_json(ENGINE.wb_video_load(params.get("path"), params.get("stamp")))
+        elif url.path == "/wb/video/clear":
+            with ENGINE.lock:
+                ENGINE.wb_video = None
+            self._send_json({"ok": True})
+        elif url.path == "/wb/video/align":
+            raw = getattr(self, "_body", b"") or b"{}"
+            try:
+                params = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                params = {}
+            self._send_json(ENGINE.wb_video_fine_align(
+                stamp=params.get("stamp"),
+                video_t=params.get("video_t"),
+                coarse_offset=params.get("offset", 0.0),
+                search_s=params.get("search_s", 3.0),
+            ))
+        elif url.path == "/wb/video/layout":
+            raw = getattr(self, "_body", b"") or b"{}"
+            try:
+                params = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                params = {}
+            out = ENGINE.update_settings(wb_stage=params, save=True)
+            self._send_json({"ok": True, "stage": out.get("wb_stage")})
         elif url.path == "/openfolder":
             try:
                 folder = recordings_dir()
@@ -5447,40 +6319,102 @@ def workbench_html():
     return (r"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>素材工作台</title>
 <style>
-  :root { --u:44px; --bg:#101215; --card:rgba(255,255,255,.03); --edge:rgba(255,255,255,.10);
-          --fg:#f4f4f5; --dim:rgba(255,255,255,.52); --acc:#38bdf8; }
+  :root { --u:44px; --bg:#0a0c10; --card:#11151d; --card2:#161b26; --edge:rgba(255,255,255,.08);
+          --edge-hi:rgba(255,255,255,.16); --fg:#f1f5f9; --dim:#8b95a7; --acc:#38bdf8; --ok:#34d399; --bad:#f43f5e; }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif; font-size:13px; }
+  body { margin:0; color:var(--fg); background:radial-gradient(1200px 420px at 50% -120px, rgba(56,189,248,.09), transparent 60%), var(--bg);
+         font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif; font-size:13px; -webkit-font-smoothing:antialiased; }
   .num { font-variant-numeric:tabular-nums; font-family:ui-monospace,"Cascadia Mono",Consolas,monospace; }
-  header { display:flex; align-items:center; gap:12px; padding:12px 20px; border-bottom:1px solid var(--edge); }
-  h1 { font-size:14px; margin:0; letter-spacing:.8px; font-weight:600; }
-  a.nav { color:var(--dim); text-decoration:none; font-size:12px; padding:4px 9px; border-radius:6px; }
-  a.nav:hover { color:#fff; background:rgba(255,255,255,.07); }
-  .wrap { max-width:1280px; margin:0 auto; padding:12px 18px 20px; display:flex; flex-direction:column; gap:12px; }
-  .card { background:var(--card); border:1px solid var(--edge); border-radius:10px; padding:12px 14px; }
-  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  .sub { color:var(--dim); font-size:11px; letter-spacing:.6px; }
-  .pill { color:var(--dim); font-size:12px; }
-  .pill b { color:#e4e4e7; font-weight:600; margin-left:4px; }
-  input, select, button { background:rgba(255,255,255,.06); color:var(--fg); border:1px solid rgba(255,255,255,.14);
-          border-radius:6px; padding:5px 9px; font-size:12px; font-family:inherit; }
-  select option { background:#14171f; color:#f4f4f5; }
-  button { cursor:pointer; }
-  button:hover { background:rgba(255,255,255,.12); }
-  button.primary { background:rgba(16,185,129,.18); border-color:rgba(52,211,153,.5); color:#6ee7b7; }
-  button.primary:hover { background:rgba(16,185,129,.28); }
-  button.play { background:rgba(56,189,248,.16); border-color:rgba(56,189,248,.45); color:#bae6fd; min-width:96px; }
-  button.play.on { background:rgba(244,63,94,.22); border-color:rgba(244,63,94,.55); color:#fecdd3; }
+  header { position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:10px; padding:10px 20px;
+           background:rgba(10,12,16,.84); backdrop-filter:blur(12px); border-bottom:1px solid var(--edge); }
+  h1 { display:flex; align-items:center; gap:8px; font-size:14px; margin:0; letter-spacing:.6px; font-weight:600; color:#f8fafc; }
+  .brand-dot { width:8px; height:8px; border-radius:50%; background:var(--acc); box-shadow:0 0 10px rgba(56,189,248,.8); }
+  a.nav { color:var(--dim); text-decoration:none; font-size:12px; padding:5px 10px; border-radius:7px; border:1px solid transparent; transition:all .15s; }
+  a.nav:hover { color:#fff; background:rgba(255,255,255,.06); border-color:var(--edge); }
+  .wrap { max-width:1520px; margin:0 auto; padding:14px 20px 28px; display:flex; flex-direction:column; gap:14px; }
+  .card { background:var(--card); border:1px solid var(--edge); border-radius:12px; padding:14px 16px; box-shadow:0 6px 24px rgba(0,0,0,.22); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .sub { color:var(--dim); font-size:11px; letter-spacing:.4px; }
+  .pill { display:inline-flex; align-items:center; gap:5px; color:var(--dim); font-size:12px; padding:3px 9px;
+          border-radius:7px; background:rgba(255,255,255,.035); border:1px solid var(--edge); }
+  .pill b { color:#f1f5f9; font-weight:600; }
+  input, select, button { background:#0d1017; color:var(--fg); border:1px solid var(--edge-hi);
+          border-radius:7px; height:30px; padding:0 10px; font-size:12px; font-family:inherit; transition:border-color .15s, background .15s; }
+  input:focus, select:focus { outline:none; border-color:rgba(56,189,248,.6); }
+  select option { background:#11151d; color:#f1f5f9; }
+  button { cursor:pointer; display:inline-flex; align-items:center; justify-content:center; gap:5px; font-weight:500; }
+  button:hover { background:rgba(255,255,255,.09); border-color:rgba(255,255,255,.24); }
+  button.primary { background:rgba(16,185,129,.18); border-color:rgba(52,211,153,.48); color:#6ee7b7; }
+  button.primary:hover { background:rgba(16,185,129,.28); border-color:rgba(52,211,153,.72); }
+  button.play { background:rgba(56,189,248,.16); border-color:rgba(56,189,248,.48); color:#bae6fd; min-width:104px; font-weight:600; }
+  button.play:hover { background:rgba(56,189,248,.24); }
+  button.play.on { background:rgba(244,63,94,.22); border-color:rgba(244,63,94,.58); color:#fecdd3; }
+  .seg { display:inline-flex; }
+  .seg button { border-radius:0; margin-left:-1px; flex:1; padding:0 8px; }
+  .seg button:first-child { border-radius:7px 0 0 7px; margin-left:0; }
+  .seg button:last-child { border-radius:0 7px 7px 0; }
+  input[type="range"].srange { -webkit-appearance:none; appearance:none; width:100%; height:4px; padding:0; border:none;
+                               border-radius:999px; background:rgba(255,255,255,.14); cursor:pointer; }
+  input[type="range"].srange::-webkit-slider-thumb { -webkit-appearance:none; width:13px; height:13px; border-radius:50%;
+                               background:#38bdf8; border:2px solid #0a0c10; box-shadow:0 0 0 1px rgba(56,189,248,.45); }
 
-  #prevStage { display:flex; align-items:center; justify-content:center; gap:24px; flex-wrap:wrap;
-               min-height:170px; padding:10px 4px; overflow:hidden; }
+  .studio-grid { display:grid; grid-template-columns:minmax(0,1fr) 336px; gap:14px; align-items:start; }
+  .studio-main { display:flex; flex-direction:column; gap:14px; min-width:0; }
+  .stage-card { display:flex; flex-direction:column; gap:10px; padding:12px 14px; }
+  .stage-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .vid-badge { display:inline-flex; align-items:center; gap:7px; padding:4px 10px; border-radius:8px;
+               background:rgba(255,255,255,.035); border:1px solid var(--edge); max-width:560px; }
+  .vid-badge b { font-size:12px; color:#e2e8f0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #vidStatus { font-size:11px; color:#7dd3fc; }
+  #vidPathRow { display:none; align-items:center; gap:8px; }
+  #vidPathRow.on { display:flex; }
+  #prevStage { display:flex; align-items:center; justify-content:center; gap:26px; flex-wrap:wrap;
+               min-height:240px; padding:18px 10px; overflow:hidden; position:relative; border-radius:10px;
+               border:1px solid var(--edge); background-color:#0b0e14;
+               background-image:radial-gradient(rgba(255,255,255,.06) 1px, transparent 1px); background-size:18px 18px; }
+  #prevStage.has-video { display:block; width:min(100%, calc(62vh * var(--vid-ar, 1.7778)));
+                          aspect-ratio:var(--vid-ar, 16/9); min-height:260px; margin:0 auto; padding:0;
+                          background:#05070a; background-image:none; border:1px solid var(--edge-hi);
+                          box-shadow:0 14px 36px rgba(0,0,0,.48); }
+  #wbVideo { display:none; width:100%; height:100%; object-fit:contain; background:#000; }
+  #prevStage.has-video #wbVideo { display:block; }
+  .transport-bar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding-top:4px; border-top:1px solid var(--edge); }
+  .inspector { display:flex; flex-direction:column; padding:0; overflow:hidden; position:sticky; top:64px; }
+  .ins-sec { padding:12px 14px; display:flex; flex-direction:column; gap:9px; }
+  .ins-sec + .ins-sec { border-top:1px solid var(--edge); }
+  .ins-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .ins-title { font-size:11px; font-weight:600; letter-spacing:.8px; color:#cbd5e1; }
+  .fgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .field { display:flex; flex-direction:column; gap:4px; min-width:0; }
+  .field label { font-size:11px; color:var(--dim); }
+  .field input, .field select { width:100%; }
+  .srow { display:grid; grid-template-columns:64px 1fr 34px; align-items:center; gap:8px; font-size:11px; color:var(--dim); }
+  .srow b { text-align:right; color:#e2e8f0; font-weight:500; }
+  #vidCtrlBar { display:none; flex-direction:column; gap:9px; }
+  #vidCtrlBar.on { display:flex; }
+  .hud-layer { position:relative; flex-shrink:0; }
+  #prevStage.has-video .hud-layer { position:absolute; left:0; top:0; transform-origin:0 0; cursor:grab;
+                                    touch-action:none; z-index:4; pointer-events:auto; border-radius:8px; }
+  #prevStage.has-video .hud-layer:hover { outline:1px dashed rgba(56,189,248,.65); outline-offset:4px; }
+  #prevStage.has-video .hud-layer.dragging { cursor:grabbing; outline:1.5px solid #38bdf8; outline-offset:4px; }
+  .hud-handle { display:none; position:absolute; right:-8px; bottom:-8px; width:14px; height:14px; border-radius:4px;
+                background:#38bdf8; border:2px solid #0b0e13; cursor:nwse-resize; z-index:6; }
+  #prevStage.has-video .hud-layer:hover .hud-handle,
+  #prevStage.has-video .hud-layer.dragging .hud-handle { display:block; }
+  .hud-tag { display:none; position:absolute; left:0; top:-20px; font-size:10px; padding:1px 6px; border-radius:4px;
+             background:rgba(11,14,19,.86); color:#bae6fd; border:1px solid rgba(56,189,248,.45); white-space:nowrap; pointer-events:none; }
+  #prevStage.has-video .hud-layer:hover .hud-tag,
+  #prevStage.has-video .hud-layer.dragging .hud-tag { display:block; }
+  .stage-guide { display:none; position:absolute; pointer-events:none; z-index:3; background:rgba(56,189,248,.55); }
+  #guideV { top:0; bottom:0; left:50%; width:1px; }
+  #guideH { left:0; right:0; top:50%; height:1px; }
+  .stage-guide.on { display:block; }
   #kbPrev { position:relative; flex-shrink:0; }
   #wbPadWrap { position:relative; flex-shrink:0; display:flex; flex-direction:column; align-items:center; gap:4px; }
   #wbPadWrap.off { display:none; }
   #wbPad { position:relative; width:220px; height:182px; border-radius:11px;
-           background:rgba(14,16,20,.72); border:1px solid rgba(255,255,255,.14);
-           backdrop-filter:blur(8px); overflow:hidden; user-select:none; }
+           background:rgba(14,16,20,.84); border:1px solid rgba(255,255,255,.14);
+           overflow:hidden; user-select:none; }
   #wbPad::before { content:""; position:absolute; inset:0; pointer-events:none;
                    background:linear-gradient(to right,transparent calc(50% - 0.5px),rgba(255,255,255,.06) 50%,transparent calc(50% + 0.5px)),
                               linear-gradient(to bottom,transparent calc(50% - 0.5px),rgba(255,255,255,.06) 50%,transparent calc(50% + 0.5px)); }
@@ -5508,8 +6442,8 @@ def workbench_html():
                   background:rgba(12,14,19,.72); backdrop-filter:blur(4px); }
   #wbMouseEmpty.on { display:flex; }
   .k { position:absolute; border-radius:calc(var(--u) * 0.125); overflow:hidden;
-       background:rgba(14,16,20,.68); border:1px solid rgba(255,255,255,.13);
-       backdrop-filter:blur(8px); user-select:none; transition:transform .04s linear; }
+       background:rgba(14,16,20,.82); border:1px solid rgba(255,255,255,.13);
+       user-select:none; }
   .k .fill { position:absolute; left:0; right:0; bottom:0; height:0%; pointer-events:none; }
   .k .lbl { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
             font-size:calc(var(--u) * 0.24); font-weight:600; color:rgba(255,255,255,.72);
@@ -5520,44 +6454,44 @@ def workbench_html():
   .k.hot .mm { opacity:1; }
   .k.dim { opacity:.32; }
 
-  #hoverRead { font-size:12px; color:#cbd5e1; min-height:18px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-  #hoverRead .hk { background:rgba(56,189,248,.12); border:1px solid rgba(56,189,248,.3); color:#bae6fd;
-                   padding:1px 6px; border-radius:5px; font-size:11px; }
+  #hoverRead { font-size:12px; color:#cbd5e1; min-height:22px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; flex:1; }
+  #hoverRead .hk { background:rgba(56,189,248,.12); border:1px solid rgba(56,189,248,.32); color:#bae6fd;
+                   padding:2px 7px; border-radius:6px; font-size:11px; }
   #hoverRead .hk.m { background:rgba(244,63,94,.16); border-color:rgba(244,63,94,.42); color:#fecdd3; }
-  #tracks { position:relative; margin-top:8px; }
-  #cv { width:100%; height:264px; display:block; background:#0b0e13; border:1px solid rgba(255,255,255,.07);
-        border-radius:8px; cursor:crosshair; }
-  #hint { color:var(--dim); font-size:11px; margin-top:6px; display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; }
-  .key-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
-  .kchip { display:inline-flex; align-items:center; gap:5px; padding:3px 8px; border-radius:6px; font-size:12px;
-           background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.12); color:var(--dim); cursor:pointer; user-select:none; }
+  #tracks { position:relative; margin-top:10px; }
+  #cv { width:100%; height:264px; display:block; background:#090c11; border:1px solid var(--edge);
+        border-radius:9px; cursor:crosshair; }
+  #hint { color:var(--dim); font-size:11px; margin-top:8px; display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+  .key-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .kchip { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:7px; font-size:11px;
+           background:rgba(255,255,255,.04); border:1px solid var(--edge); color:var(--dim); cursor:pointer; user-select:none; transition:all .15s; }
   .kchip.on { background:rgba(56,189,248,.16); border-color:rgba(56,189,248,.48); color:#e0f2fe; }
-  .kchip input { margin:0; accent-color:#38bdf8; }
-  #prog { height:5px; background:rgba(255,255,255,.07); border-radius:4px; overflow:hidden; margin-top:10px; }
+  .kchip input { margin:0; width:auto; height:auto; padding:0; accent-color:#38bdf8; }
+  #prog { height:6px; background:rgba(255,255,255,.07); border-radius:999px; overflow:hidden; margin-top:4px; }
   #prog i { display:block; height:100%; width:0%; background:linear-gradient(90deg,#38bdf8,#34d399); transition:width .15s; }
-  #log { color:var(--dim); font-size:11px; margin-top:6px; white-space:pre-wrap; }
+  #log { color:var(--dim); font-size:11px; white-space:pre-wrap; line-height:1.45; min-height:16px; }
   #histDrawer { display:none; }
   #histDrawer.open { display:block; }
   .hist-list { display:flex; flex-direction:column; gap:6px; max-height:220px; overflow-y:auto; margin-top:8px; }
   .hist-item { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 10px;
-               border-radius:7px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08);
-               cursor:pointer; }
-  .hist-item:hover { background:rgba(255,255,255,.07); }
+               border-radius:8px; background:rgba(255,255,255,.03); border:1px solid var(--edge); cursor:pointer; }
+  .hist-item:hover { background:rgba(255,255,255,.06); }
   .hist-item.on { background:rgba(56,189,248,.13); border-color:rgba(56,189,248,.48); }
   .hist-meta { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:12px; }
   .hist-tag { font-size:10px; padding:1px 6px; border-radius:999px; background:rgba(52,211,153,.16);
               color:#6ee7b7; border:1px solid rgba(52,211,153,.35); }
   .hist-tag.m { background:rgba(56,189,248,.16); color:#bae6fd; border-color:rgba(56,189,248,.38); }
   .hist-keys { font-size:11px; color:var(--dim); max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  button.danger { color:#fca5a5; border-color:rgba(239,68,68,.32); background:rgba(239,68,68,.10); padding:3px 8px; font-size:11px; }
+  button.danger { color:#fca5a5; border-color:rgba(239,68,68,.35); background:rgba(239,68,68,.10); padding:0 9px; font-size:11px; }
   button.danger:hover { background:rgba(239,68,68,.22); }
   .kpi-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:10px; }
-  .kpi { background:rgba(255,255,255,.025); border:1px solid rgba(255,255,255,.08); border-radius:8px; padding:9px 11px; }
+  .kpi { background:linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.015));
+         border:1px solid var(--edge); border-radius:9px; padding:10px 12px; }
   .kpi .kl { font-size:11px; color:var(--dim); }
-  .kpi .kv { font-size:18px; font-weight:700; margin-top:2px; color:#f4f4f5; }
+  .kpi .kv { font-size:19px; font-weight:700; margin-top:3px; color:#f8fafc; }
   .kpi .ks { font-size:11px; color:var(--dim); margin-top:2px; }
   .diag-cols { display:grid; grid-template-columns:1fr 1fr 1.25fr; gap:10px; margin-top:10px; }
-  .diag-box { background:rgba(255,255,255,.02); border:1px solid rgba(255,255,255,.07); border-radius:8px; padding:8px 10px; }
+  .diag-box { background:#0d1017; border:1px solid var(--edge); border-radius:9px; padding:9px 11px; }
   .diag-list { display:flex; flex-direction:column; gap:5px; max-height:142px; overflow-y:auto; margin-top:6px; }
   .diag-item { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:5px 8px; border-radius:6px;
                background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.07); cursor:pointer; font-size:12px; }
@@ -5565,12 +6499,13 @@ def workbench_html():
   .tag-bad { color:#fda4af; font-weight:600; }
   .tag-ok { color:#6ee7b7; font-weight:600; }
   .ks-tbl { width:100%; border-collapse:collapse; font-size:11px; margin-top:6px; }
-  .ks-tbl th { text-align:left; color:var(--dim); font-weight:500; padding:3px 4px; border-bottom:1px solid rgba(255,255,255,.08); }
+  .ks-tbl th { text-align:left; color:var(--dim); font-weight:500; padding:3px 4px; border-bottom:1px solid var(--edge); }
   .ks-tbl td { padding:4px 4px; border-bottom:1px solid rgba(255,255,255,.04); }
+  @media (max-width:1120px) { .studio-grid { grid-template-columns:1fr; } .inspector { position:static; } }
   @media (max-width:920px) { .kpi-grid { grid-template-columns:repeat(2,1fr); } .diag-cols { grid-template-columns:1fr; } }
 </style></head><body>
 <header>
-  <h1>素材工作台</h1>
+  <h1><span class="brand-dot"></span>素材工作台</h1>
   <select id="recSel" class="num" title="切换历史录制" onchange="onSelectRec(this.value)">
     <option value="">加载中…</option>
   </select>
@@ -5592,37 +6527,37 @@ def workbench_html():
     </div>
     <div id="histList" class="hist-list"><span class="sub">暂无录制</span></div>
   </div>
-  <div class="card">
-    <div class="row" style="justify-content:space-between">
-      <div class="row">
-        <button id="playBtn" class="play" type="button" onclick="togglePlay()">▶ 试播选区</button>
-        <span class="pill">当前时刻<b id="cur_t" class="num">0.000 s</b></span>
-        <div id="hoverRead" class="num"><span style="color:var(--dim)">移动鼠标到时间轴查看实时按键深度</span></div>
+
+  <div class="studio-grid">
+    <div class="studio-main">
+    <div class="card stage-card">
+      <div class="stage-head">
+        <div class="row" style="min-width:0;flex:1">
+          <span class="vid-badge"><span class="sub">录像</span><b id="vidName" class="num">未导入（纯 HUD 预览）</b></span>
+          <span id="vidStatus"></span>
+        </div>
+        <div class="row">
+          <button type="button" class="primary" onclick="pickVideo()">导入录像…</button>
+          <button type="button" onclick="togglePathInput()">粘贴路径</button>
+          <button id="vidCloseBtn" type="button" class="danger" style="display:none" onclick="clearVideo()">关闭录像</button>
+        </div>
       </div>
-      <div class="row">
-        <label id="showMouseChip" class="kchip on" style="margin:0"><input id="showMouse" type="checkbox" checked onchange="toggleWbMouse()">同步鼠标</label>
-        <span class="sub">布局</span>
-        <select id="layout" onchange="buildPreviewKb()">
-          <option value="hud">HUD 键簇</option>
-          <option value="wasd">WASD 极简</option>
-          <option value="full">75% 整键盘</option>
-        </select>
-        <span class="sub">主题</span>
-        <select id="theme" onchange="renderPreviewAt(activeTime())">
-          <option value="ramp">随深度平滑</option>
-          <option value="cyan">冰川青</option>
-          <option value="mint">薄荷绿</option>
-          <option value="amber">琥珀金</option>
-          <option value="crimson">绯红</option>
-          <option value="violet">紫罗兰</option>
-        </select>
-        <span class="sub">满程</span>
-        <input id="wbFull" class="num" type="number" min="1.0" max="5.0" step="0.05" value="3.50" style="width:66px" onchange="onWbFullChange(this.value)">
+      <div id="vidPathRow">
+        <input id="vidPathIn" placeholder="输入本地录像路径，例如 F:\录屏\Valorant\xxx.mp4" style="flex:1">
+        <button type="button" class="primary" onclick="loadVideoByPath()">加载</button>
       </div>
-    </div>
-    <div id="prevStage">
-      <div id="kbPrev"></div>
-      <div id="wbPadWrap">
+      <div id="prevStage">
+      <video id="wbVideo" controls preload="metadata" playsinline></video>
+      <div id="guideV" class="stage-guide"></div>
+      <div id="guideH" class="stage-guide"></div>
+      <div id="kbLayer" class="hud-layer">
+        <span class="hud-tag">键盘 HUD（拖动 · 右下角缩放）</span>
+        <div id="kbPrev"></div>
+        <div class="hud-handle" data-target="kb" title="拖动缩放键盘 HUD"></div>
+      </div>
+      <div id="msLayer" class="hud-layer">
+        <span class="hud-tag">鼠标 HUD（拖动 · 右下角缩放）</span>
+        <div id="wbPadWrap">
         <div id="wbPad" title="鼠标同步回放 (Zowie G-SR III · Viper V4 Pro)">
           <div class="wb-c wb-tl"></div><div class="wb-c wb-tr"></div>
           <div class="wb-c wb-bl"></div><div class="wb-c wb-br"></div>
@@ -5654,30 +6589,102 @@ def workbench_html():
           </div>
           <div id="wbMouseEmpty">该录制无鼠标数据<br>新录制将自动同步记录</div>
         </div>
+        </div>
+        <div class="hud-handle" data-target="mouse" title="拖动缩放鼠标 HUD"></div>
+      </div>
+      </div>
+      <div class="transport-bar">
+        <button id="playBtn" class="play" type="button" onclick="togglePlay()">▶ 试播选区</button>
+        <span class="pill">时刻<b id="cur_t" class="num">0.000 s</b></span>
+        <div id="hoverRead" class="num"><span style="color:var(--dim)">移动鼠标到时间轴查看实时按键深度</span></div>
       </div>
     </div>
-  </div>
 
-  <div class="card">
-    <div class="row" style="justify-content:space-between">
-      <div class="row">
-        <span class="sub">起点</span>
-        <input id="sel_start" class="num" size="7" value="0.000">
-        <span class="sub">终点</span>
-        <input id="sel_end" class="num" size="7" value="0.000">
-        <span class="pill">选中<b id="sel_len" class="num">0.000</b> 秒</span>
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <div class="row">
+          <span class="sub">起点</span><input id="sel_start" class="num" size="7" value="0.000">
+          <span class="sub">终点</span><input id="sel_end" class="num" size="7" value="0.000">
+          <span class="pill">选中<b id="sel_len" class="num">0.000</b> 秒</span>
+        </div>
+        <div class="row">
+          <label id="showDiagChip" class="kchip on" style="margin:0"><input id="showDiag" type="checkbox" checked onchange="toggleDiag()">急停标注</label>
+          <div class="seg"><button type="button" onclick="zoom(0.5)">放大</button><button type="button" onclick="zoom(2)">缩小</button><button type="button" onclick="resetView()">全览</button></div>
+        </div>
       </div>
-      <div class="row">
-        <label id="showDiagChip" class="kchip on" style="margin:0"><input id="showDiag" type="checkbox" checked onchange="toggleDiag()">急停标注</label>
-        <button type="button" onclick="zoom(0.5)">放大</button>
-        <button type="button" onclick="zoom(2)">缩小</button>
-        <button type="button" onclick="resetView()">全览</button>
+      <div id="tracks"><canvas id="cv"></canvas></div>
+      <div id="hint">
+        <span>拖拽选区 · 滚轮缩放 · 悬停实时同步预览键鼠 · 红/绿区段=急停重叠/完美 · 双击清选 · Space 播/停 · ←/→ 微调</span>
+        <span id="viewSpan" class="num">0.000s — 0.000s</span>
       </div>
     </div>
-    <div id="tracks"><canvas id="cv"></canvas></div>
-    <div id="hint">
-      <span>拖拽选区 · 滚轮缩放 · 悬停实时同步预览键鼠 · 红/绿区段=急停重叠/完美 · 双击清选 · Space 播/停 · ←/→ 微调</span>
-      <span id="viewSpan" class="num">0.000s — 0.000s</span>
+    </div>
+
+    <div class="card inspector">
+      <div id="vidCtrlBar" class="ins-sec">
+        <div class="ins-head">
+          <span class="ins-title">录像对齐与剪辑</span>
+          <button type="button" style="height:24px;font-size:11px;padding:0 8px" onclick="resetStageLayout()">复位排版</button>
+        </div>
+        <div class="row" style="gap:6px">
+          <div class="field" style="flex:1"><label>时间偏移 (s)</label><input id="vidOffIn" class="num" type="number" step="0.016" value="0.000" onchange="setVideoOffset(this.value)"></div>
+          <button type="button" style="align-self:flex-end" onclick="fineAlignVideo()" title="按当前画面附近枪声与左键脉冲自动对齐">声画精对齐</button>
+        </div>
+        <div class="seg" style="width:100%">
+          <button type="button" onclick="nudgeVideoOffset(-0.1)">-0.1s</button>
+          <button type="button" onclick="nudgeVideoOffset(-0.016)">-1帧</button>
+          <button type="button" onclick="nudgeVideoOffset(0.016)">+1帧</button>
+          <button type="button" onclick="nudgeVideoOffset(0.1)">+0.1s</button>
+        </div>
+        <div class="seg" style="width:100%">
+          <button type="button" onclick="markSelFromVideo(0)" title="把当前视频时刻设为选区起点">设选区起点</button>
+          <button type="button" onclick="markSelFromVideo(1)" title="把当前视频时刻设为选区终点">设选区终点</button>
+        </div>
+        <div class="srow"><span>键盘透度</span><input id="stKbAlpha" class="srange" type="range" min="0.15" max="1" step="0.05" value="0.72" oninput="onStageOpacityChange()"><b id="stKbAlphaVal" class="num">72%</b></div>
+        <div class="srow"><span>鼠标垫底</span><input id="stMsAlpha" class="srange" type="range" min="0.1" max="0.95" step="0.05" value="0.55" oninput="onStageOpacityChange()"><b id="stMsAlphaVal" class="num">55%</b></div>
+        <div class="srow"><span>鼠标本体</span><input id="stMsBody" class="srange" type="range" min="0.2" max="1" step="0.05" value="0.85" oninput="onStageOpacityChange()"><b id="stMsBodyVal" class="num">85%</b></div>
+      </div>
+
+      <div class="ins-sec">
+        <div class="ins-head">
+          <span class="ins-title">HUD 外观</span>
+          <label id="showMouseChip" class="kchip on" style="margin:0"><input id="showMouse" type="checkbox" checked onchange="toggleWbMouse()">同步鼠标</label>
+        </div>
+        <div class="fgrid">
+          <div class="field"><label>键位布局</label>
+            <select id="layout" onchange="buildPreviewKb()"><option value="hud">HUD 键簇</option><option value="wasd">WASD 极简</option><option value="full">75% 整键盘</option></select>
+          </div>
+          <div class="field"><label>深度配色</label>
+            <select id="theme" onchange="renderPreviewAt(activeTime())"><option value="ramp">随深度平滑</option><option value="cyan">冰川青</option><option value="mint">薄荷绿</option><option value="amber">琥珀金</option><option value="crimson">绯红</option><option value="violet">紫罗兰</option></select>
+          </div>
+        </div>
+        <div class="field"><label>满程基准 (mm)</label><input id="wbFull" class="num" type="number" min="1.0" max="5.0" step="0.05" value="3.50" onchange="onWbFullChange(this.value)"></div>
+      </div>
+
+      <div class="ins-sec">
+        <div class="ins-head">
+          <span class="ins-title">导出成片 / HUD</span>
+          <label class="kchip on" id="expMouseChip" style="margin:0"><input id="expMouse" type="checkbox" checked onchange="this.parentNode.classList.toggle('on',this.checked)">含鼠标</label>
+        </div>
+        <div class="field"><label>导出方式</label>
+          <select id="expMode" title="选择导出合成视频、三轨文件或纯透明 HUD"><option value="hud">仅透明 HUD</option><option value="composite">一键合成成片 MP4</option><option value="tracks">三轨分开导出（视频+键+鼠）</option></select>
+        </div>
+        <div class="fgrid">
+          <div class="field"><label>分辨率</label><select id="size"><option value="1920x1080">1080p</option><option value="2560x1440">1440p</option><option value="3840x2160">4K</option></select></div>
+          <div class="field"><label>帧率</label><select id="fps"><option>30</option><option selected>60</option><option>120</option></select></div>
+          <div class="field"><label>倍速</label><select id="speed"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select></div>
+          <div class="field"><label>透明格式</label><select id="fmt"><option value="webm" selected>WebM VP9</option><option value="prores">ProRes 4444</option><option value="png">PNG 序列</option></select></div>
+          <div class="field"><label>背景底色</label><select id="bg"><option value="">透明</option><option value="#101014">深色 #101014</option><option value="#ffffff">白色</option></select></div>
+          <div class="field"><label>HUD 排版</label><select id="expMouseLayout" title="仅透明 HUD 模式下的键鼠排版"><option value="side">左右并排</option><option value="stack">上下叠放</option><option value="only">仅鼠标垫</option></select></div>
+        </div>
+        <button class="primary" type="button" style="width:100%;height:34px;font-weight:600" onclick="startExport()">开始导出</button>
+        <div class="row" style="gap:6px">
+          <button type="button" style="flex:1" onclick="openExportsFolder()">打开目录</button>
+          <button type="button" style="flex:1" onclick="cancelExport()">取消导出</button>
+        </div>
+        <div id="prog"><i></i></div>
+        <div id="log">—</div>
+      </div>
     </div>
   </div>
 
@@ -5725,47 +6732,13 @@ def workbench_html():
   <div class="card">
     <div class="row" style="justify-content:space-between">
       <span class="sub">导出键位（勾选控制导出与波形高亮）</span>
-      <div class="row" style="gap:6px">
+      <div class="seg">
         <button type="button" onclick="selectKeysPreset('all')">全选</button>
         <button type="button" onclick="selectKeysPreset('hud')">常用 HUD</button>
         <button type="button" onclick="selectKeysPreset('none')">清空</button>
       </div>
     </div>
     <div id="keyChips" class="key-chips"><span class="sub">加载录制后显示可选键位…</span></div>
-  </div>
-
-  <div class="card">
-    <div class="row">
-      <span class="sub">分辨率</span>
-      <select id="size">
-        <option value="1920x1080">1080p</option>
-        <option value="2560x1440">1440p</option>
-        <option value="3840x2160">4K</option>
-      </select>
-      <span class="sub">帧率</span>
-      <select id="fps"><option>30</option><option selected>60</option><option>120</option></select>
-      <span class="sub">倍速</span>
-      <select id="speed"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
-      <span class="sub">格式</span>
-      <select id="fmt">
-        <option value="webm" selected>WebM VP9（轻量透明）</option>
-        <option value="prores">ProRes 4444（透明 .mov）</option>
-        <option value="png">PNG 序列（透明）</option>
-      </select>
-      <span class="sub">背景</span>
-      <select id="bg"><option value="">透明</option><option value="#101014">深色 #101014</option><option value="#ffffff">白色</option></select>
-      <label class="kchip on" id="expMouseChip" style="margin:0"><input id="expMouse" type="checkbox" checked onchange="this.parentNode.classList.toggle('on',this.checked)">导出鼠标</label>
-      <select id="expMouseLayout" title="键鼠视频排版">
-        <option value="side">左右并排</option>
-        <option value="stack">上下叠放</option>
-        <option value="only">仅鼠标垫</option>
-      </select>
-      <span style="flex:1"></span>
-      <button class="primary" type="button" onclick="startExport()">开始导出</button>
-      <button type="button" onclick="cancelExport()">取消</button>
-    </div>
-    <div id="prog"><i></i></div>
-    <div id="log">—</div>
   </div>
 </div>
 
@@ -5789,37 +6762,106 @@ const CLUSTERS = {
 const HUD_DEFAULT_KEYS = new Set(['Q','W','E','R','A','S','D','LShift','LCtrl','LAlt','Space']);
 
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const bgCv = document.createElement('canvas'), bgCtx = bgCv.getContext('2d');
 const wbTrailCv = document.getElementById('wbTrail'), wbTrailCtx = wbTrailCv ? wbTrailCv.getContext('2d') : null;
 const RULER_H = 22, CV_H = 264;
-let info = null, data = null, analysis = null, view = [0, 1], sel = [0, 0], dragging = false, dragFrom = 0;
+let info = null, data = null, detailData = null, playData = null, analysis = null, view = [0, 1], sel = [0, 0], dragging = false, dragFrom = 0;
 let hoverT = null, playT = 0, playing = false, playLastMs = 0, showMouse = true, showDiag = true;
-let selectedKeys = new Set(), prevEls = {};
+let selectedKeys = new Set(), selectedNorm = new Set(), prevEls = {}, lastHoverHtml = '', lastPadAcc = '', wbTrailSized = false;
+let cvW = 800, cvDpr = 1, waveDirty = true, lodTimer = null, lodReqId = 0, playLodReqId = 0, playLodInflight = false, playLodTargetEnd = -1;
 
+function syncSelectedNorm() { selectedNorm = new Set(Array.from(selectedKeys).map(norm)); }
 function fmt(t) { return (t || 0).toFixed(3); }
 function activeTime() { return hoverT !== null ? hoverT : playT; }
 
 function fit() {
   const dpr = window.devicePixelRatio || 1;
   const r = cv.getBoundingClientRect();
-  cv.width = Math.max(200, Math.round(r.width * dpr));
-  cv.height = Math.round(CV_H * dpr);
+  cvW = Math.max(200, r.width);
+  cvDpr = dpr;
+  const pw = Math.round(cvW * dpr), ph = Math.round(CV_H * dpr);
+  cv.width = pw; cv.height = ph;
+  bgCv.width = pw; bgCv.height = ph;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  draw();
+  bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  waveDirty = true;
+  draw(true);
 }
 
-function xOf(t) {
-  const w = cv.getBoundingClientRect().width;
-  return (t - view[0]) / Math.max(1e-6, view[1] - view[0]) * w;
+function xOf(t) { return (t - view[0]) / Math.max(1e-6, view[1] - view[0]) * cvW; }
+function tOf(x) { return view[0] + x / Math.max(1, cvW) * (view[1] - view[0]); }
+
+function lowerBound(arr, target) {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid] < target) lo = mid + 1; else hi = mid;
+  }
+  return lo;
 }
-function tOf(x) {
-  const w = cv.getBoundingClientRect().width;
-  return view[0] + x / Math.max(1, w) * (view[1] - view[0]);
+function lowerBoundBy(arr, target, getT) {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (getT(arr[mid]) < target) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+function activeSeriesFor(t) {
+  if (playData && playData.ok && playData.t && playData.t.length &&
+      t >= (playData.view_start || 0) - 0.02 && t <= (playData.view_end || 0) + 0.02) {
+    return playData;
+  }
+  if (detailData && detailData.ok && detailData.t && detailData.t.length &&
+      t >= (detailData.view_start || 0) - 0.02 && t <= (detailData.view_end || 0) + 0.02) {
+    return detailData;
+  }
+  return data;
+}
+function ensurePlaybackHd(t, forceNow) {
+  if (!data || !data.ok || (data.step || 0) <= 0.025) return;
+  const dur = data.duration || 0;
+  if (dur <= 0) return;
+  const needHi = Math.min(dur, t + 4.0);
+  if (playData && playData.ok && (playData.step || 1) <= 0.025 &&
+      t >= (playData.view_start || 0) - 0.02 && needHi <= (playData.view_end || 0) + 0.02) {
+    return;
+  }
+  if (detailData && detailData.ok && (detailData.step || 1) <= 0.025 &&
+      t >= (detailData.view_start || 0) - 0.02 && needHi <= (detailData.view_end || 0) + 0.02) {
+    return;
+  }
+  if (playLodInflight && !forceNow) return;
+  if (playLodInflight && t <= playLodTargetEnd && t >= (playData ? (playData.view_start || 0) : 0)) return;
+  const reqId = ++playLodReqId;
+  const a = Math.max(0, t - 2.0);
+  const b = Math.min(dur, t + 18.0);
+  playLodInflight = true;
+  playLodTargetEnd = b;
+  const q = '?limit=2200&start=' + a.toFixed(3) + '&end=' + b.toFixed(3) +
+            (currentStamp ? ('&stamp=' + encodeURIComponent(currentStamp)) : '');
+  fetch('/wb/series' + q).then(r => r.json()).then(res => {
+    if (reqId !== playLodReqId) return;
+    playLodInflight = false;
+    if (res && res.ok) {
+      playData = res;
+      if (!playing || hoverT === null) renderPreviewAt(activeTime());
+    }
+  }).catch(() => { if (reqId === playLodReqId) playLodInflight = false; });
+}
+function activeWaveData() {
+  if (detailData && detailData.ok && detailData.t && detailData.t.length &&
+      (detailData.view_start || 0) <= view[0] + 0.05 && (detailData.view_end || 0) >= view[1] - 0.05) {
+    return detailData;
+  }
+  return data;
 }
 
 function sampleAt(t) {
   const out = {};
-  if (!data || !data.ok || !data.t || !data.t.length) return out;
-  const ts = data.t, n = ts.length;
+  const src = activeSeriesFor(t);
+  if (!src || !src.ok || !src.t || !src.t.length) return out;
+  const ts = src.t, n = ts.length;
   let lo = 0, hi = n - 1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
@@ -5829,8 +6871,8 @@ function sampleAt(t) {
   const j = Math.min(n - 1, i + 1);
   const dt = ts[j] - ts[i];
   const f = (dt > 1e-6 && dt <= 0.12 && t >= ts[i]) ? Math.max(0, Math.min(1, (t - ts[i]) / dt)) : 0;
-  for (const k of data.keys) {
-    const arr = data.v[k];
+  for (const k of src.keys) {
+    const arr = src.v[k];
     if (!arr) continue;
     const v = (f > 0) ? (arr[i] + (arr[j] - arr[i]) * f) : arr[i];
     out[k] = v;
@@ -5840,8 +6882,9 @@ function sampleAt(t) {
 }
 
 function sampleMouseAt(t) {
-  if (!data || !data.ok || !data.mouse || !data.t || !data.t.length) return null;
-  const ts = data.t, m = data.mouse, n = Math.min(ts.length, (m.x || []).length);
+  const src = activeSeriesFor(t);
+  if (!src || !src.ok || !src.mouse || !src.t || !src.t.length) return null;
+  const ts = src.t, m = src.mouse, n = Math.min(ts.length, (m.x || []).length);
   if (!n) return null;
   let lo = 0, hi = n - 1;
   while (lo <= hi) {
@@ -5854,7 +6897,7 @@ function sampleMouseAt(t) {
   const f = (dt > 1e-6 && dt <= 0.12 && t >= ts[i]) ? Math.max(0, Math.min(1, (t - ts[i]) / dt)) : 0;
   const x = f > 0 ? (m.x[i] + (m.x[j] - m.x[i]) * f) : m.x[i];
   const y = f > 0 ? (m.y[i] + (m.y[j] - m.y[i]) * f) : m.y[i];
-  return { x, y, b: (m.b && m.b[i]) || 0, w: (m.w && m.w[i]) || 0, spd: (m.spd && m.spd[i]) || 0, idx: i };
+  return { x, y, b: (m.b && m.b[i]) || 0, w: (m.w && m.w[i]) || 0, spd: (m.spd && m.spd[i]) || 0, idx: i, src };
 }
 
 function chooseTickStep(span, pxW) {
@@ -5865,66 +6908,68 @@ function chooseTickStep(span, pxW) {
   return 60;
 }
 
-function draw() {
-  const w = cv.getBoundingClientRect().width, h = CV_H;
-  ctx.clearRect(0, 0, w, h);
-  if (!data || !data.ok) {
-    ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.font = '13px sans-serif';
-    ctx.fillText(data && data.error ? ('读取失败：' + data.error) : '没有录制数据（请先在主监测页录制并停止）', 16, 44);
+function renderWaveCache() {
+  const w = cvW, h = CV_H, c = bgCtx;
+  c.clearRect(0, 0, w, h);
+  const src = activeWaveData();
+  if (!src || !src.ok) {
+    c.fillStyle = 'rgba(255,255,255,0.45)'; c.font = '13px sans-serif';
+    c.fillText(src && src.error ? ('读取失败：' + src.error) : '没有录制数据（请先在主监测页录制并停止）', 16, 44);
     return;
   }
   const span = Math.max(1e-3, view[1] - view[0]);
   const vs = document.getElementById('viewSpan');
-  if (vs) vs.textContent = fmt(view[0]) + 's — ' + fmt(view[1]) + 's';
+  if (vs) vs.textContent = fmt(view[0]) + 's — ' + fmt(view[1]) + 's' + (src === detailData ? ' · 高清' : '');
 
-  // Top adaptive time ruler + vertical grid
-  ctx.fillStyle = 'rgba(255,255,255,0.03)';
-  ctx.fillRect(0, 0, w, RULER_H);
-  ctx.strokeStyle = 'rgba(255,255,255,0.09)';
-  ctx.beginPath(); ctx.moveTo(0, RULER_H + 0.5); ctx.lineTo(w, RULER_H + 0.5); ctx.stroke();
+  c.fillStyle = 'rgba(255,255,255,0.03)';
+  c.fillRect(0, 0, w, RULER_H);
+  c.strokeStyle = 'rgba(255,255,255,0.09)';
+  c.beginPath(); c.moveTo(0, RULER_H + 0.5); c.lineTo(w, RULER_H + 0.5); c.stroke();
 
   const step = chooseTickStep(span, w);
   const firstTick = Math.ceil(view[0] / step) * step;
   const dec = step < 0.1 ? 2 : (step < 1 ? 1 : 0);
-  ctx.font = '10px ui-monospace, Consolas, monospace';
+  c.font = '10px ui-monospace, Consolas, monospace';
   for (let t = firstTick; t <= view[1] + 1e-6; t += step) {
     const x = Math.round(xOf(t)) + 0.5;
-    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-    ctx.beginPath(); ctx.moveTo(x, RULER_H); ctx.lineTo(x, h); ctx.stroke();
-    ctx.strokeStyle = 'rgba(255,255,255,0.28)';
-    ctx.beginPath(); ctx.moveTo(x, RULER_H - 6); ctx.lineTo(x, RULER_H); ctx.stroke();
-    ctx.fillStyle = 'rgba(255,255,255,0.52)';
-    ctx.fillText(t.toFixed(dec) + 's', x + 3, 13);
+    c.strokeStyle = 'rgba(255,255,255,0.05)';
+    c.beginPath(); c.moveTo(x, RULER_H); c.lineTo(x, h); c.stroke();
+    c.strokeStyle = 'rgba(255,255,255,0.28)';
+    c.beginPath(); c.moveTo(x, RULER_H - 6); c.lineTo(x, RULER_H); c.stroke();
+    c.fillStyle = 'rgba(255,255,255,0.52)';
+    c.fillText(t.toFixed(dec) + 's', x + 3, 13);
   }
 
-  // Selection band
   const x0 = xOf(sel[0]), x1 = xOf(sel[1]);
   if (sel[1] > sel[0]) {
-    ctx.fillStyle = 'rgba(56,189,248,0.13)';
-    ctx.fillRect(x0, RULER_H, Math.max(1, x1 - x0), h - RULER_H);
-    ctx.strokeStyle = 'rgba(56,189,248,0.85)';
-    ctx.beginPath();
-    ctx.moveTo(x0, RULER_H); ctx.lineTo(x0, h);
-    ctx.moveTo(x1, RULER_H); ctx.lineTo(x1, h);
-    ctx.stroke();
+    c.fillStyle = 'rgba(56,189,248,0.13)';
+    c.fillRect(x0, RULER_H, Math.max(1, x1 - x0), h - RULER_H);
+    c.strokeStyle = 'rgba(56,189,248,0.85)';
+    c.beginPath();
+    c.moveTo(x0, RULER_H); c.lineTo(x0, h);
+    c.moveTo(x1, RULER_H); c.lineTo(x1, h);
+    c.stroke();
   }
 
-  // FPS counter-strafe overlap (red) & clean (green) bands
   if (showDiag && analysis && analysis.ok && analysis.strafes && analysis.strafes.events) {
-    for (const ev of analysis.strafes.events) {
-      if (ev.t1 < view[0] || ev.t0 > view[1]) continue;
+    const sevs = analysis.strafes.events;
+    let si = lowerBoundBy(sevs, view[0], e => e.t1);
+    for (; si < sevs.length; si++) {
+      const ev = sevs[si];
+      if (ev.t0 > view[1]) break;
       const sx0 = xOf(ev.t0), sw = Math.max(2, xOf(ev.t1) - sx0);
       const isBad = ev.kind === 'overlap' && !ev.clean;
-      ctx.fillStyle = isBad ? 'rgba(244,63,94,0.22)' : (ev.clean ? 'rgba(52,211,153,0.16)' : 'rgba(251,191,36,0.16)');
-      ctx.fillRect(sx0, RULER_H, sw, h - RULER_H);
-      ctx.fillStyle = isBad ? '#f43f5e' : (ev.clean ? '#34d399' : '#fbbf24');
-      ctx.fillRect(sx0, RULER_H, sw, 3);
+      c.fillStyle = isBad ? 'rgba(244,63,94,0.22)' : (ev.clean ? 'rgba(52,211,153,0.16)' : 'rgba(251,191,36,0.16)');
+      c.fillRect(sx0, RULER_H, sw, h - RULER_H);
+      c.fillStyle = isBad ? '#f43f5e' : (ev.clean ? '#34d399' : '#fbbf24');
+      c.fillRect(sx0, RULER_H, sw, 3);
     }
   }
 
-  // Per-key tracks (+ optional bottom Mouse lane)
-  const keys = data.keys || [], n = keys.length;
-  const hasMouseLane = !!(showMouse && data.mouse && data.mouse.x && data.mouse.x.length);
+  const keys = src.keys || [], n = keys.length, ts = src.t || [];
+  const i0 = Math.max(0, lowerBound(ts, view[0]) - 1);
+  const i1 = Math.min(ts.length - 1, lowerBound(ts, view[1]));
+  const hasMouseLane = !!(showMouse && src.mouse && src.mouse.x && src.mouse.x.length);
   const MOUSE_H = hasMouseLane ? (n ? 34 : (h - RULER_H - 6)) : 0;
   const keyAreaH = h - RULER_H - 6 - MOUSE_H;
   const rowH = keyAreaH / Math.max(1, n);
@@ -5932,99 +6977,110 @@ function draw() {
   keys.forEach((k, row) => {
     const on = selectedKeys.has(k);
     const y = RULER_H + 3 + row * rowH, base = y + rowH - 3;
-    ctx.fillStyle = on ? 'rgba(255,255,255,0.78)' : 'rgba(255,255,255,0.24)';
-    ctx.fillText(disp(norm(k)), 5, y + 10);
-    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
-    ctx.beginPath(); ctx.moveTo(0, base); ctx.lineTo(w, base); ctx.stroke();
-    const vals = data.v[k] || [];
-    ctx.beginPath();
+    c.fillStyle = on ? 'rgba(255,255,255,0.78)' : 'rgba(255,255,255,0.24)';
+    c.fillText(disp(norm(k)), 5, y + 10);
+    c.strokeStyle = 'rgba(255,255,255,0.04)';
+    c.beginPath(); c.moveTo(0, base); c.lineTo(w, base); c.stroke();
+    const vals = src.v[k] || [];
+    c.beginPath();
     let started = false;
-    for (let i = 0; i < vals.length; i++) {
-      const t = data.t[i];
-      if (t < view[0] || t > view[1]) continue;
-      const x = xOf(t);
-      const yv = base - Math.min(1, vals[i] / FULL) * Math.max(6, rowH - 11);
-      if (!started) { ctx.moveTo(x, yv); started = true; } else ctx.lineTo(x, yv);
+    const scaleH = Math.max(6, rowH - 11);
+    for (let i = i0; i <= i1; i++) {
+      const x = xOf(ts[i]);
+      const yv = base - Math.min(1, vals[i] / FULL) * scaleH;
+      if (!started) { c.moveTo(x, yv); started = true; } else c.lineTo(x, yv);
     }
-    ctx.strokeStyle = on ? trackCols[row % trackCols.length] : 'rgba(255,255,255,0.16)';
-    ctx.lineWidth = on ? 1.35 : 0.8;
-    ctx.stroke();
+    c.strokeStyle = on ? trackCols[row % trackCols.length] : 'rgba(255,255,255,0.16)';
+    c.lineWidth = on ? 1.35 : 0.8;
+    c.stroke();
   });
 
   if (hasMouseLane) {
-    const m = data.mouse, my = RULER_H + 3 + keyAreaH, mBase = h - 4, mH = Math.max(12, MOUSE_H - 12);
-    ctx.strokeStyle = 'rgba(255,255,255,0.11)';
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(0, my + 0.5); ctx.lineTo(w, my + 0.5); ctx.stroke();
-    ctx.fillStyle = 'rgba(255,255,255,0.72)';
-    ctx.fillText('Mouse', 5, my + 11);
+    const m = src.mouse, my = RULER_H + 3 + keyAreaH, mBase = h - 4, mH = Math.max(12, MOUSE_H - 12);
+    c.strokeStyle = 'rgba(255,255,255,0.11)';
+    c.lineWidth = 1;
+    c.beginPath(); c.moveTo(0, my + 0.5); c.lineTo(w, my + 0.5); c.stroke();
+    c.fillStyle = 'rgba(255,255,255,0.72)';
+    c.fillText('Mouse', 5, my + 11);
     const spds = m.spd || [], bs = m.b || [], ws = m.w || [];
-    const nM = Math.min(data.t.length, spds.length);
+    const nM = Math.min(ts.length, spds.length);
+    const mi0 = Math.max(0, lowerBound(ts, view[0]) - 1);
+    const mi1 = Math.min(nM - 1, lowerBound(ts, view[1]));
     let maxS = 1.2;
-    for (let i = 0; i < nM; i++) if (spds[i] > maxS) maxS = spds[i];
+    for (let i = mi0; i <= mi1; i++) if (spds[i] > maxS) maxS = spds[i];
     maxS = Math.min(maxS, 5.0);
-    ctx.beginPath();
+    c.beginPath();
     let started = false, firstX = 0, lastX = 0;
-    for (let i = 0; i < nM; i++) {
-      const t = data.t[i];
-      if (t < view[0] || t > view[1]) continue;
-      const x = xOf(t);
+    for (let i = mi0; i <= mi1; i++) {
+      const x = xOf(ts[i]);
       const yv = mBase - Math.min(1, spds[i] / maxS) * mH;
-      if (!started) { ctx.moveTo(x, yv); firstX = x; started = true; } else ctx.lineTo(x, yv);
+      if (!started) { c.moveTo(x, yv); firstX = x; started = true; } else c.lineTo(x, yv);
       lastX = x;
     }
     if (started) {
-      ctx.strokeStyle = 'rgba(56,189,248,0.82)';
-      ctx.lineWidth = 1.25;
-      ctx.stroke();
-      ctx.lineTo(lastX, mBase); ctx.lineTo(firstX, mBase); ctx.closePath();
-      ctx.fillStyle = 'rgba(56,189,248,0.14)';
-      ctx.fill();
+      c.strokeStyle = 'rgba(56,189,248,0.82)';
+      c.lineWidth = 1.25;
+      c.stroke();
+      c.lineTo(lastX, mBase); c.lineTo(firstX, mBase); c.closePath();
+      c.fillStyle = 'rgba(56,189,248,0.14)';
+      c.fill();
     }
     const clicks = m.clicks, wheels = m.wheels;
     if (Array.isArray(clicks)) {
-      for (let i = 0; i < clicks.length; i++) {
-        const [ct, bit, durMs] = clicks[i];
+      let ci = lowerBoundBy(clicks, view[0] - 5.0, cl => cl[0]);
+      for (; ci < clicks.length; ci++) {
+        const [ct, bit, durMs] = clicks[ci];
+        if (ct > view[1]) break;
         const ctEnd = ct + (durMs || 0) / 1000;
-        if (ctEnd < view[0] || ct > view[1]) continue;
+        if (ctEnd < view[0]) continue;
         const x0m = xOf(ct), bw = Math.max(2, xOf(ctEnd) - x0m);
-        if (bit === 1) { ctx.fillStyle = 'rgba(244,63,94,0.84)'; ctx.fillRect(x0m, my + 2, bw, 5); }
-        else if (bit === 2) { ctx.fillStyle = 'rgba(251,191,36,0.84)'; ctx.fillRect(x0m, my + 8, bw, 4); }
-        else { ctx.fillStyle = 'rgba(52,211,153,0.84)'; ctx.fillRect(x0m, my + 13, bw, 3); }
+        if (bit === 1) { c.fillStyle = 'rgba(244,63,94,0.84)'; c.fillRect(x0m, my + 2, bw, 5); }
+        else if (bit === 2) { c.fillStyle = 'rgba(251,191,36,0.84)'; c.fillRect(x0m, my + 8, bw, 4); }
+        else { c.fillStyle = 'rgba(52,211,153,0.84)'; c.fillRect(x0m, my + 13, bw, 3); }
       }
       if (Array.isArray(wheels)) {
-        ctx.fillStyle = 'rgba(125,211,252,0.88)';
-        for (let i = 0; i < wheels.length; i++) {
-          const tw = wheels[i][0];
-          if (tw < view[0] || tw > view[1]) continue;
-          ctx.fillRect(xOf(tw), my + 13, 2, 4);
+        c.fillStyle = 'rgba(125,211,252,0.88)';
+        let wi = lowerBoundBy(wheels, view[0], wh => wh[0]);
+        for (; wi < wheels.length; wi++) {
+          const tw = wheels[wi][0];
+          if (tw > view[1]) break;
+          c.fillRect(xOf(tw), my + 13, 2, 4);
         }
       }
     } else {
-      for (let i = 0; i < nM; i++) {
-        const t = data.t[i];
-        if (t < view[0] || t > view[1]) continue;
+      for (let i = mi0; i <= mi1; i++) {
         const b = bs[i] || 0, wh = ws[i] || 0;
         if (!b && !wh) continue;
-        const x0m = xOf(t), x1m = i + 1 < nM ? xOf(data.t[i + 1]) : x0m + 2;
+        const x0m = xOf(ts[i]), x1m = i + 1 < nM ? xOf(ts[i + 1]) : x0m + 2;
         const bw = Math.max(2, x1m - x0m);
-        if (b & 1) { ctx.fillStyle = 'rgba(244,63,94,0.78)'; ctx.fillRect(x0m, my + 2, bw, 5); }
-        if (b & 2) { ctx.fillStyle = 'rgba(251,191,36,0.78)'; ctx.fillRect(x0m, my + 8, bw, 4); }
-        if ((b & 28) || wh) { ctx.fillStyle = 'rgba(52,211,153,0.78)'; ctx.fillRect(x0m, my + 13, bw, 3); }
+        if (b & 1) { c.fillStyle = 'rgba(244,63,94,0.78)'; c.fillRect(x0m, my + 2, bw, 5); }
+        if (b & 2) { c.fillStyle = 'rgba(251,191,36,0.78)'; c.fillRect(x0m, my + 8, bw, 4); }
+        if ((b & 28) || wh) { c.fillStyle = 'rgba(52,211,153,0.78)'; c.fillRect(x0m, my + 13, bw, 3); }
       }
     }
-    // Moving-shot warning triangles along top edge of Mouse lane
     if (showDiag && analysis && analysis.ok && analysis.shots && analysis.shots.all) {
-      ctx.fillStyle = '#fb923c';
-      for (const s of analysis.shots.all) {
-        if (s[2] || s[0] < view[0] || s[0] > view[1]) continue;
+      c.fillStyle = '#fb923c';
+      const shAll = analysis.shots.all;
+      let shi = lowerBoundBy(shAll, view[0], s => s[0]);
+      for (; shi < shAll.length; shi++) {
+        const s = shAll[shi];
+        if (s[0] > view[1]) break;
+        if (s[2]) continue;
         const sx = xOf(s[0]);
-        ctx.beginPath(); ctx.moveTo(sx, my + 1); ctx.lineTo(sx - 4, my - 5); ctx.lineTo(sx + 4, my - 5); ctx.closePath(); ctx.fill();
+        c.beginPath(); c.moveTo(sx, my + 1); c.lineTo(sx - 4, my - 5); c.lineTo(sx + 4, my - 5); c.closePath(); c.fill();
       }
     }
   }
+}
 
-  // Playhead + Hover cursor
+function draw(forceWave) {
+  if (forceWave || waveDirty) {
+    renderWaveCache();
+    waveDirty = false;
+  }
+  const w = cvW, h = CV_H;
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(bgCv, 0, 0, w, h);
   if (playT >= view[0] && playT <= view[1]) {
     const px = Math.round(xOf(playT)) + 0.5;
     ctx.strokeStyle = playing ? '#f43f5e' : 'rgba(244,63,94,0.55)';
@@ -6041,6 +7097,37 @@ function draw() {
   }
 }
 
+function scheduleLodFetch() {
+  clearTimeout(lodTimer);
+  if (!data || !data.ok || (data.step || 0) <= 0.025) return;
+  const dur = data.duration || 1;
+  const span = Math.max(0.05, view[1] - view[0]);
+  if (span >= dur * 0.7) {
+    if (detailData) { detailData = null; draw(true); }
+    return;
+  }
+  const wantStep = Math.max(0.015, span / 1200);
+  if (detailData && detailData.ok &&
+      (detailData.view_start || 0) <= view[0] + 0.02 &&
+      (detailData.view_end || 0) >= view[1] - 0.02 &&
+      (detailData.step || 1) <= wantStep) {
+    return;
+  }
+  lodTimer = setTimeout(() => {
+    const reqId = ++lodReqId;
+    const pad = Math.min(8, Math.max(0.5, span * 0.2));
+    const a = Math.max(0, view[0] - pad).toFixed(3);
+    const b = Math.min(dur, view[1] + pad).toFixed(3);
+    const q = '?limit=2000&start=' + a + '&end=' + b + (currentStamp ? ('&stamp=' + encodeURIComponent(currentStamp)) : '');
+    fetch('/wb/series' + q).then(r => r.json()).then(res => {
+      if (reqId !== lodReqId || !res || !res.ok) return;
+      detailData = res;
+      draw(true);
+      renderPreviewAt(activeTime());
+    }).catch(() => {});
+  }, 140);
+}
+
 function setSel(a, b, skipInputs) {
   const dur = (data && data.ok) ? data.duration : Math.max(a, b, 0);
   const lo = Math.max(0, Math.min(dur, Math.min(a, b)));
@@ -6052,7 +7139,11 @@ function setSel(a, b, skipInputs) {
   }
   document.getElementById('sel_len').textContent = fmt(sel[1] - sel[0]);
   if (playT < sel[0] || playT > sel[1]) playT = sel[0];
-  draw();
+  draw(true);
+  if (!dragging) {
+    ensurePlaybackHd(activeTime(), true);
+    syncVideoToPlayT();
+  }
   renderPreviewAt(activeTime());
 }
 
@@ -6079,14 +7170,20 @@ cv.addEventListener('mousemove', e => {
   const t = Math.max(0, Math.min(data && data.ok ? data.duration : 0, tOf(e.offsetX)));
   hoverT = t;
   if (dragging) setSel(dragFrom, t);
-  else { draw(); renderPreviewAt(t); }
+  else { draw(false); renderPreviewAt(t); }
 });
 cv.addEventListener('mouseleave', () => {
   hoverT = null;
-  draw();
+  draw(false);
   renderPreviewAt(playT);
 });
-window.addEventListener('mouseup', () => { dragging = false; });
+window.addEventListener('mouseup', () => {
+  if (dragging) {
+    dragging = false;
+    ensurePlaybackHd(activeTime(), true);
+    syncVideoToPlayT();
+  }
+});
 cv.addEventListener('dblclick', () => setSel(0, 0));
 cv.addEventListener('wheel', e => {
   e.preventDefault();
@@ -6096,16 +7193,18 @@ cv.addEventListener('wheel', e => {
   const a = Math.max(0, pivot - (pivot - view[0]) * z);
   const b = Math.min(dur, pivot + (view[1] - pivot) * z);
   if (b - a >= 0.05) view = [a, b];
-  draw();
+  draw(true);
+  scheduleLodFetch();
 }, { passive: false });
 
 function zoom(f) {
   const dur = (data && data.ok) ? data.duration : 1;
   const mid = (view[0] + view[1]) / 2, half = Math.max(0.05, (view[1] - view[0]) / 2 * f);
   view = [Math.max(0, mid - half), Math.min(dur, mid + half)];
-  draw();
+  draw(true);
+  scheduleLodFetch();
 }
-function resetView() { view = [0, data && data.ok ? data.duration : 1]; draw(); }
+function resetView() { view = [0, data && data.ok ? data.duration : 1]; detailData = null; draw(true); }
 
 function buildPreviewKb() {
   const lay = document.getElementById('layout').value || 'hud';
@@ -6120,8 +7219,8 @@ function buildPreviewKb() {
   const stW = stage ? stage.clientWidth : 800;
   const padReserve = (showMouse && stW > 560) ? 252 : 0;
   const availW = Math.max(240, stW - 24 - padReserve);
-  const baseU = lay === 'full' ? 38 : 50;
-  const u = Math.max(24, Math.min(baseU, Math.floor(availW / (maxX + 0.2))));
+  const baseU = lay === 'full' ? (vidInfo ? 30 : 38) : (vidInfo ? 42 : 50);
+  const u = vidInfo ? baseU : Math.max(24, Math.min(baseU, Math.floor(availW / (maxX + 0.2))));
   const gap = Math.max(4, Math.round(u * 0.11));
   document.documentElement.style.setProperty('--u', u + 'px');
   host.style.width = Math.max(1, Math.round(maxX * u - gap)) + 'px';
@@ -6139,6 +7238,7 @@ function buildPreviewKb() {
     host.appendChild(d);
     prevEls[it.k] = { box: d, fill: d.children[0], mm: d.children[2] };
   }
+  applyStageLayout();
   renderPreviewAt(activeTime());
 }
 
@@ -6150,29 +7250,37 @@ function toggleWbMouse() {
   const wrap = document.getElementById('wbPadWrap');
   if (wrap) wrap.classList.toggle('off', !showMouse);
   buildPreviewKb();
-  draw();
+  draw(true);
 }
 
+const elCurT = document.getElementById('cur_t'), elHoverRead = document.getElementById('hoverRead');
+const elTheme = document.getElementById('theme'), elPad = document.getElementById('wbPad');
+const elMouse = document.getElementById('wbMouse'), elMouseEmpty = document.getElementById('wbMouseEmpty');
+const elMbL = document.getElementById('wbMbL'), elMbR = document.getElementById('wbMbR');
+const elMbM = document.getElementById('wbMbM'), elMbX1 = document.getElementById('wbMbX1');
+const elMbX2 = document.getElementById('wbMbX2'), elMbLed = document.getElementById('wbMbLed');
+
 function renderMousePreviewAt(t) {
-  const pad = document.getElementById('wbPad');
-  const mEl = document.getElementById('wbMouse');
-  const emptyEl = document.getElementById('wbMouseEmpty');
-  if (!pad || !mEl) return;
-  const preset = FILL_PRESETS[document.getElementById('theme').value] || FILL_PRESETS.ramp;
+  if (!elPad || !elMouse) return;
+  const preset = FILL_PRESETS[(elTheme && elTheme.value) || 'ramp'] || FILL_PRESETS.ramp;
   const acc = preset.style(0.78).line || '#38bdf8';
-  pad.style.setProperty('--acc', acc);
+  if (acc !== lastPadAcc) {
+    lastPadAcc = acc;
+    elPad.style.setProperty('--acc', acc);
+  }
   if (!showMouse) return;
   const ms = sampleMouseAt(t);
   const hasData = !!ms;
-  if (emptyEl) emptyEl.classList.toggle('on', !hasData);
-  mEl.style.display = hasData ? '' : 'none';
+  if (elMouseEmpty) elMouseEmpty.classList.toggle('on', !hasData);
+  elMouse.style.display = hasData ? '' : 'none';
   const PW = 220, PH = 182, MW = 32, MH = 60, IN = 7;
   if (wbTrailCv && wbTrailCtx) {
     const dpr = window.devicePixelRatio || 1;
-    if (wbTrailCv.width !== Math.round(PW * dpr) || wbTrailCv.height !== Math.round(PH * dpr)) {
+    if (!wbTrailSized || wbTrailCv.width !== Math.round(PW * dpr) || wbTrailCv.height !== Math.round(PH * dpr)) {
       wbTrailCv.width = Math.round(PW * dpr); wbTrailCv.height = Math.round(PH * dpr);
+      wbTrailCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      wbTrailSized = true;
     }
-    wbTrailCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     wbTrailCtx.clearRect(0, 0, PW, PH);
   }
   if (!hasData) return;
@@ -6181,16 +7289,17 @@ function renderMousePreviewAt(t) {
     IN + MH / 2 + (ny + 1) * 0.5 * (PH - MH - IN * 2)
   ];
   const [cx, cy] = toXY(ms.x, ms.y);
-  mEl.style.transform = 'translate(' + (cx - MW / 2).toFixed(1) + 'px,' + (cy - MH / 2).toFixed(1) + 'px)';
+  elMouse.style.transform = 'translate(' + (cx - MW / 2).toFixed(1) + 'px,' + (cy - MH / 2).toFixed(1) + 'px)';
   const b = ms.b || 0;
-  document.getElementById('wbMbL').classList.toggle('on', !!(b & 1));
-  document.getElementById('wbMbR').classList.toggle('on', !!(b & 2));
-  document.getElementById('wbMbM').classList.toggle('on', !!((b & 4) || ms.w !== 0));
-  document.getElementById('wbMbX1').classList.toggle('on', !!(b & 8));
-  document.getElementById('wbMbX2').classList.toggle('on', !!(b & 16));
-  document.getElementById('wbMbLed').classList.toggle('hot', b !== 0 || ms.spd > 0.25);
-  if (wbTrailCtx && data.t && data.mouse) {
-    const ts = data.t, mx = data.mouse.x, my = data.mouse.y, win = 0.55;
+  if (elMbL) elMbL.classList.toggle('on', !!(b & 1));
+  if (elMbR) elMbR.classList.toggle('on', !!(b & 2));
+  if (elMbM) elMbM.classList.toggle('on', !!((b & 4) || ms.w !== 0));
+  if (elMbX1) elMbX1.classList.toggle('on', !!(b & 8));
+  if (elMbX2) elMbX2.classList.toggle('on', !!(b & 16));
+  if (elMbLed) elMbLed.classList.toggle('hot', b !== 0 || ms.spd > 0.25);
+  const src = ms.src || data;
+  if (wbTrailCtx && src && src.t && src.mouse) {
+    const ts = src.t, mx = src.mouse.x, my = src.mouse.y, win = 0.55;
     let k0 = ms.idx;
     while (k0 > 0 && (t - ts[k0 - 1]) <= win) k0--;
     let prev = null;
@@ -6217,12 +7326,128 @@ function renderMousePreviewAt(t) {
   }
 }
 
+let vidInfo = null, videoOffset = 0.0, syncingVid = false, syncVidTimer = null, loopSelection = false, saveStageTimer = null;
+let stageCfg = { kb: { x: 0.03, y: 0.66, scale: 0.85, alpha: 0.72 }, mouse: { x: 0.76, y: 0.64, scale: 0.90, alpha: 0.55, mopacity: 0.85 } };
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function applyStageLayout() {
+  const stage = document.getElementById('prevStage');
+  const kbL = document.getElementById('kbLayer'), msL = document.getElementById('msLayer');
+  const kbEl = document.getElementById('kbPrev'), padEl = document.getElementById('wbPad'), msEl = document.getElementById('wbMouse');
+  if (!stage || !kbL || !msL) return;
+  if (!vidInfo) {
+    kbL.style.left = ''; kbL.style.top = ''; kbL.style.transform = '';
+    msL.style.left = ''; msL.style.top = ''; msL.style.transform = '';
+    if (kbEl) kbEl.style.opacity = '';
+    if (padEl) padEl.style.background = '';
+    if (msEl) msEl.style.opacity = '';
+    return;
+  }
+  const sw = Math.max(1, stage.clientWidth), sh = Math.max(1, stage.clientHeight);
+  kbL.style.left = (clamp(stageCfg.kb.x, 0, 0.94) * sw).toFixed(1) + 'px';
+  kbL.style.top = (clamp(stageCfg.kb.y, 0, 0.94) * sh).toFixed(1) + 'px';
+  kbL.style.transform = 'scale(' + clamp(stageCfg.kb.scale, 0.35, 2.5).toFixed(3) + ')';
+  msL.style.left = (clamp(stageCfg.mouse.x, 0, 0.94) * sw).toFixed(1) + 'px';
+  msL.style.top = (clamp(stageCfg.mouse.y, 0, 0.94) * sh).toFixed(1) + 'px';
+  msL.style.transform = 'scale(' + clamp(stageCfg.mouse.scale, 0.35, 2.5).toFixed(3) + ')';
+  const ka = stageCfg.kb.alpha != null ? stageCfg.kb.alpha : 0.72;
+  const ma = stageCfg.mouse.alpha != null ? stageCfg.mouse.alpha : 0.55;
+  const mp = stageCfg.mouse.mopacity != null ? stageCfg.mouse.mopacity : 0.85;
+  if (kbEl) kbEl.style.opacity = String(ka);
+  if (padEl) padEl.style.background = 'rgba(14,16,20,' + ma.toFixed(2) + ')';
+  if (msEl) msEl.style.opacity = String(mp);
+  const s1 = document.getElementById('stKbAlpha'), s2 = document.getElementById('stMsAlpha'), s3 = document.getElementById('stMsBody');
+  if (s1) s1.value = String(ka);
+  if (s2) s2.value = String(ma);
+  if (s3) s3.value = String(mp);
+  const v1 = document.getElementById('stKbAlphaVal'), v2 = document.getElementById('stMsAlphaVal'), v3 = document.getElementById('stMsBodyVal');
+  if (v1) v1.textContent = Math.round(ka * 100) + '%';
+  if (v2) v2.textContent = Math.round(ma * 100) + '%';
+  if (v3) v3.textContent = Math.round(mp * 100) + '%';
+}
+
+function onStageOpacityChange() {
+  const s1 = document.getElementById('stKbAlpha'), s2 = document.getElementById('stMsAlpha'), s3 = document.getElementById('stMsBody');
+  if (s1) stageCfg.kb.alpha = parseFloat(s1.value) || 0.72;
+  if (s2) stageCfg.mouse.alpha = parseFloat(s2.value) || 0.55;
+  if (s3) stageCfg.mouse.mopacity = parseFloat(s3.value) || 0.85;
+  applyStageLayout();
+  saveStageSoon();
+}
+
+function saveStageSoon() {
+  clearTimeout(saveStageTimer);
+  saveStageTimer = setTimeout(() => {
+    fetch('/wb/video/layout', {
+      method: 'POST', headers: { 'X-Depth-Token': window.__token || '' },
+      body: JSON.stringify(stageCfg)
+    }).catch(() => {});
+  }, 180);
+}
+
+function resetStageLayout() {
+  stageCfg = { kb: { x: 0.03, y: 0.66, scale: 0.85, alpha: 0.72 }, mouse: { x: 0.76, y: 0.64, scale: 0.90, alpha: 0.55, mopacity: 0.85 } };
+  applyStageLayout();
+  saveStageSoon();
+}
+
+function initHudDrag() {
+  const stage = document.getElementById('prevStage');
+  const gV = document.getElementById('guideV'), gH = document.getElementById('guideH');
+  for (const [id, key] of [['kbLayer', 'kb'], ['msLayer', 'mouse']]) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.addEventListener('pointerdown', ev => {
+      if (!vidInfo || ev.button !== 0) return;
+      ev.preventDefault(); ev.stopPropagation();
+      const isScale = ev.target && ev.target.classList && ev.target.classList.contains('hud-handle');
+      const sw = Math.max(1, stage.clientWidth), sh = Math.max(1, stage.clientHeight);
+      const sx = ev.clientX, sy = ev.clientY;
+      const orig = Object.assign({}, stageCfg[key]);
+      const baseW = Math.max(40, el.offsetWidth), baseH = Math.max(40, el.offsetHeight);
+      el.classList.add('dragging');
+      if (el.setPointerCapture) try { el.setPointerCapture(ev.pointerId); } catch (e) {}
+      const onMove = mv => {
+        const dx = mv.clientX - sx, dy = mv.clientY - sy;
+        if (isScale) {
+          stageCfg[key].scale = clamp(orig.scale + (dx + dy) / 220, 0.35, 2.4);
+        } else {
+          let nx = clamp(orig.x + dx / sw, 0.0, 0.94);
+          let ny = clamp(orig.y + dy / sh, 0.0, 0.94);
+          const cx = nx + (baseW * stageCfg[key].scale * 0.5) / sw;
+          const cy = ny + (baseH * stageCfg[key].scale * 0.5) / sh;
+          const snapV = Math.abs(cx - 0.5) < 0.015;
+          const snapH = Math.abs(cy - 0.5) < 0.015;
+          if (snapV) nx = 0.5 - (baseW * stageCfg[key].scale * 0.5) / sw;
+          if (snapH) ny = 0.5 - (baseH * stageCfg[key].scale * 0.5) / sh;
+          if (Math.abs(nx - 0.03) < 0.012) nx = 0.03;
+          if (Math.abs(ny - 0.04) < 0.012) ny = 0.04;
+          if (gV) gV.classList.toggle('on', snapV);
+          if (gH) gH.classList.toggle('on', snapH);
+          stageCfg[key].x = clamp(nx, 0.0, 0.94);
+          stageCfg[key].y = clamp(ny, 0.0, 0.94);
+        }
+        applyStageLayout();
+      };
+      const onUp = () => {
+        el.classList.remove('dragging');
+        if (gV) gV.classList.remove('on');
+        if (gH) gH.classList.remove('on');
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        saveStageSoon();
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    });
+  }
+}
+
 function renderPreviewAt(t) {
-  const curEl = document.getElementById('cur_t');
-  if (curEl) curEl.textContent = fmt(t) + ' s';
+  if (elCurT) elCurT.textContent = fmt(t) + ' s';
   const vals = sampleAt(t);
-  const preset = FILL_PRESETS[document.getElementById('theme').value] || FILL_PRESETS.ramp;
-  const selectedNorm = new Set(Array.from(selectedKeys).map(norm));
+  const preset = FILL_PRESETS[(elTheme && elTheme.value) || 'ramp'] || FILL_PRESETS.ramp;
   const hasSel = selectedKeys.size > 0;
 
   for (const name in prevEls) {
@@ -6243,8 +7468,7 @@ function renderPreviewAt(t) {
 
   renderMousePreviewAt(t);
 
-  const hr = document.getElementById('hoverRead');
-  if (hr && data && data.ok) {
+  if (elHoverRead && data && data.ok) {
     const activeList = data.keys
       .filter(k => selectedKeys.has(k) && (vals[k] || 0) > 0.03)
       .sort((a, b) => (vals[b] || 0) - (vals[a] || 0));
@@ -6260,37 +7484,96 @@ function renderPreviewAt(t) {
       if (ms.w > 0) chips.push('<span class="hk m">滚轮↑' + (ms.w > 1 ? ('×' + ms.w) : '') + '</span>');
       if (ms.w < 0) chips.push('<span class="hk m">滚轮↓' + (ms.w < -1 ? ('×' + (-ms.w)) : '') + '</span>');
     }
-    hr.innerHTML = chips.length ? chips.join('') : '<span style="color:var(--dim)">当前时刻无按下键</span>';
+    const html = chips.length ? chips.join('') : '<span style="color:var(--dim)">当前时刻无按下键</span>';
+    if (html !== lastHoverHtml) {
+      lastHoverHtml = html;
+      elHoverRead.innerHTML = html;
+    }
   }
 }
 
-function togglePlay() {
-  if (!data || !data.ok) return;
-  playing = !playing;
+function setPlayUI(on) {
+  playing = !!on;
   const btn = document.getElementById('playBtn');
   if (btn) {
     btn.classList.toggle('on', playing);
     btn.textContent = playing ? '⏸ 暂停试播' : '▶ 试播选区';
   }
-  if (playing) {
-    const lo = sel[1] > sel[0] ? sel[0] : 0;
-    const hi = sel[1] > sel[0] ? sel[1] : data.duration;
-    if (playT < lo || playT >= hi) playT = lo;
+}
+
+function selValidForVideo() {
+  if (!(sel[1] > sel[0])) return false;
+  if (!vidInfo) return true;
+  const vDur = vidInfo.duration || (document.getElementById('wbVideo') || {}).duration || 0;
+  return sel[1] > videoOffset + 0.05 && sel[0] < videoOffset + vDur - 0.05;
+}
+
+function syncVideoToPlayT() {
+  const v = document.getElementById('wbVideo');
+  if (!vidInfo || !v || !v.src || syncingVid) return;
+  const vt = clamp(playT - videoOffset, 0, Math.max(0, (vidInfo.duration || v.duration || 0) - 0.02));
+  if (Math.abs((v.currentTime || 0) - vt) > 0.04) {
+    syncingVid = true;
+    clearTimeout(syncVidTimer);
+    try { v.currentTime = vt; } catch (e) {}
+    syncVidTimer = setTimeout(() => { syncingVid = false; }, 250);
+  }
+}
+
+function togglePlay() {
+  if (!data || !data.ok) return;
+  const v = document.getElementById('wbVideo');
+  const next = !playing;
+  if (next) {
+    const useSel = selValidForVideo();
+    loopSelection = useSel;
+    const vDur = vidInfo ? (vidInfo.duration || (v && v.duration) || data.duration) : data.duration;
+    const lo = useSel ? (vidInfo ? Math.max(sel[0], videoOffset) : sel[0]) : 0;
+    const hi = useSel ? (vidInfo ? Math.min(sel[1], videoOffset + vDur) : sel[1]) : data.duration;
+    if (useSel && (playT < lo || playT >= hi)) playT = lo;
+    ensurePlaybackHd(playT, true);
+    if (vidInfo && v && v.src) {
+      if (useSel) syncVideoToPlayT();
+      else playT = clamp((v.currentTime || 0) + videoOffset, 0, data.duration || 1e9);
+      v.playbackRate = Number(document.getElementById('speed').value) || 1;
+      setPlayUI(true);
+      v.play().catch(() => { setPlayUI(false); });
+    } else {
+      setPlayUI(true);
+    }
     playLastMs = performance.now();
     requestAnimationFrame(playLoop);
+  } else {
+    loopSelection = false;
+    setPlayUI(false);
+    if (vidInfo && v && !v.paused) v.pause();
   }
 }
 
 function playLoop(now) {
   if (!playing || !data || !data.ok) return;
-  const dt = Math.min(0.1, (now - playLastMs) / 1000);
-  playLastMs = now;
   const spd = Number(document.getElementById('speed').value) || 1;
-  const lo = sel[1] > sel[0] ? sel[0] : 0;
-  const hi = sel[1] > sel[0] ? sel[1] : data.duration;
-  playT += dt * spd;
-  if (playT > hi) playT = lo;
-  draw();
+  const useSel = loopSelection && selValidForVideo();
+  const v = document.getElementById('wbVideo');
+  const vDur = vidInfo ? (vidInfo.duration || (v && v.duration) || data.duration) : data.duration;
+  const lo = useSel ? (vidInfo ? Math.max(sel[0], videoOffset) : sel[0]) : 0;
+  const hi = useSel ? (vidInfo ? Math.min(sel[1], videoOffset + vDur) : sel[1]) : data.duration;
+  if (vidInfo && v && !v.paused && !v.seeking) {
+    v.playbackRate = spd;
+    playT = clamp((v.currentTime || 0) + videoOffset, 0, data.duration || 1e9);
+    if (useSel && playT >= hi) {
+      playT = lo;
+      syncVideoToPlayT();
+    }
+    ensurePlaybackHd(playT, false);
+  } else if (!(vidInfo && v && !v.paused)) {
+    const dt = Math.min(0.1, (now - playLastMs) / 1000);
+    playT += dt * spd;
+    if (playT > hi) { playT = lo; ensurePlaybackHd(playT, true); }
+    else { ensurePlaybackHd(playT, false); }
+  }
+  playLastMs = now;
+  draw(false);
   if (hoverT === null) renderPreviewAt(playT);
   requestAnimationFrame(playLoop);
 }
@@ -6312,8 +7595,9 @@ function renderKeyChips() {
     cb.checked = checked;
     cb.addEventListener('change', () => {
       if (cb.checked) selectedKeys.add(k); else selectedKeys.delete(k);
+      syncSelectedNorm();
       lbl.classList.toggle('on', cb.checked);
-      draw();
+      draw(true);
       renderPreviewAt(activeTime());
     });
     lbl.appendChild(cb);
@@ -6331,8 +7615,9 @@ function selectKeysPreset(mode) {
     for (const k of info.keys) if (HUD_DEFAULT_KEYS.has(norm(k))) selectedKeys.add(k);
     if (!selectedKeys.size) for (const k of info.keys) selectedKeys.add(k);
   }
+  syncSelectedNorm();
   renderKeyChips();
-  draw();
+  draw(true);
   renderPreviewAt(activeTime());
 }
 
@@ -6434,6 +7719,12 @@ function loadList(preferredStamp) {
 
 function load(stamp) {
   if (playing) togglePlay();
+  detailData = null;
+  playData = null;
+  lodReqId++;
+  playLodReqId++;
+  playLodInflight = false;
+  playLodTargetEnd = -1;
   const qs = stamp ? ('?stamp=' + encodeURIComponent(stamp)) : '';
   fetch('/wb/info' + qs).then(r => r.json()).then(j => {
     info = j;
@@ -6442,7 +7733,7 @@ function load(stamp) {
       document.getElementById('r_dur').textContent = '—';
       document.getElementById('r_n').textContent = '—';
       document.getElementById('log').textContent = j.error || '没有录制';
-      data = j; selectedKeys.clear(); renderKeyChips(); draw(); buildPreviewKb(); return;
+      data = j; selectedKeys.clear(); syncSelectedNorm(); renderKeyChips(); draw(true); buildPreviewKb(); return;
     }
     currentStamp = j.stamp || stamp || '';
     document.getElementById('r_stamp').textContent = currentStamp || '—';
@@ -6450,18 +7741,32 @@ function load(stamp) {
     document.getElementById('r_n').textContent = j.samples;
     renderHistoryUI();
     selectedKeys = new Set(j.keys || []);
+    syncSelectedNorm();
     renderKeyChips();
     const sq = '?step=0.02' + (currentStamp ? ('&stamp=' + encodeURIComponent(currentStamp)) : '');
     fetch('/wb/series' + sq).then(r => r.json()).then(k => {
       data = k;
       if (k.ok) {
         view = [0, k.duration];
-        playT = 0;
-        hoverT = null;
-        setSel(0, Math.min(k.duration, 5));
+        const v = document.getElementById('wbVideo');
+        if (vidInfo && v) {
+          if (!selValidForVideo()) {
+            sel = [0, 0];
+            document.getElementById('sel_start').value = '0.000';
+            document.getElementById('sel_end').value = '0.000';
+            document.getElementById('sel_len').textContent = '0.000';
+          }
+          playT = clamp((v.currentTime || 0) + videoOffset, 0, k.duration);
+          hoverT = null;
+          ensurePlaybackHd(playT, true);
+        } else {
+          playT = 0;
+          hoverT = null;
+          setSel(0, Math.min(k.duration, 5));
+        }
       }
       buildPreviewKb();
-      draw();
+      draw(true);
       loadAnalysis();
     });
   });
@@ -6472,7 +7777,7 @@ function toggleDiag() {
   showDiag = cb ? cb.checked : true;
   const chip = document.getElementById('showDiagChip');
   if (chip) chip.classList.toggle('on', showDiag);
-  draw();
+  draw(true);
 }
 
 function jumpToMoment(t) {
@@ -6483,7 +7788,10 @@ function jumpToMoment(t) {
   hoverT = null;
   const half = Math.min(0.8, Math.max(0.25, dur * 0.2));
   view = [Math.max(0, playT - half), Math.min(dur, playT + half)];
-  draw();
+  draw(true);
+  ensurePlaybackHd(playT, true);
+  syncVideoToPlayT();
+  scheduleLodFetch();
   renderPreviewAt(playT);
 }
 
@@ -6494,7 +7802,7 @@ function loadAnalysis() {
   fetch('/wb/analysis' + q).then(r => r.json()).then(j => {
     analysis = j;
     renderAnalysis();
-    draw();
+    draw(true);
   }).catch(() => { analysis = null; renderAnalysis(); });
 }
 
@@ -6752,19 +8060,57 @@ function onWbFullChange(v) {
   setFullMm(v);
   const el = document.getElementById('wbFull');
   if (el) el.value = FULL.toFixed(2);
-  draw();
+  draw(true);
   renderPreviewAt(activeTime());
+}
+
+function getStageBoxes() {
+  const stage = document.getElementById('prevStage');
+  const kbL = document.getElementById('kbLayer'), msL = document.getElementById('msLayer');
+  if (!vidInfo || !stage || !kbL || !msL) return {};
+  const sr = stage.getBoundingClientRect();
+  let vx = 0, vy = 0, vw = sr.width, vh = sr.height;
+  const aspect = (vidInfo.width && vidInfo.height) ? (vidInfo.width / vidInfo.height) : (16 / 9);
+  if (sr.width / Math.max(1, sr.height) > aspect) {
+    vw = sr.height * aspect;
+    vx = (sr.width - vw) * 0.5;
+  } else {
+    vh = sr.width / aspect;
+    vy = (sr.height - vh) * 0.5;
+  }
+  const normRect = (el) => {
+    const r = el.getBoundingClientRect();
+    return [
+      clamp((r.left - sr.left - vx) / Math.max(1, vw), 0, 0.96),
+      clamp((r.top - sr.top - vy) / Math.max(1, vh), 0, 0.96),
+      clamp(r.width / Math.max(1, vw), 0.04, 1.0),
+      clamp(r.height / Math.max(1, vh), 0.04, 1.0),
+    ];
+  };
+  return { kb_box: normRect(kbL), mouse_box: normRect(msL) };
+}
+
+function openExportsFolder() {
+  fetch('/wb/export/open', { method: 'POST', headers: { 'X-Depth-Token': window.__token || '' } }).catch(() => {});
 }
 
 function startExport() {
   if (!data || !data.ok) { alert('还没有可导出的录制'); return; }
   if (!(sel[1] > sel[0])) { alert('请先在时间轴上拖出一段区间'); return; }
+  const mode = (document.getElementById('expMode') || {}).value || 'hud';
+  if ((mode === 'composite' || mode === 'tracks') && !vidInfo) {
+    alert('合成成片或三轨导出需要先在上方导入录像');
+    return;
+  }
   const incMouse = !!(document.getElementById('expMouse') && document.getElementById('expMouse').checked && data.mouse);
   const mLay = (document.getElementById('expMouseLayout') || {}).value || 'side';
   const picked = (info.keys || []).filter(k => selectedKeys.has(k));
   if (!picked.length && !(incMouse && mLay === 'only')) { alert('请至少勾选一个导出键位'); return; }
   const fmt = document.getElementById('fmt').value || 'webm';
+  const boxes = vidInfo ? getStageBoxes() : {};
   const params = {
+    mode: mode,
+    offset: vidInfo ? videoOffset : 0.0,
     stamp: currentStamp || undefined,
     start: sel[0], end: sel[1],
     layout: document.getElementById('layout').value,
@@ -6778,6 +8124,12 @@ function startExport() {
     png: fmt === 'png',
     mouse: incMouse,
     mouse_layout: mLay,
+    mm: 'press',
+    kb_box: boxes.kb_box,
+    mouse_box: boxes.mouse_box,
+    kb_alpha: vidInfo ? stageCfg.kb.alpha : undefined,
+    mouse_alpha: vidInfo ? stageCfg.mouse.alpha : undefined,
+    mopacity: vidInfo ? stageCfg.mouse.mopacity : undefined,
     keys: picked
   };
   const tok = window.__token || '';
@@ -6798,6 +8150,172 @@ function poll() {
 
 function cancelExport() {
   fetch('/wb/cancel', { method:'POST', headers:{'X-Depth-Token': window.__token || ''} }).then(() => poll());
+}
+
+function setVidStatus(msg) {
+  const el = document.getElementById('vidStatus');
+  if (el) el.textContent = msg || '';
+}
+function togglePathInput(force) {
+  const r = document.getElementById('vidPathRow');
+  if (!r) return;
+  const on = typeof force === 'boolean' ? force : !r.classList.contains('on');
+  r.classList.toggle('on', on);
+}
+function applyVideoLoaded(res) {
+  if (!res || !res.ok || !res.video) { setVidStatus((res && res.error) || '加载失败'); return; }
+  vidInfo = res.video;
+  videoOffset = Number(res.offset || 0);
+  if (res.stage) stageCfg = res.stage;
+  const stg = document.getElementById('prevStage');
+  if (stg) {
+    stg.classList.add('has-video');
+    if (vidInfo.width && vidInfo.height) stg.style.setProperty('--vid-ar', (vidInfo.width / vidInfo.height).toFixed(4));
+  }
+  document.getElementById('vidCtrlBar').classList.add('on');
+  const cb = document.getElementById('vidCloseBtn');
+  if (cb) cb.style.display = '';
+  document.getElementById('vidName').textContent = vidInfo.name + ' (' + vidInfo.start_str + '~' + vidInfo.end_str + ')';
+  document.getElementById('vidOffIn').value = videoOffset.toFixed(3);
+  const em = document.getElementById('expMode');
+  if (em && em.value === 'hud') em.value = 'composite';
+  const v = document.getElementById('wbVideo');
+  v.src = '/wb/video/stream?v=' + Date.now();
+  buildPreviewKb();
+  fit();
+  const ov = Number(res.overlap_s || 0);
+  if (res.matched_stamp) {
+    setVidStatus('已自动匹配 ' + res.matched_stamp + (ov > 0 ? (' · 重叠 ' + ov.toFixed(0) + 's') : ' · 无重叠请手动调偏移'));
+    if (res.matched_stamp !== currentStamp) {
+      onSelectRec(res.matched_stamp);
+      return;
+    }
+  } else {
+    setVidStatus('未找到重合录制，请手动选择历史并调整偏移');
+  }
+  if (data && data.ok) {
+    if (!selValidForVideo()) setSel(0, 0);
+    playT = clamp(videoOffset, 0, data.duration);
+    hoverT = null;
+    ensurePlaybackHd(playT, true);
+    draw(true);
+    renderPreviewAt(playT);
+  }
+}
+function pickVideo() {
+  setVidStatus('请在系统窗口中选择录像文件…');
+  fetch('/wb/video/pick', { method: 'POST', headers: { 'X-Depth-Token': window.__token || '' } })
+    .then(r => r.json()).then(res => {
+      if (res && res.cancelled) { setVidStatus(''); return; }
+      applyVideoLoaded(res);
+    }).catch(() => setVidStatus('选择失败'));
+}
+function loadVideoByPath() {
+  const p = (document.getElementById('vidPathIn').value || '').trim();
+  if (!p) return;
+  setVidStatus('正在解析录像时间戳…');
+  fetch('/wb/video/load', {
+    method: 'POST', headers: { 'X-Depth-Token': window.__token || '' },
+    body: JSON.stringify({ path: p, stamp: currentStamp || undefined })
+  }).then(r => r.json()).then(res => {
+    if (res && res.ok) togglePathInput(false);
+    applyVideoLoaded(res);
+  }).catch(() => setVidStatus('加载失败'));
+}
+function clearVideo() {
+  fetch('/wb/video/clear', { method: 'POST', headers: { 'X-Depth-Token': window.__token || '' } }).catch(() => {});
+  vidInfo = null;
+  const v = document.getElementById('wbVideo');
+  if (v) { v.pause(); v.removeAttribute('src'); v.load(); }
+  const stg = document.getElementById('prevStage');
+  if (stg) { stg.classList.remove('has-video'); stg.style.removeProperty('--vid-ar'); }
+  document.getElementById('vidCtrlBar').classList.remove('on');
+  const cb = document.getElementById('vidCloseBtn');
+  if (cb) cb.style.display = 'none';
+  const vn = document.getElementById('vidName');
+  if (vn) vn.textContent = '未导入（纯 HUD 预览）';
+  const em = document.getElementById('expMode');
+  if (em) em.value = 'hud';
+  setVidStatus('');
+  buildPreviewKb();
+  fit();
+}
+
+function setVideoOffset(v) {
+  const n = parseFloat(v);
+  if (isNaN(n)) return;
+  videoOffset = Math.round(n * 1000) / 1000;
+  document.getElementById('vidOffIn').value = videoOffset.toFixed(3);
+  const vid = document.getElementById('wbVideo');
+  if (vidInfo && vid && data && data.ok) {
+    playT = clamp((vid.currentTime || 0) + videoOffset, 0, data.duration || 1e9);
+    hoverT = null;
+    ensurePlaybackHd(playT, true);
+    draw(false);
+    renderPreviewAt(playT);
+  }
+}
+function nudgeVideoOffset(d) { setVideoOffset(videoOffset + d); }
+function fineAlignVideo() {
+  if (!vidInfo) return;
+  const vid = document.getElementById('wbVideo');
+  setVidStatus('正在分析枪声音频与左键脉冲…');
+  fetch('/wb/video/align', {
+    method: 'POST', headers: { 'X-Depth-Token': window.__token || '' },
+    body: JSON.stringify({ stamp: currentStamp || undefined, video_t: vid ? (vid.currentTime || 0) : 0, offset: videoOffset, search_s: 3.0 })
+  }).then(r => r.json()).then(res => {
+    if (res && res.ok) {
+      setVideoOffset(res.offset);
+      const ms = Math.round((res.delta || 0) * 1000);
+      setVidStatus('精对齐成功 (' + (ms >= 0 ? '+' : '') + ms + 'ms · ' + res.clicks + ' 枪 · z=' + res.confidence + ')');
+    } else {
+      setVidStatus((res && (res.message || res.error)) || '精对齐未命中');
+    }
+  }).catch(() => setVidStatus('精对齐请求失败'));
+}
+function markSelFromVideo(which) {
+  if (!vidInfo || !data || !data.ok) return;
+  const vid = document.getElementById('wbVideo');
+  const rt = clamp((vid.currentTime || 0) + videoOffset, 0, data.duration || 0);
+  if (which === 0) setSel(rt, Math.max(rt, sel[1]));
+  else setSel(Math.min(sel[0], rt), rt);
+}
+function bindVideoEvents() {
+  const v = document.getElementById('wbVideo');
+  if (!v) return;
+  v.addEventListener('play', () => {
+    if (!vidInfo || !data || !data.ok) return;
+    if (!playing) loopSelection = false;
+    setPlayUI(true);
+    ensurePlaybackHd(clamp((v.currentTime || 0) + videoOffset, 0, data.duration), true);
+    playLastMs = performance.now();
+    requestAnimationFrame(playLoop);
+  });
+  v.addEventListener('pause', () => { if (vidInfo && playing) { loopSelection = false; setPlayUI(false); } });
+  const onSeek = () => {
+    if (!vidInfo || syncingVid || !data || !data.ok) return;
+    playT = clamp((v.currentTime || 0) + videoOffset, 0, data.duration || 1e9);
+    hoverT = null;
+    ensurePlaybackHd(playT, true);
+    draw(false);
+    renderPreviewAt(playT);
+  };
+  v.addEventListener('timeupdate', () => { if (vidInfo && !playing && !syncingVid) onSeek(); });
+  v.addEventListener('loadedmetadata', () => {
+    const stg = document.getElementById('prevStage');
+    if (stg && v.videoWidth && v.videoHeight) {
+      stg.style.setProperty('--vid-ar', (v.videoWidth / v.videoHeight).toFixed(4));
+      applyStageLayout();
+    }
+  });
+  v.addEventListener('seeked', () => {
+    if (syncingVid) {
+      syncingVid = false;
+      clearTimeout(syncVidTimer);
+      return;
+    }
+    onSeek();
+  });
 }
 
 fetch('/snapshot').then(r => r.json()).then(j => {
@@ -6826,13 +8344,25 @@ window.addEventListener('keydown', e => {
     const hi = sel[1] > sel[0] ? sel[1] : (data.duration || 0);
     playT = Math.max(lo, Math.min(hi, playT + dir * step));
     hoverT = null;
-    draw();
+    draw(false);
+    ensurePlaybackHd(playT, false);
+    syncVideoToPlayT();
     renderPreviewAt(playT);
   }
 });
-addEventListener('resize', () => { fit(); buildPreviewKb(); });
+addEventListener('resize', () => { fit(); buildPreviewKb(); applyStageLayout(); });
+if (window.ResizeObserver) {
+  const _stgObs = new ResizeObserver(() => { if (vidInfo) applyStageLayout(); });
+  const _stgEl = document.getElementById('prevStage');
+  if (_stgEl) _stgObs.observe(_stgEl);
+}
+initHudDrag();
+bindVideoEvents();
 buildPreviewKb();
 loadList(currentStamp);
+fetch('/wb/video/info').then(r => r.json()).then(j => {
+  if (j && j.stage) stageCfg = j.stage;
+}).catch(() => {});
 fit();
 </script></body></html>"""
             .replace("__LAYOUT__", json.dumps(_layout_dicts(), ensure_ascii=False))
