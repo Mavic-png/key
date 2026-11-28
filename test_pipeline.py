@@ -1202,15 +1202,37 @@ def t_user_settings_and_bind_unbind_flow():
     dl.ENGINE = make_engine()
     srv, port = start_server()
     try:
-        body = json.dumps({"full_mm": 3.80, "theme": "mint", "mouse_span": 11200}).encode("utf-8")
+        mh_in = {
+            "pad": "wide", "theme": "violet", "scale": 1.45,
+            "opacity": 0.30, "mopacity": 0.65, "sens": 2.25,
+            "recenter": "fast", "align": "br", "trail": False,
+        }
+        kh_in = {
+            "cluster": "wasd", "keys": "Tab,W,A,S,D,Space", "theme": "amber",
+            "full": 3.20, "scale": 1.35, "opacity": 0.45,
+            "mm": "always", "align": "tl",
+        }
+        body = json.dumps({"full_mm": 3.80, "theme": "mint", "mouse_span": 11200,
+                           "mouse_hud": mh_in, "kb_hud": kh_in}).encode("utf-8")
         req = urllib.request.Request("http://127.0.0.1:%d/settings" % port, data=body, method="POST")
         req.add_header("X-Depth-Token", dl.ENGINE.token)
         with urllib.request.urlopen(req, timeout=5) as r:
             res = json.loads(r.read().decode("utf-8"))
         assert res["ok"] and abs(res["full_mm"] - 3.80) < 0.01 and res["theme"] == "mint" and res["mouse_span"] == 11200
-        # Restarted Engine must reload persisted settings
+        assert res["mouse_hud"] == mh_in and res["mouse_hud_rev"] >= 1, res
+        assert res["kb_hud"] == kh_in and res["kb_hud_rev"] >= 1, res
+        snap_mh = dl.ENGINE.snapshot(0, 0)
+        assert snap_mh["mouse_hud"] == mh_in and snap_mh["mouse_hud_rev"] == res["mouse_hud_rev"]
+        assert snap_mh["kb_hud"] == kh_in and snap_mh["kb_hud_rev"] == res["kb_hud_rev"]
+        m_html = dl.mouse_overlay_html()
+        assert '"pad": "wide"' in m_html and '"theme": "violet"' in m_html and '"sens": 2.25' in m_html
+        o_html = dl.overlay_html()
+        assert '"cluster": "wasd"' in o_html and '"theme": "amber"' in o_html and '"opacity": 0.45' in o_html
+        # Restarted Engine must reload persisted settings including mouse_hud & kb_hud
         e2 = dl.Engine()
         assert abs(e2.full_mm - 3.80) < 0.01 and e2.theme == "mint" and e2.mouse_span == 11200
+        assert e2.mouse_hud == mh_in and e2.mouse_hud_rev >= 1, (e2.mouse_hud, e2.mouse_hud_rev)
+        assert e2.kb_hud == kh_in and e2.kb_hud_rev >= 1, (e2.kb_hud, e2.kb_hud_rev)
 
         # Left-click bind + right-click unbind flow (simulate key moving 0 -> 2.2mm)
         api(port, "/bind?key=W")
@@ -1333,6 +1355,82 @@ def t_user_workbench_history_switch_and_delete():
         srv.shutdown()
 
 
+def t_mouse_overlay_cef_compat_and_uipi_fallback():
+    """Mouse overlay uses Date.now/rAF keepalive/SSE reconnect, and UIPI desktop fallback works."""
+    ov_html = dl.overlay_html()
+    m_html = dl.mouse_overlay_html()
+    assert "connectSSE" in ov_html and "es.onerror" in ov_html, "overlay SSE reconnect missing"
+    assert "connectSSE" in m_html and "es.onerror" in m_html, "mouse overlay SSE reconnect missing"
+    assert "performance.now" not in m_html, "mouse overlay still mixes performance.now with rAF"
+    assert "Math.max(0.001, Math.min(0.05" in m_html, "dt lower clamp missing"
+    assert "finally {" in m_html and "requestAnimationFrame(loop)" in m_html, "rAF keepalive missing"
+    assert "xlink:href=\"#viperOutline\"" in m_html and "top: 0; right: 0; bottom: 0; left: 0;" in m_html
+
+    # Test UIPI desktop cursor + button fallback on Engine._poll_mouse_fallback
+    assert abs(dl.win_mouse_speed_factor(4) - 0.25) < 1e-9
+    assert abs(dl.win_mouse_speed_factor(10) - 1.0) < 1e-9
+    assert abs(dl.win_mouse_speed_factor(20) - 3.5) < 1e-9
+
+    e = dl.Engine()
+    e._cursor_raw_ratio = 4.0
+    pts = [(100, 200), (145, 180), (160, 185), (161, 185), (162, 185)]
+    idx = [0]
+    elev = [True]
+    lbtn = [False]
+    orig_elev = dl.is_foreground_elevated
+    orig_gcp = dl.user32.GetCursorPos
+    orig_gaks = dl.user32.GetAsyncKeyState
+
+    def fake_gcp(pt_ptr):
+        pt = dl.ctypes.cast(pt_ptr, dl.ctypes.POINTER(dl.wt.POINT)).contents
+        x, y = pts[min(idx[0], len(pts) - 1)]
+        pt.x, pt.y = x, y
+        return 1
+
+    def fake_gaks(vk):
+        return -32768 if (vk == 0x01 and lbtn[0]) else 0
+
+    dl.is_foreground_elevated = lambda: elev[0]
+    dl.user32.GetCursorPos = fake_gcp
+    dl.user32.GetAsyncKeyState = fake_gaks
+    try:
+        st = {"pt": None, "elev": False, "chk_t": 0.0, "self_elev": False}
+        # 1. While WM_INPUT is fresh, fallback must NOT engage
+        e._last_raw_mouse_t = 10.0
+        e._poll_mouse_fallback(st, now=10.01)
+        assert e.mouse_uipi_fallback is False and e._mouse_abs == 0
+        # 2. Once WM_INPUT goes silent under an elevated window, fallback scales cursor + tracks clicks
+        e._poll_mouse_fallback(st, now=10.30)
+        assert e.mouse_uipi_fallback is True and e._mouse_abs == 0
+        idx[0] = 1
+        lbtn[0] = True
+        e._poll_mouse_fallback(st, now=10.31)
+        assert e._mouse_abs == 1 and e.mouse_events[-1] == (180, -80, 0), e.mouse_events
+        snap0 = e.snapshot(0, 0)
+        assert e.mouse_btns["l"] is True and snap0["mouse_uipi"] is True and snap0["mouse_ratio"] == 4.0
+        # 3. Fractional carry accumulates accurately across consecutive sub-integer moves
+        idx[0] = 2
+        e._poll_mouse_fallback(st, now=10.32)
+        e._cursor_raw_ratio = 1.5
+        st["rx"] = 0.0
+        st["ry"] = 0.0
+        before_n = len(e.mouse_events)
+        idx[0] = 3
+        e._poll_mouse_fallback(st, now=10.33)
+        idx[0] = 4
+        e._poll_mouse_fallback(st, now=10.34)
+        total_dx = sum(ev[0] for ev in e.mouse_events[before_n:])
+        assert total_dx == 3, (total_dx, e.mouse_events[before_n:])
+        # 4. Switching back to a normal window clears fallback cleanly
+        elev[0] = False
+        e._poll_mouse_fallback(st, now=10.60)
+        assert e.mouse_uipi_fallback is False and st["pt"] is None
+    finally:
+        dl.is_foreground_elevated = orig_elev
+        dl.user32.GetCursorPos = orig_gcp
+        dl.user32.GetAsyncKeyState = orig_gaks
+
+
 def main():
     print("depth monitor user-workflow gate tests")
     for name, fn in [
@@ -1342,8 +1440,9 @@ def main():
         ("multi-key hold writer + firmware switch-zero", t_hold_without_mapping),
         ("settings persistence + bind/unbind flow", t_user_settings_and_bind_unbind_flow),
         ("close browser tab auto-exits backend", t_user_close_page_auto_exits),
-        # 2. 直播设备 /overlay & /overlay/mouse（自定义键、预设切换、鼠标配置）
+        # 2. 直播设备 /overlay & /overlay/mouse（自定义键、预设切换、鼠标配置、OBS/UIPI 兼容）
         ("overlay custom keys + preset switch + JS check", t_user_overlay_custom_keys_and_preset_switch),
+        ("mouse overlay CEF compat + UIPI fallback", t_mouse_overlay_cef_compat_and_uipi_fallback),
         # 3. 键鼠同步录制、自动分段保存防丢、长录制内存上限与完整性
         ("synced mouse record + wb replay + legacy", t_sync_mouse_record_and_wb_replay),
         ("autosave preserves inflight events", t_autosave_preserves_inflight_events),

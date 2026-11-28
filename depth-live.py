@@ -127,7 +127,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.17.1"
+VERSION = "1.17.2"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -138,6 +138,7 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 hid = ctypes.WinDLL("hid")
 setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
 DIGCF_PRESENT = 0x02
 DIGCF_DEVICEINTERFACE = 0x10
@@ -203,10 +204,132 @@ user32.GetRawInputData.restype = wt.UINT
 user32.GetRawInputData.argtypes = [wt.HANDLE, wt.UINT, ctypes.c_void_p, ctypes.POINTER(wt.UINT), wt.UINT]
 user32.GetMessageW.restype = wt.BOOL
 user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+user32.PeekMessageW.restype = wt.BOOL
+user32.PeekMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT, wt.UINT]
+user32.MsgWaitForMultipleObjects.restype = wt.DWORD
+user32.MsgWaitForMultipleObjects.argtypes = [wt.DWORD, ctypes.c_void_p, wt.BOOL, wt.DWORD, wt.DWORD]
 user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 user32.PostThreadMessageW.restype = wt.BOOL
 user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.GetCursorPos.restype = wt.BOOL
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.SystemParametersInfoW.restype = wt.BOOL
+user32.SystemParametersInfoW.argtypes = [wt.UINT, wt.UINT, ctypes.c_void_p, wt.UINT]
+user32.GetSystemMetrics.restype = ctypes.c_int
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+
+
+class _DEVMODEW(ctypes.Structure):
+    _fields_ = [
+        ("dmDeviceName", wt.WCHAR * 32), ("dmSpecVersion", wt.WORD), ("dmDriverVersion", wt.WORD),
+        ("dmSize", wt.WORD), ("dmDriverExtra", wt.WORD), ("dmFields", wt.DWORD),
+        ("dmPositionX", wt.LONG), ("dmPositionY", wt.LONG), ("dmDisplayOrientation", wt.DWORD),
+        ("dmDisplayFixedOutput", wt.DWORD), ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short),
+        ("dmYResolution", ctypes.c_short), ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short),
+        ("dmFormName", wt.WCHAR * 32), ("dmLogPixels", wt.WORD), ("dmBitsPerPel", wt.DWORD),
+        ("dmPelsWidth", wt.DWORD), ("dmPelsHeight", wt.DWORD), ("dmDisplayFlags", wt.DWORD),
+        ("dmDisplayFrequency", wt.DWORD),
+    ]
+
+
+user32.EnumDisplaySettingsW.restype = wt.BOOL
+user32.EnumDisplaySettingsW.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(_DEVMODEW)]
 kernel32.GetCurrentThreadId.restype = wt.DWORD
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.GetCurrentProcess.restype = wt.HANDLE
+advapi32.OpenProcessToken.restype = wt.BOOL
+advapi32.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE)]
+advapi32.GetTokenInformation.restype = wt.BOOL
+advapi32.GetTokenInformation.argtypes = [wt.HANDLE, wt.DWORD, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wt.DWORD)
+advapi32.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wt.DWORD]
+
+
+def _token_is_elevated(proc_handle):
+    tok = wt.HANDLE()
+    if not advapi32.OpenProcessToken(proc_handle, 0x0008, ctypes.byref(tok)):
+        return ctypes.get_last_error() == 5
+    try:
+        buf = (ctypes.c_ubyte * 256)()
+        need = wt.DWORD(0)
+        if not advapi32.GetTokenInformation(tok, 25, buf, 256, ctypes.byref(need)):
+            return False
+        sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p)).contents
+        cnt_p = advapi32.GetSidSubAuthorityCount(sid)
+        n = cnt_p.contents.value if cnt_p else 0
+        if n <= 0:
+            return False
+        rid = advapi32.GetSidSubAuthority(sid, n - 1).contents.value
+        return rid >= 0x3000
+    finally:
+        kernel32.CloseHandle(tok)
+
+
+def is_self_elevated():
+    try:
+        return _token_is_elevated(kernel32.GetCurrentProcess())
+    except Exception:
+        return False
+
+
+def is_foreground_elevated():
+    """True when the foreground window belongs to a higher-integrity (admin) process."""
+    try:
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = wt.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return False
+        h = kernel32.OpenProcess(0x1000, False, pid.value)
+        if not h:
+            return ctypes.get_last_error() == 5
+        try:
+            return _token_is_elevated(h)
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def win_mouse_speed_factor(speed):
+    """Map Windows SPI_GETMOUSESPEED (1..20) to its cursor-to-raw multiplier."""
+    s = max(1, min(20, int(speed)))
+    if s == 1:
+        return 1.0 / 32.0
+    if s == 2:
+        return 1.0 / 16.0
+    if s <= 10:
+        return (s - 2) / 8.0
+    return 1.0 + (s - 10) * 0.25
+
+
+def cursor_to_raw_scale():
+    """Estimate raw mouse counts per logical GetCursorPos pixel from Windows speed & DPI."""
+    spd = ctypes.c_int(10)
+    try:
+        if not user32.SystemParametersInfoW(0x0070, 0, ctypes.byref(spd), 0):
+            spd.value = 10
+    except Exception:
+        spd.value = 10
+    inv = 1.0 / win_mouse_speed_factor(spd.value)
+    dpi_scale = 1.0
+    try:
+        lw = user32.GetSystemMetrics(0)
+        dm = _DEVMODEW()
+        dm.dmSize = ctypes.sizeof(_DEVMODEW)
+        if lw > 0 and user32.EnumDisplaySettingsW(None, -1, ctypes.byref(dm)) and dm.dmPelsWidth > 0:
+            dpi_scale = max(1.0, min(4.0, float(dm.dmPelsWidth) / float(lw)))
+    except Exception:
+        dpi_scale = 1.0
+    return max(0.25, min(32.0, inv * dpi_scale))
 
 
 # ------------------------------------------------------------------ HID layer
@@ -347,6 +470,106 @@ def decode(report):
     return None
 
 
+MOUSE_HUD_DEFAULTS = {
+    "pad": "gsr3",
+    "theme": "ramp",
+    "scale": 1.0,
+    "opacity": 0.62,
+    "mopacity": 0.90,
+    "sens": 1.0,
+    "recenter": "smart",
+    "align": "center",
+    "trail": True,
+}
+
+
+def _sanitize_mouse_hud(raw, base=None):
+    out = dict(base if base is not None else MOUSE_HUD_DEFAULTS)
+    if not isinstance(raw, dict):
+        return out
+    if "pad" in raw:
+        v = str(raw["pad"]).strip().lower()
+        if v in ("gsr3", "sq", "wide", "xl"):
+            out["pad"] = v
+    if "theme" in raw:
+        v = str(raw["theme"]).strip().lower()
+        if v in ("ramp", "cyan", "mint", "amber", "crimson", "violet"):
+            out["theme"] = v
+    for key, lo, hi in (("scale", 0.5, 2.5), ("opacity", 0.1, 0.95),
+                        ("mopacity", 0.15, 1.0), ("sens", 0.2, 4.0)):
+        if key in raw:
+            try:
+                v = float(raw[key])
+                if lo <= v <= hi:
+                    out[key] = round(v, 2)
+            except (TypeError, ValueError):
+                pass
+    if "recenter" in raw:
+        v = str(raw["recenter"]).strip().lower()
+        if v == "gentle":
+            v = "smart"
+        if v in ("smart", "fast", "off"):
+            out["recenter"] = v
+    if "align" in raw:
+        v = str(raw["align"]).strip().lower()
+        if v in ("center", "tl", "tr", "bl", "br"):
+            out["align"] = v
+    if "trail" in raw:
+        v = raw["trail"]
+        if isinstance(v, bool):
+            out["trail"] = v
+        else:
+            out["trail"] = str(v).strip().lower() not in ("0", "false", "off", "")
+    return out
+
+
+KB_HUD_DEFAULTS = {
+    "cluster": "hud",
+    "keys": "",
+    "theme": "ramp",
+    "full": 3.5,
+    "scale": 1.0,
+    "opacity": 0.85,
+    "mm": "1",
+    "align": "center",
+}
+
+
+def _sanitize_kb_hud(raw, base=None):
+    out = dict(base if base is not None else KB_HUD_DEFAULTS)
+    if not isinstance(raw, dict):
+        return out
+    if "cluster" in raw:
+        v = str(raw["cluster"]).strip().lower()
+        if v == "layout":
+            v = "hud"
+        if v in ("hud", "wasd", "full"):
+            out["cluster"] = v
+    if "keys" in raw:
+        out["keys"] = str(raw["keys"] or "").strip()[:400]
+    if "theme" in raw:
+        v = str(raw["theme"]).strip().lower()
+        if v in ("ramp", "cyan", "mint", "amber", "crimson", "violet"):
+            out["theme"] = v
+    for key, lo, hi in (("full", 1.0, 5.0), ("scale", 0.4, 3.0), ("opacity", 0.1, 1.0)):
+        if key in raw:
+            try:
+                v = float(raw[key])
+                if lo <= v <= hi:
+                    out[key] = round(v, 2)
+            except (TypeError, ValueError):
+                pass
+    if "mm" in raw:
+        v = str(raw["mm"]).strip().lower()
+        out["mm"] = ("0" if v in ("0", "false", "off")
+                     else ("always" if v in ("always", "2") else "1"))
+    if "align" in raw:
+        v = str(raw["align"]).strip().lower()
+        if v in ("center", "tl", "tr", "bl", "br"):
+            out["align"] = v
+    return out
+
+
 # ------------------------------------------------------------------- engine
 
 KEYNAME = {0x20: "Space", 0x08: "Bksp", 0x09: "Tab", 0x0D: "Enter", 0x1B: "Esc",
@@ -449,9 +672,16 @@ class Engine(object):
         self.full_mm = FULL
         self.theme = "ramp"
         self.mouse_span = 14800
+        self.mouse_hud = dict(MOUSE_HUD_DEFAULTS)
+        self.mouse_hud_rev = 0
+        self.kb_hud = dict(KB_HUD_DEFAULTS)
+        self.kb_hud_rev = 0
         self.mouse_events = []       # (dx, dy, wheel) live ring for SSE cursors
         self._mouse_abs = 0
         self.mouse_btns = {"l": False, "r": False, "m": False, "x1": False, "x2": False}
+        self._last_raw_mouse_t = 0.0
+        self.mouse_uipi_fallback = False
+        self._cursor_raw_ratio = cursor_to_raw_scale()
         self._load_settings()
         self._load_mapping()
 
@@ -469,10 +699,23 @@ class Engine(object):
             ms = int(round(float(raw.get("mouse_span", 14800))))
             if 500 <= ms <= 200000:
                 self.mouse_span = ms
+            mh = raw.get("mouse_hud")
+            if isinstance(mh, dict):
+                self.mouse_hud = _sanitize_mouse_hud(mh, MOUSE_HUD_DEFAULTS)
+                self.mouse_hud_rev = 1
+            else:
+                self.mouse_hud["theme"] = self.theme
+            kh = raw.get("kb_hud")
+            if isinstance(kh, dict):
+                self.kb_hud = _sanitize_kb_hud(kh, KB_HUD_DEFAULTS)
+                self.kb_hud_rev = 1
+            else:
+                self.kb_hud["theme"] = self.theme
+                self.kb_hud["full"] = self.full_mm
         except Exception:
             pass
 
-    def update_settings(self, full_mm=None, theme=None, mouse_span=None, save=True):
+    def update_settings(self, full_mm=None, theme=None, mouse_span=None, mouse_hud=None, kb_hud=None, save=True):
         with self.lock:
             if full_mm is not None:
                 try:
@@ -492,13 +735,28 @@ class Engine(object):
                         self.mouse_span = ms
                 except (TypeError, ValueError):
                     pass
-            snap = {"full_mm": self.full_mm, "theme": self.theme, "mouse_span": self.mouse_span}
+            if isinstance(mouse_hud, dict):
+                self.mouse_hud = _sanitize_mouse_hud(mouse_hud, self.mouse_hud)
+                self.mouse_hud_rev += 1
+            if isinstance(kb_hud, dict):
+                self.kb_hud = _sanitize_kb_hud(kb_hud, self.kb_hud)
+                self.kb_hud_rev += 1
+            snap = {
+                "full_mm": self.full_mm,
+                "theme": self.theme,
+                "mouse_span": self.mouse_span,
+                "mouse_hud": dict(self.mouse_hud),
+                "kb_hud": dict(self.kb_hud),
+            }
+            out = dict(snap)
+            out["mouse_hud_rev"] = self.mouse_hud_rev
+            out["kb_hud_rev"] = self.kb_hud_rev
         if save:
             try:
                 self._write_atomic(self.settings_path, json.dumps(snap, ensure_ascii=False, indent=1))
             except Exception:
                 pass
-        return snap
+        return out
 
     # ---- mapping persistence ----------------------------------------
     def _map_paths(self):
@@ -903,8 +1161,55 @@ class Engine(object):
                                    "\u5df2\u6eda\u52a8\u88c1\u526a\u6700\u65e7 %d \u6761\u4e8b\u4ef6"
                                    % self.mouse_rec_dropped)
 
+    def _poll_mouse_fallback(self, state, now=None):
+        """Desktop cursor + button fallback when UIPI blocks WM_INPUT behind an elevated foreground app."""
+        if now is None:
+            now = time.perf_counter()
+        state.setdefault("rx", 0.0)
+        state.setdefault("ry", 0.0)
+        if state["self_elev"] or (now - self._last_raw_mouse_t) < 0.05:
+            self.mouse_uipi_fallback = False
+            state["pt"] = None
+            state["rx"] = 0.0
+            state["ry"] = 0.0
+            return
+        if now - state["chk_t"] >= 0.25:
+            state["chk_t"] = now
+            state["elev"] = is_foreground_elevated()
+        if not state["elev"]:
+            self.mouse_uipi_fallback = False
+            state["pt"] = None
+            state["rx"] = 0.0
+            state["ry"] = 0.0
+            return
+        self.mouse_uipi_fallback = True
+        dx = dy = 0
+        pt = wt.POINT()
+        if user32.GetCursorPos(ctypes.byref(pt)):
+            cur = (pt.x, pt.y)
+            if state["pt"] is not None:
+                dx_px = cur[0] - state["pt"][0]
+                dy_px = cur[1] - state["pt"][1]
+                if abs(dx_px) >= 800 or abs(dy_px) >= 800:
+                    dx_px = dy_px = 0
+                ratio = max(0.25, min(32.0, float(self._cursor_raw_ratio)))
+                fx = state["rx"] + dx_px * ratio
+                fy = state["ry"] + dy_px * ratio
+                dx = int(round(fx))
+                dy = int(round(fy))
+                state["rx"] = fx - dx
+                state["ry"] = fy - dy
+            state["pt"] = cur
+        btns = {}
+        for name, vk in (("l", 0x01), ("r", 0x02), ("m", 0x04), ("x1", 0x05), ("x2", 0x06)):
+            down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
+            if self.mouse_btns.get(name) != down:
+                btns[name] = down
+        if dx or dy or btns:
+            self.on_mouse(dx, dy, btns)
+
     def run_mouse(self):
-        """Passive read-only Windows Raw Input mouse listener (works in locked-cursor FPS games)."""
+        """Passive read-only Windows Raw Input mouse listener with UIPI desktop fallback."""
         hwnd = user32.CreateWindowExW(
             0, "STATIC", "depth-mouse-sink", 0, 0, 0, 0, 0,
             HWND_MESSAGE, None, None, None,
@@ -919,42 +1224,55 @@ class Engine(object):
             buf = (ctypes.c_ubyte * 128)()
             sz = wt.UINT(0)
             hdr_sz = ctypes.sizeof(RAWINPUTHEADER)
+            fb_state = {"pt": None, "elev": False, "chk_t": 0.0, "self_elev": is_self_elevated(),
+                        "rx": 0.0, "ry": 0.0, "scale_t": time.perf_counter()}
             while not self.stop_io.is_set():
-                r = user32.GetMessageW(ctypes.byref(msg), hwnd, 0, 0)
-                if r <= 0:
-                    break
-                if msg.message == WM_INPUT:
-                    sz.value = ctypes.sizeof(buf)
-                    got = user32.GetRawInputData(
-                        ctypes.c_void_p(msg.lParam), RID_INPUT,
-                        buf, ctypes.byref(sz), hdr_sz,
-                    )
-                    if got and got >= ctypes.sizeof(RAWINPUT_MOUSE):
-                        ri = ctypes.cast(buf, ctypes.POINTER(RAWINPUT_MOUSE)).contents
-                        if ri.header.dwType == RIM_TYPEMOUSE:
-                            rm = ri.mouse
-                            dx = rm.lLastX if not (rm.usFlags & 0x01) else 0
-                            dy = rm.lLastY if not (rm.usFlags & 0x01) else 0
-                            bf = rm.parts.usButtonFlags
-                            btns = {}
-                            if bf & 0x0001: btns["l"] = True
-                            if bf & 0x0002: btns["l"] = False
-                            if bf & 0x0004: btns["r"] = True
-                            if bf & 0x0008: btns["r"] = False
-                            if bf & 0x0010: btns["m"] = True
-                            if bf & 0x0020: btns["m"] = False
-                            if bf & 0x0040: btns["x1"] = True
-                            if bf & 0x0080: btns["x1"] = False
-                            if bf & 0x0100: btns["x2"] = True
-                            if bf & 0x0200: btns["x2"] = False
-                            wheel = 0
-                            if bf & 0x0400:
-                                wd = ctypes.c_short(rm.parts.usButtonData).value
-                                wheel = 1 if wd > 0 else (-1 if wd < 0 else 0)
-                            if dx or dy or btns or wheel:
-                                self.on_mouse(dx, dy, btns, wheel)
-                else:
-                    user32.DispatchMessageW(ctypes.byref(msg))
+                while user32.PeekMessageW(ctypes.byref(msg), hwnd, 0, 0, 1):
+                    if msg.message == 0x0012:   # WM_QUIT
+                        return
+                    if msg.message == WM_INPUT:
+                        sz.value = ctypes.sizeof(buf)
+                        got = user32.GetRawInputData(
+                            ctypes.c_void_p(msg.lParam), RID_INPUT,
+                            buf, ctypes.byref(sz), hdr_sz,
+                        )
+                        if got and got >= ctypes.sizeof(RAWINPUT_MOUSE):
+                            ri = ctypes.cast(buf, ctypes.POINTER(RAWINPUT_MOUSE)).contents
+                            if ri.header.dwType == RIM_TYPEMOUSE:
+                                self._last_raw_mouse_t = time.perf_counter()
+                                self.mouse_uipi_fallback = False
+                                fb_state["pt"] = None
+                                fb_state["rx"] = 0.0
+                                fb_state["ry"] = 0.0
+                                rm = ri.mouse
+                                dx = rm.lLastX if not (rm.usFlags & 0x01) else 0
+                                dy = rm.lLastY if not (rm.usFlags & 0x01) else 0
+                                bf = rm.parts.usButtonFlags
+                                btns = {}
+                                if bf & 0x0001: btns["l"] = True
+                                if bf & 0x0002: btns["l"] = False
+                                if bf & 0x0004: btns["r"] = True
+                                if bf & 0x0008: btns["r"] = False
+                                if bf & 0x0010: btns["m"] = True
+                                if bf & 0x0020: btns["m"] = False
+                                if bf & 0x0040: btns["x1"] = True
+                                if bf & 0x0080: btns["x1"] = False
+                                if bf & 0x0100: btns["x2"] = True
+                                if bf & 0x0200: btns["x2"] = False
+                                wheel = 0
+                                if bf & 0x0400:
+                                    wd = ctypes.c_short(rm.parts.usButtonData).value
+                                    wheel = 1 if wd > 0 else (-1 if wd < 0 else 0)
+                                if dx or dy or btns or wheel:
+                                    self.on_mouse(dx, dy, btns, wheel)
+                    else:
+                        user32.DispatchMessageW(ctypes.byref(msg))
+                now_loop = time.perf_counter()
+                if now_loop - fb_state["scale_t"] >= 2.0:
+                    fb_state["scale_t"] = now_loop
+                    self._cursor_raw_ratio = cursor_to_raw_scale()
+                self._poll_mouse_fallback(fb_state, now_loop)
+                user32.MsgWaitForMultipleObjects(0, None, False, 10, 0x04FF)
         except Exception:
             _log_exc("run_mouse")
         finally:
@@ -2147,6 +2465,12 @@ class Engine(object):
                 "full_mm": round(self.full_mm, 2),
                 "theme": self.theme,
                 "mouse_span": self.mouse_span,
+                "mouse_hud": dict(self.mouse_hud),
+                "mouse_hud_rev": self.mouse_hud_rev,
+                "kb_hud": dict(self.kb_hud),
+                "kb_hud_rev": self.kb_hud_rev,
+                "mouse_uipi": self.mouse_uipi_fallback,
+                "mouse_ratio": round(self._cursor_raw_ratio, 2),
                 "binding": self.pending_label,
                 "bind_msg": self.bind_msg,
                 "recording": self.recording,
@@ -2606,9 +2930,14 @@ class Handler(BaseHTTPRequestHandler):
             full_v = body_obj.get("full_mm", (q.get("full_mm") or [None])[0])
             theme_v = body_obj.get("theme", (q.get("theme") or [None])[0])
             span_v = body_obj.get("mouse_span", (q.get("mouse_span") or [None])[0])
-            snap = ENGINE.update_settings(full_mm=full_v, theme=theme_v, mouse_span=span_v, save=True)
+            mh_v = body_obj.get("mouse_hud") if isinstance(body_obj.get("mouse_hud"), dict) else None
+            kh_v = body_obj.get("kb_hud") if isinstance(body_obj.get("kb_hud"), dict) else None
+            snap = ENGINE.update_settings(full_mm=full_v, theme=theme_v, mouse_span=span_v,
+                                          mouse_hud=mh_v, kb_hud=kh_v, save=True)
             self._send_json({"ok": True, "full_mm": snap["full_mm"],
-                             "theme": snap["theme"], "mouse_span": snap["mouse_span"]})
+                             "theme": snap["theme"], "mouse_span": snap["mouse_span"],
+                             "mouse_hud": snap["mouse_hud"], "mouse_hud_rev": snap["mouse_hud_rev"],
+                             "kb_hud": snap["kb_hud"], "kb_hud_rev": snap["kb_hud_rev"]})
         elif url.path == "/resetmap":
             ENGINE.reset_mapping()
             body = b"ok"
@@ -2749,13 +3078,26 @@ def page_html():
 
 
 def overlay_html():
+    eng = globals().get("ENGINE")
+    kh = dict(eng.kb_hud) if eng else dict(KB_HUD_DEFAULTS)
+    krev = eng.kb_hud_rev if eng else 0
     return (OVERLAY_PAGE
             .replace("__LAYOUT__", json.dumps(_layout_dicts(), ensure_ascii=False))
-            .replace("__THEME_JS__", COMMON_THEME_JS))
+            .replace("__THEME_JS__", COMMON_THEME_JS)
+            .replace("__KB_HUD__", json.dumps(kh, ensure_ascii=False))
+            .replace("__KB_HUD_REV__", str(krev)))
 
 
 def mouse_overlay_html():
-    return MOUSE_OVERLAY_PAGE.replace("__THEME_JS__", COMMON_THEME_JS)
+    eng = globals().get("ENGINE")
+    mh = dict(eng.mouse_hud) if eng else dict(MOUSE_HUD_DEFAULTS)
+    mspan = eng.mouse_span if eng else 14800
+    mrev = eng.mouse_hud_rev if eng else 0
+    return (MOUSE_OVERLAY_PAGE
+            .replace("__THEME_JS__", COMMON_THEME_JS)
+            .replace("__MOUSE_HUD__", json.dumps(mh, ensure_ascii=False))
+            .replace("__MOUSE_SPAN__", str(mspan))
+            .replace("__MOUSE_HUD_REV__", str(mrev)))
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -3786,7 +4128,7 @@ OVERLAY_PAGE = r"""<!DOCTYPE html>
     <button id="pCopy" class="p-btn primary" type="button">复制 OBS 链接</button>
     <button id="pReset" class="p-btn" type="button">恢复默认</button>
   </div>
-  <div class="p-hint">OBS 添加「浏览器」源并粘贴上方链接即可透明叠加；浏览器中按 C 键可切换此面板。</div>
+  <div class="p-hint">所有样式与参数调整自动保存并实时同步至 OBS/直播姬；浏览器中按 C 键可切换此面板。</div>
 </div>
 
 <script>
@@ -3843,29 +4185,34 @@ function clamp(v, lo, hi, def) {
   return isNaN(n) ? def : Math.max(lo, Math.min(hi, n));
 }
 
+const SAVED_KBHUD = __KB_HUD__;
+const SAVED_KBHUD_REV = __KB_HUD_REV__;
+
 function readConfig() {
   const q = new URLSearchParams(location.search);
-  const rawCluster = (q.get('cluster') || q.get('layout') || 'hud').toLowerCase();
+  const rawCl = q.get('cluster') !== null ? q.get('cluster') : (q.get('layout') !== null ? q.get('layout') : (SAVED_KBHUD.cluster || 'hud'));
+  const rawCluster = String(rawCl).toLowerCase();
   const cluster = CLUSTERS[rawCluster] ? rawCluster : 'hud';
   const hasThemeQ = q.has('theme');
-  const rawTheme = (q.get('theme') || 'ramp').toLowerCase();
+  const rawTheme = String(q.get('theme') !== null ? q.get('theme') : (SAVED_KBHUD.theme || 'ramp')).toLowerCase();
   const theme = FILL_PRESETS[rawTheme] ? rawTheme : 'ramp';
   const hasFullQ = q.has('full');
-  const full = clamp(q.get('full'), 1.0, 5.0, FULL);
-  const rawMm = (q.get('mm') || '1').toLowerCase();
+  const full = clamp(q.get('full') !== null ? q.get('full') : SAVED_KBHUD.full, 1.0, 5.0, FULL);
+  const rawMm = String(q.get('mm') !== null ? q.get('mm') : (SAVED_KBHUD.mm || '1')).toLowerCase();
   const mm = (rawMm === '0' || rawMm === 'false' || rawMm === 'off') ? '0'
            : (rawMm === 'always' || rawMm === '2') ? 'always' : '1';
-  const rawAlign = (q.get('align') || 'center').toLowerCase();
+  const rawAlign = String(q.get('align') !== null ? q.get('align') : (SAVED_KBHUD.align || 'center')).toLowerCase();
   const align = ['center','tl','tr','bl','br'].indexOf(rawAlign) >= 0 ? rawAlign : 'center';
+  const opQ = q.get('opacity') !== null ? q.get('opacity') : q.get('alpha');
   return {
     cluster,
-    keys: (q.get('keys') || '').trim(),
+    keys: (q.get('keys') !== null ? q.get('keys') : (SAVED_KBHUD.keys || '')).trim(),
     theme,
     full,
     hasThemeQ,
     hasFullQ,
-    scale: clamp(q.get('scale'), 0.4, 3.0, 1.0),
-    opacity: clamp(q.get('opacity') !== null ? q.get('opacity') : q.get('alpha'), 0.1, 1.0, 0.85),
+    scale: clamp(q.get('scale') !== null ? q.get('scale') : SAVED_KBHUD.scale, 0.4, 3.0, 1.0),
+    opacity: clamp(opQ !== null ? opQ : SAVED_KBHUD.opacity, 0.1, 1.0, 0.85),
     mm,
     align,
     panel: q.get('panel') === '1'
@@ -3942,19 +4289,36 @@ function buildLayout() {
   kb.appendChild(frag);
 }
 
+let srvToken = '', lastSrvRev = SAVED_KBHUD_REV, localDirty = false, saveTimer = null, pendingSave = false;
+function kbHudPayload() {
+  return {
+    cluster: cfg.cluster, keys: cfg.keys, theme: cfg.theme,
+    full: Number(cfg.full.toFixed(2)),
+    scale: Number(cfg.scale.toFixed(2)),
+    opacity: Number(cfg.opacity.toFixed(2)),
+    mm: cfg.mm, align: cfg.align
+  };
+}
+function flushKbHudSave() {
+  if (!srvToken) { pendingSave = true; return; }
+  pendingSave = false;
+  fetch('/settings', {
+    method: 'POST',
+    headers: { 'X-Depth-Token': srvToken },
+    body: JSON.stringify({ kb_hud: kbHudPayload() })
+  }).then(r => r.json()).then(res => {
+    if (res && res.kb_hud_rev !== undefined) lastSrvRev = Math.max(lastSrvRev, res.kb_hud_rev);
+    if (!saveTimer) localDirty = false;
+  }).catch(() => { if (!saveTimer) localDirty = false; });
+}
+function scheduleKbHudSave() {
+  localDirty = true;
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { saveTimer = null; flushKbHudSave(); }, 120);
+}
+
 function buildObsUrl(includePanel) {
-  const p = new URLSearchParams();
-  if (cfg.cluster !== 'hud') p.set('cluster', cfg.cluster);
-  if (cfg.keys) p.set('keys', cfg.keys);
-  if (cfg.theme !== 'ramp') p.set('theme', cfg.theme);
-  if (Math.abs(cfg.full - 3.5) > 0.005) p.set('full', cfg.full.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
-  if (Math.abs(cfg.scale - 1.0) > 0.001) p.set('scale', cfg.scale.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
-  if (Math.abs(cfg.opacity - 0.85) > 0.001) p.set('opacity', cfg.opacity.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
-  if (cfg.mm !== '1') p.set('mm', cfg.mm);
-  if (cfg.align !== 'center') p.set('align', cfg.align);
-  if (includePanel) p.set('panel', '1');
-  const qs = p.toString();
-  return location.origin + '/overlay' + (qs ? ('?' + qs) : '');
+  return location.origin + '/overlay' + (includePanel ? '?panel=1' : '');
 }
 
 const panelEl = document.getElementById('panel');
@@ -3965,7 +4329,7 @@ for (const id in FILL_PRESETS) {
   b.className = 'chip';
   b.dataset.theme = id;
   b.innerHTML = '<span class="sw" style="background:' + FILL_PRESETS[id].acc + '"></span>' + FILL_PRESETS[id].label;
-  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(false); });
+  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(false, true); });
   pThemes.appendChild(b);
 }
 
@@ -3988,7 +4352,7 @@ function toggleCustomKey(k, forceAdd) {
   }
   cfg.keys = list.join(',');
   pKeysEl.value = cfg.keys;
-  applyConfig();
+  applyConfig(true, true);
 }
 
 for (const [k, label] of QUICK_KEYS) {
@@ -4054,7 +4418,7 @@ function scheduleUrlSync() {
   }, 120);
 }
 
-function applyConfig(rebuild) {
+function applyConfig(rebuild, persist) {
   if (rebuild !== false) {
     buildLayout();
   } else {
@@ -4068,6 +4432,7 @@ function applyConfig(rebuild) {
   syncPanelUI();
   if (typeof drawOnce === 'function') drawOnce();
   scheduleUrlSync();
+  if (persist) scheduleKbHudSave();
 }
 
 document.getElementById('pCluster').addEventListener('change', e => {
@@ -4075,19 +4440,19 @@ document.getElementById('pCluster').addEventListener('change', e => {
   cfg.cluster = e.target.value;
   cfg.keys = '';
   pKeysEl.value = '';
-  applyConfig(true);
+  applyConfig(true, true);
 });
-pKeysEl.addEventListener('input', e => { cfg.keys = e.target.value.trim(); applyConfig(true); });
+pKeysEl.addEventListener('input', e => { cfg.keys = e.target.value.trim(); applyConfig(true, true); });
 if (pCapBtn) pCapBtn.addEventListener('click', () => {
   capturingKeys = !capturingKeys;
   if (capturingKeys) pCapBtn.blur();
   syncPanelUI();
 });
-document.getElementById('pScale').addEventListener('input', e => { cfg.scale = parseFloat(e.target.value); applyConfig(true); });
-document.getElementById('pOpacity').addEventListener('input', e => { cfg.opacity = parseFloat(e.target.value); applyConfig(false); });
-document.getElementById('pFull').addEventListener('input', e => { cfg.full = parseFloat(e.target.value); cfg.hasFullQ = true; applyConfig(false); });
-document.getElementById('pMm').addEventListener('change', e => { cfg.mm = e.target.value; applyConfig(false); });
-document.getElementById('pAlign').addEventListener('change', e => { cfg.align = e.target.value; applyConfig(false); });
+document.getElementById('pScale').addEventListener('input', e => { cfg.scale = parseFloat(e.target.value); applyConfig(true, true); });
+document.getElementById('pOpacity').addEventListener('input', e => { cfg.opacity = parseFloat(e.target.value); applyConfig(false, true); });
+document.getElementById('pFull').addEventListener('input', e => { cfg.full = parseFloat(e.target.value); cfg.hasFullQ = true; applyConfig(false, true); });
+document.getElementById('pMm').addEventListener('change', e => { cfg.mm = e.target.value; applyConfig(false, true); });
+document.getElementById('pAlign').addEventListener('change', e => { cfg.align = e.target.value; applyConfig(false, true); });
 document.getElementById('pChecker').addEventListener('change', e => { document.body.classList.toggle('checker', e.target.checked); });
 document.getElementById('pClose').addEventListener('click', () => {
   cfg.panel = false;
@@ -4100,7 +4465,10 @@ document.getElementById('pClose').addEventListener('click', () => {
 document.getElementById('pReset').addEventListener('click', () => {
   capturingKeys = false;
   cfg = { cluster:'hud', keys:'', theme:'ramp', full:3.5, hasThemeQ:false, hasFullQ:false, scale:1.0, opacity:0.85, mm:'1', align:'center', panel:cfg.panel };
-  applyConfig();
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  localDirty = false;
+  flushKbHudSave();
+  applyConfig(true, false);
 });
 document.getElementById('pCopy').addEventListener('click', () => {
   const url = buildObsUrl(false);
@@ -4139,34 +4507,67 @@ addEventListener('keydown', e => {
 let live = {}, nameIdx = {}, held = new Set();
 let lastMsg = Date.now();
 const EMPTY_SET = new Set();
+let es = null, esTimer = null;
 
-const es = new EventSource('/events');
-es.onmessage = ev => {
-  lastMsg = Date.now();
-  const m = JSON.parse(ev.data);
-  if (m.live) {
-    for (const i in m.live) live[i] = m.live[i];
-  }
-  if (m.s) {
-    for (const p of m.s) live[p[1]] = p[2];
-  }
-  if (m.k) {
-    nameIdx = {};
-    for (const i in m.k) if (m.k[i]) nameIdx[norm(m.k[i])] = i;
-  }
-  if (m.held) held = new Set(m.held.map(norm));
-  if (!cfg.hasFullQ && m.full_mm && Math.abs(m.full_mm - cfg.full) > 0.005) {
-    cfg.full = clamp(m.full_mm, 1.0, 5.0, FULL);
-    setFullMm(cfg.full);
-    lastRatio = {};
-    syncPanelUI();
-  }
-  if (!cfg.hasThemeQ && m.theme && FILL_PRESETS[m.theme] && m.theme !== cfg.theme) {
-    cfg.theme = m.theme;
-    lastRatio = {};
-    syncPanelUI();
-  }
-};
+function connectSSE() {
+  if (es) { try { es.close(); } catch (e) {} }
+  es = new EventSource('/events');
+  es.onmessage = ev => {
+    lastMsg = Date.now();
+    const m = JSON.parse(ev.data);
+    if (m.token) {
+      srvToken = m.token;
+      if (pendingSave) flushKbHudSave();
+    }
+    if (m.live) {
+      for (const i in m.live) live[i] = m.live[i];
+    }
+    if (m.s) {
+      for (const p of m.s) live[p[1]] = p[2];
+    }
+    if (m.k) {
+      nameIdx = {};
+      for (const i in m.k) if (m.k[i]) nameIdx[norm(m.k[i])] = i;
+    }
+    if (m.held) held = new Set(m.held.map(norm));
+    if (!localDirty && m.kb_hud && typeof m.kb_hud_rev === 'number' && m.kb_hud_rev > lastSrvRev) {
+      lastSrvRev = m.kb_hud_rev;
+      const h = m.kb_hud;
+      const prevCl = cfg.cluster, prevKeys = cfg.keys, prevScale = cfg.scale;
+      if (h.cluster && CLUSTERS[h.cluster]) cfg.cluster = h.cluster;
+      if (h.keys !== undefined) cfg.keys = String(h.keys || '').trim();
+      if (h.theme && FILL_PRESETS[h.theme]) cfg.theme = h.theme;
+      if (h.full !== undefined) cfg.full = clamp(h.full, 1.0, 5.0, cfg.full);
+      if (h.scale !== undefined) cfg.scale = clamp(h.scale, 0.4, 3.0, cfg.scale);
+      if (h.opacity !== undefined) cfg.opacity = clamp(h.opacity, 0.1, 1.0, cfg.opacity);
+      if (h.mm && ['0', '1', 'always'].indexOf(h.mm) >= 0) cfg.mm = h.mm;
+      if (h.align && ['center', 'tl', 'tr', 'bl', 'br'].indexOf(h.align) >= 0) cfg.align = h.align;
+      const needRebuild = (cfg.cluster !== prevCl || cfg.keys !== prevKeys || Math.abs(cfg.scale - prevScale) > 0.001);
+      applyConfig(needRebuild, false);
+    } else if (lastSrvRev === 0) {
+      if (!cfg.hasFullQ && m.full_mm && Math.abs(m.full_mm - cfg.full) > 0.005) {
+        cfg.full = clamp(m.full_mm, 1.0, 5.0, FULL);
+        setFullMm(cfg.full);
+        lastRatio = {};
+        syncPanelUI();
+      }
+      if (!cfg.hasThemeQ && m.theme && FILL_PRESETS[m.theme] && m.theme !== cfg.theme) {
+        cfg.theme = m.theme;
+        lastRatio = {};
+        syncPanelUI();
+      }
+    }
+  };
+  es.onerror = () => {
+    if (es && es.readyState === 2 && !esTimer) {
+      esTimer = setTimeout(() => { esTimer = null; connectSSE(); }, 1200);
+    }
+  };
+}
+connectSSE();
+setInterval(() => {
+  if (Date.now() - lastMsg > 4000 && !esTimer) { lastMsg = Date.now(); connectSSE(); }
+}, 2000);
 
 function drawOnce() {
   const stale = Date.now() - lastMsg > 2000;
@@ -4256,7 +4657,7 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
     user-select: none;
   }
   #pad::before {
-    content: ""; position: absolute; inset: 0; pointer-events: none;
+    content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0; inset: 0; pointer-events: none;
     background:
       linear-gradient(to right, transparent calc(50% - 0.5px), rgba(255,255,255,0.06) 50%, transparent calc(50% + 0.5px)),
       linear-gradient(to bottom, transparent calc(50% - 0.5px), rgba(255,255,255,0.06) 50%, transparent calc(50% + 0.5px));
@@ -4267,7 +4668,7 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
   .c-tr { top: 6px; right: 6px; border-width: 1.5px 1.5px 0 0; border-radius: 0 3px 0 0; }
   .c-bl { bottom: 6px; left: 6px; border-width: 0 0 1.5px 1.5px; border-radius: 0 0 0 3px; }
   .c-br { bottom: 6px; right: 6px; border-width: 0 1.5px 1.5px 0; border-radius: 0 0 3px 0; }
-  #trailCv { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #trailCv { position: absolute; top: 0; right: 0; bottom: 0; left: 0; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 
   #mouse {
     position: absolute; left: 0; top: 0;
@@ -4336,7 +4737,7 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
   .p-btn.cal.on { background: rgba(251, 191, 36, 0.32); color: #fff; }
   .p-hint { color: rgba(255, 255, 255, 0.42); font-size: 11px; margin-top: 8px; line-height: 1.4; }
   #calBanner {
-    position: absolute; inset: 0; z-index: 20; display: none;
+    position: absolute; top: 0; right: 0; bottom: 0; left: 0; inset: 0; z-index: 20; display: none;
     flex-direction: column; align-items: center; justify-content: center; gap: 6px;
     background: rgba(12, 15, 21, 0.86); backdrop-filter: blur(6px);
     padding: 14px; text-align: center;
@@ -4354,7 +4755,7 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
     <div class="corner c-bl"></div><div class="corner c-br"></div>
     <canvas id="trailCv"></canvas>
     <div id="mouse" title="Razer Viper V4 Pro (127.1×63.9mm)">
-      <svg viewBox="-22 -18 682 1307" xmlns="http://www.w3.org/2000/svg">
+      <svg viewBox="-22 -18 682 1307" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
         <defs>
           <linearGradient id="viperGrad" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stop-color="#222631" stop-opacity="0.92"/>
@@ -4362,16 +4763,16 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
             <stop offset="100%" stop-color="#0f1117" stop-opacity="0.94"/>
           </linearGradient>
           <path id="viperOutline" d="M268.5 1268c-66.5-11-128.7-41.4-173.3-85-75-73.3-104.2-175-92.9-323.1 2.1-27 3.9-69.3 4.1-93.9 1.1-144.3.9-138.4 6.9-144.4 6.6-6.6 7.8-28.3 1.8-33.3-2.9-2.4-4.2-20-5.7-74.5-1.8-63.7-1.5-72.4 2.7-80.5 3.7-7.2 4.3-13.6 3-31.7-7-91.8-8.4-276.4-2.3-293.8 4.1-11.7 17.8-24.6 26-24.6 3.9 0 5.5 2.1 5.7 7.7.2 6.1.9 5.3 2.9-4l2.6-11.7 31.4-13.2C150.6 32 258.8-4 267.3-.8c3 1.1 4 7.5 4 25.6 0 21.5.5 24 4.9 23.2 2.7-.5 5.3-3.6 5.8-6.9 1.1-7.7 7.5-9.3 37.5-9.3 28.3 0 38.7 3 38.7 11.1 0 3.2 1.9 5.7 4.2 5.7 3.4 0 4.2-4.3 4.2-22.1 0-29.4 1.6-30.6 29.6-22.7 50.3 14.1 180.7 62.4 191.2 70.8 1.9 1.5 3.5 7.1 3.5 12.3s1 9.5 2.3 9.5c1.3 0 2.2-2.8 2.1-6.3-.4-11 10.2-9.4 21.5 3.1 8.1 8.9 10.5 14.3 12.2 27.5 3.7 27.6 2 154.9-3.2 243.5-8 136.1-6.8 246.9 4.1 398.2 14.8 205.3 9.9 262.2-29.6 341.6-41.4 83.1-117.7 139.9-215.6 160.3-30.7 6.4-86.6 7.8-116.4 2.9z"/>
-          <clipPath id="viperClip"><use href="#viperOutline"/></clipPath>
+          <clipPath id="viperClip"><use href="#viperOutline" xlink:href="#viperOutline"/></clipPath>
         </defs>
-        <use href="#viperOutline" class="m-shell"/>
+        <use href="#viperOutline" xlink:href="#viperOutline" class="m-shell"/>
         <g clip-path="url(#viperClip)">
           <path id="mbL" class="m-btn" d="M 0 0 L 312 0 L 312 486 Q 160 510, 0 462 Z"/>
           <path id="mbR" class="m-btn" d="M 326 0 L 640 0 L 640 462 Q 480 510, 326 486 Z"/>
           <path class="m-seam" d="M 10 462 Q 165 510, 319 488 Q 473 510, 628 462"/>
           <line class="m-seam" x1="319" y1="32" x2="319" y2="488"/>
         </g>
-        <use href="#viperOutline" fill="none" stroke="rgba(255,255,255,0.52)" stroke-width="18" stroke-linejoin="round"/>
+        <use href="#viperOutline" xlink:href="#viperOutline" fill="none" stroke="rgba(255,255,255,0.52)" stroke-width="18" stroke-linejoin="round"/>
         <rect id="mbM" class="m-wheel" x="284" y="138" width="70" height="184" rx="35"/>
         <rect id="mbX2" class="m-side" x="-6" y="430" width="32" height="156" rx="14"/>
         <rect id="mbX1" class="m-side" x="-6" y="618" width="32" height="156" rx="14"/>
@@ -4465,39 +4866,47 @@ MOUSE_OVERLAY_PAGE = r"""<!DOCTYPE html>
     <button id="pCopy" class="p-btn primary" type="button">复制鼠标垫链接</button>
     <button id="pReset" class="p-btn" type="button">恢复默认</button>
   </div>
-  <div class="p-hint">独立透明源，与键盘 HUD 链接分开。按 C 切面板，按 Home 归中（已避开游戏 R 换弹键）；校准后自动同步 OBS。</div>
+  <div id="pUipiWarn" class="p-hint" style="display:none;color:#fde68a">检测到管理员权限窗口（如直播姬/游戏），已自动启用桌面光标兜底；若锁视角 FPS 内不动，请以管理员身份运行本程序。</div>
+  <div class="p-hint">所有样式与参数调整自动保存并实时同步至 OBS/直播姬；按 C 切面板，按 Home 归中（已避开游戏 R 换弹键）。</div>
 </div>
 
 <script>
 __THEME_JS__
 const PAD_SIZES = { gsr3: [306, 254], sq: [270, 270], wide: [340, 212], xl: [405, 180] };
+const SAVED_MHUD = __MOUSE_HUD__;
+const SAVED_MSPAN = __MOUSE_SPAN__;
+const SAVED_MHUD_REV = __MOUSE_HUD_REV__;
 function clamp(v, lo, hi, def) {
   const n = parseFloat(v);
   return isNaN(n) ? def : Math.max(lo, Math.min(hi, n));
 }
 function readConfig() {
   const q = new URLSearchParams(location.search);
-  const rawPad = (q.get('pad') || 'gsr3').toLowerCase();
+  const rawPad = (q.get('pad') !== null ? q.get('pad') : (SAVED_MHUD.pad || 'gsr3')).toLowerCase();
   const pad = PAD_SIZES[rawPad] ? rawPad : 'gsr3';
   const hasThemeQ = q.has('theme');
-  const rawTheme = (q.get('theme') || 'ramp').toLowerCase();
+  const rawTheme = (q.get('theme') !== null ? q.get('theme') : (SAVED_MHUD.theme || 'ramp')).toLowerCase();
   const theme = FILL_PRESETS[rawTheme] ? rawTheme : 'ramp';
   const hasSpanQ = q.has('span');
-  const span = Math.round(clamp(q.get('span'), 500, 200000, 14800));
-  const rawRec = (q.get('recenter') || 'smart').toLowerCase();
+  const span = Math.round(clamp(q.get('span') !== null ? q.get('span') : SAVED_MSPAN, 500, 200000, 14800));
+  const rawRec = (q.get('recenter') !== null ? q.get('recenter') : (SAVED_MHUD.recenter || 'smart')).toLowerCase();
   const recenter = rawRec === 'gentle' ? 'smart'
                  : (['smart', 'fast', 'off'].indexOf(rawRec) >= 0 ? rawRec : 'smart');
-  const rawAlign = (q.get('align') || 'center').toLowerCase();
+  const rawAlign = (q.get('align') !== null ? q.get('align') : (SAVED_MHUD.align || 'center')).toLowerCase();
   const align = ['center', 'tl', 'tr', 'bl', 'br'].indexOf(rawAlign) >= 0 ? rawAlign : 'center';
-  const rawTrail = (q.get('trail') || '1').toLowerCase();
+  const rawTrail = q.get('trail');
+  const trailVal = rawTrail !== null
+    ? !(rawTrail.toLowerCase() === '0' || rawTrail.toLowerCase() === 'false' || rawTrail.toLowerCase() === 'off')
+    : (SAVED_MHUD.trail !== false);
+  const opQ = q.get('opacity') !== null ? q.get('opacity') : q.get('alpha');
   return {
     pad, theme, hasThemeQ, span, hasSpanQ,
-    scale: clamp(q.get('scale'), 0.5, 2.5, 1.0),
-    opacity: clamp(q.get('opacity') !== null ? q.get('opacity') : q.get('alpha'), 0.1, 0.95, 0.62),
-    mopacity: clamp(q.get('mopacity'), 0.15, 1.0, 0.90),
-    sens: clamp(q.get('sens'), 0.2, 4.0, 1.0),
+    scale: clamp(q.get('scale') !== null ? q.get('scale') : SAVED_MHUD.scale, 0.5, 2.5, 1.0),
+    opacity: clamp(opQ !== null ? opQ : SAVED_MHUD.opacity, 0.1, 0.95, 0.62),
+    mopacity: clamp(q.get('mopacity') !== null ? q.get('mopacity') : SAVED_MHUD.mopacity, 0.15, 1.0, 0.90),
+    sens: clamp(q.get('sens') !== null ? q.get('sens') : SAVED_MHUD.sens, 0.2, 4.0, 1.0),
     recenter, align,
-    trail: !(rawTrail === '0' || rawTrail === 'false' || rawTrail === 'off'),
+    trail: trailVal,
     panel: q.get('panel') === '1'
   };
 }
@@ -4516,25 +4925,43 @@ for (const id in FILL_PRESETS) {
   const b = document.createElement('button');
   b.type = 'button'; b.className = 'chip'; b.dataset.theme = id;
   b.innerHTML = '<span class="sw" style="background:' + FILL_PRESETS[id].acc + '"></span>' + FILL_PRESETS[id].label;
-  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(false); });
+  b.addEventListener('click', () => { cfg.theme = id; cfg.hasThemeQ = true; applyConfig(true); });
   pThemes.appendChild(b);
 }
 
+let lastSrvRev = SAVED_MHUD_REV, localDirty = false, saveTimer = null, pendingSave = false;
+function mouseHudPayload() {
+  return {
+    pad: cfg.pad, theme: cfg.theme,
+    scale: Number(cfg.scale.toFixed(2)),
+    opacity: Number(cfg.opacity.toFixed(2)),
+    mopacity: Number(cfg.mopacity.toFixed(2)),
+    sens: Number(cfg.sens.toFixed(2)),
+    recenter: cfg.recenter, align: cfg.align,
+    trail: !!cfg.trail
+  };
+}
+function flushMouseHudSave(extra) {
+  if (!srvToken) { pendingSave = true; return; }
+  pendingSave = false;
+  const body = Object.assign({ mouse_hud: mouseHudPayload() }, extra || {});
+  fetch('/settings', {
+    method: 'POST',
+    headers: { 'X-Depth-Token': srvToken },
+    body: JSON.stringify(body)
+  }).then(r => r.json()).then(res => {
+    if (res && res.mouse_hud_rev !== undefined) lastSrvRev = Math.max(lastSrvRev, res.mouse_hud_rev);
+    if (!saveTimer) localDirty = false;
+  }).catch(() => { if (!saveTimer) localDirty = false; });
+}
+function scheduleMouseHudSave() {
+  localDirty = true;
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { saveTimer = null; flushMouseHudSave(); }, 120);
+}
+
 function buildObsUrl(includePanel) {
-  const p = new URLSearchParams();
-  if (cfg.pad !== 'gsr3') p.set('pad', cfg.pad);
-  if (cfg.theme !== 'ramp') p.set('theme', cfg.theme);
-  if (Math.abs(cfg.scale - 1.0) > 0.005) p.set('scale', cfg.scale.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
-  if (Math.abs(cfg.opacity - 0.62) > 0.005) p.set('opacity', cfg.opacity.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
-  if (Math.abs(cfg.mopacity - 0.90) > 0.005) p.set('mopacity', cfg.mopacity.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
-  if (Math.abs(cfg.sens - 1.0) > 0.005) p.set('sens', cfg.sens.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
-  if (cfg.hasSpanQ && cfg.span !== 14800) p.set('span', String(cfg.span));
-  if (cfg.recenter !== 'smart') p.set('recenter', cfg.recenter);
-  if (cfg.align !== 'center') p.set('align', cfg.align);
-  if (!cfg.trail) p.set('trail', '0');
-  if (includePanel) p.set('panel', '1');
-  const qs = p.toString();
-  return location.origin + '/overlay/mouse' + (qs ? ('?' + qs) : '');
+  return location.origin + '/overlay/mouse' + (includePanel ? '?panel=1' : '');
 }
 
 function syncPanelUI() {
@@ -4556,7 +4983,7 @@ function syncPanelUI() {
   panelEl.classList.toggle('open', cfg.panel);
 }
 
-function applyConfig() {
+function applyConfig(persist) {
   const base = PAD_SIZES[cfg.pad] || PAD_SIZES.gsr3;
   padW = Math.round(base[0] * cfg.scale);
   padH = Math.round(base[1] * cfg.scale);
@@ -4577,16 +5004,17 @@ function applyConfig() {
   tCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
   syncPanelUI();
   try { history.replaceState(null, '', buildObsUrl(cfg.panel)); } catch (e) {}
+  if (persist) scheduleMouseHudSave();
 }
 
-document.getElementById('pPad').addEventListener('change', e => { cfg.pad = e.target.value; applyConfig(); });
-document.getElementById('pScale').addEventListener('input', e => { cfg.scale = parseFloat(e.target.value); applyConfig(); });
-document.getElementById('pOpacity').addEventListener('input', e => { cfg.opacity = parseFloat(e.target.value); applyConfig(); });
-document.getElementById('pMOpacity').addEventListener('input', e => { cfg.mopacity = parseFloat(e.target.value); applyConfig(); });
-document.getElementById('pSens').addEventListener('input', e => { cfg.sens = parseFloat(e.target.value); applyConfig(); });
-document.getElementById('pRecenter').addEventListener('change', e => { cfg.recenter = e.target.value; applyConfig(); });
-document.getElementById('pAlign').addEventListener('change', e => { cfg.align = e.target.value; applyConfig(); });
-document.getElementById('pTrail').addEventListener('change', e => { cfg.trail = e.target.checked; if (!cfg.trail) trail.length = 0; applyConfig(); });
+document.getElementById('pPad').addEventListener('change', e => { cfg.pad = e.target.value; applyConfig(true); });
+document.getElementById('pScale').addEventListener('input', e => { cfg.scale = parseFloat(e.target.value); applyConfig(true); });
+document.getElementById('pOpacity').addEventListener('input', e => { cfg.opacity = parseFloat(e.target.value); applyConfig(true); });
+document.getElementById('pMOpacity').addEventListener('input', e => { cfg.mopacity = parseFloat(e.target.value); applyConfig(true); });
+document.getElementById('pSens').addEventListener('input', e => { cfg.sens = parseFloat(e.target.value); applyConfig(true); });
+document.getElementById('pRecenter').addEventListener('change', e => { cfg.recenter = e.target.value; applyConfig(true); });
+document.getElementById('pAlign').addEventListener('change', e => { cfg.align = e.target.value; applyConfig(true); });
+document.getElementById('pTrail').addEventListener('change', e => { cfg.trail = e.target.checked; if (!cfg.trail) trail.length = 0; applyConfig(true); });
 document.getElementById('pChecker').addEventListener('change', e => { document.body.classList.toggle('checker', e.target.checked); });
 document.getElementById('pClose').addEventListener('click', () => {
   cfg.panel = false; document.body.classList.remove('checker'); document.getElementById('pChecker').checked = false;
@@ -4616,12 +5044,10 @@ function setCalibrating(on, saveResult) {
     cfg.span = Math.max(500, Math.min(200000, measured));
     cfg.sens = 1.0;
     cfg.hasSpanQ = false;
-    fetch('/settings', {
-      method: 'POST',
-      headers: { 'X-Depth-Token': srvToken },
-      body: JSON.stringify({ mouse_span: cfg.span })
-    }).catch(() => {});
-    applyConfig();
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    localDirty = false;
+    flushMouseHudSave({ mouse_span: cfg.span });
+    applyConfig(false);
   }
   tx = ty = 0; trail.length = 0;
 }
@@ -4631,12 +5057,10 @@ document.getElementById('pCenter').addEventListener('click', () => { tx = ty = 0
 document.getElementById('pReset').addEventListener('click', () => {
   if (calibrating) setCalibrating(false, false);
   cfg = { pad:'gsr3', theme:'ramp', hasThemeQ:false, span:14800, hasSpanQ:false, scale:1.0, opacity:0.62, mopacity:0.90, sens:1.0, recenter:'smart', align:'center', trail:true, panel:cfg.panel };
-  fetch('/settings', {
-    method: 'POST',
-    headers: { 'X-Depth-Token': srvToken },
-    body: JSON.stringify({ mouse_span: 14800 })
-  }).catch(() => {});
-  tx = ty = px = py = 0; trail.length = 0; applyConfig();
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  localDirty = false;
+  flushMouseHudSave({ mouse_span: 14800 });
+  tx = ty = px = py = 0; trail.length = 0; applyConfig(false);
 });
 document.getElementById('pCopy').addEventListener('click', () => {
   const url = buildObsUrl(false), btn = document.getElementById('pCopy');
@@ -4658,60 +5082,101 @@ addEventListener('keydown', e => {
   }
 });
 
-let tx = 0, ty = 0, px = 0, py = 0, lastMoveMs = 0, wheelUntil = 0, lastFrameMs = performance.now();
+let tx = 0, ty = 0, px = 0, py = 0, lastMoveMs = 0, wheelUntil = 0, lastFrameMs = Date.now(), lastMsgMs = Date.now();
 const btns = { l: false, r: false, m: false, x1: false, x2: false };
 const trail = [];
 const mbL = document.getElementById('mbL'), mbR = document.getElementById('mbR');
 const mbM = document.getElementById('mbM'), mbX1 = document.getElementById('mbX1');
 const mbX2 = document.getElementById('mbX2'), mbLed = document.getElementById('mbLed');
+const pUipiWarn = document.getElementById('pUipiWarn');
+let es = null, esTimer = null;
 
-const es = new EventSource('/events');
-es.onmessage = ev => {
-  const m = JSON.parse(ev.data);
-  if (m.token) srvToken = m.token;
-  if (!cfg.hasThemeQ && m.theme && FILL_PRESETS[m.theme] && m.theme !== cfg.theme) {
-    cfg.theme = m.theme; applyConfig();
-  }
-  if (!cfg.hasSpanQ && m.mouse_span && Math.abs(m.mouse_span - cfg.span) >= 1) {
-    cfg.span = Math.round(clamp(m.mouse_span, 500, 200000, 14800));
-    syncPanelUI();
-  }
-  const ms = m.m;
-  if (!ms) return;
-  const midNow = !!ms.m;
-  if (calibrating) {
-    if (ms.dx) {
-      calDx += ms.dx;
-      const absDx = Math.round(Math.abs(calDx));
-      calCountEl.textContent = absDx + ' counts';
-      tx = Math.max(-1, Math.min(1, -1 + 2 * Math.min(1, absDx / Math.max(2000, cfg.span))));
-      lastMoveMs = performance.now();
+function connectSSE() {
+  if (es) { try { es.close(); } catch (e) {} }
+  es = new EventSource('/events');
+  es.onmessage = ev => {
+    lastMsgMs = Date.now();
+    const m = JSON.parse(ev.data);
+    if (m.token) {
+      srvToken = m.token;
+      if (pendingSave) flushMouseHudSave();
     }
-    if (midNow && !prevMidBtn) setCalibrating(false, Math.abs(calDx) >= 500);
+    if (pUipiWarn) pUipiWarn.style.display = m.mouse_uipi ? 'block' : 'none';
+    if (!localDirty && m.mouse_hud && typeof m.mouse_hud_rev === 'number' && m.mouse_hud_rev > lastSrvRev) {
+      lastSrvRev = m.mouse_hud_rev;
+      const h = m.mouse_hud;
+      if (h.pad && PAD_SIZES[h.pad]) cfg.pad = h.pad;
+      if (h.theme && FILL_PRESETS[h.theme]) cfg.theme = h.theme;
+      if (h.scale !== undefined) cfg.scale = clamp(h.scale, 0.5, 2.5, cfg.scale);
+      if (h.opacity !== undefined) cfg.opacity = clamp(h.opacity, 0.1, 0.95, cfg.opacity);
+      if (h.mopacity !== undefined) cfg.mopacity = clamp(h.mopacity, 0.15, 1.0, cfg.mopacity);
+      if (h.sens !== undefined) cfg.sens = clamp(h.sens, 0.2, 4.0, cfg.sens);
+      if (h.recenter && ['smart', 'fast', 'off'].indexOf(h.recenter) >= 0) cfg.recenter = h.recenter;
+      if (h.align && ['center', 'tl', 'tr', 'bl', 'br'].indexOf(h.align) >= 0) cfg.align = h.align;
+      if (h.trail !== undefined) {
+        cfg.trail = !!h.trail;
+        if (!cfg.trail) trail.length = 0;
+      }
+      applyConfig(false);
+    } else if (lastSrvRev === 0 && !cfg.hasThemeQ && m.theme && FILL_PRESETS[m.theme] && m.theme !== cfg.theme) {
+      cfg.theme = m.theme; applyConfig(false);
+    }
+    if (!cfg.hasSpanQ && m.mouse_span && Math.abs(m.mouse_span - cfg.span) >= 1) {
+      cfg.span = Math.round(clamp(m.mouse_span, 500, 200000, 14800));
+      syncPanelUI();
+    }
+    const ms = m.m;
+    if (!ms) return;
+    const midNow = !!ms.m;
+    const nowMs = Date.now();
+    if (calibrating) {
+      if (ms.dx) {
+        calDx += ms.dx;
+        const absDx = Math.round(Math.abs(calDx));
+        calCountEl.textContent = absDx + ' counts';
+        tx = Math.max(-1, Math.min(1, -1 + 2 * Math.min(1, absDx / Math.max(2000, cfg.span))));
+        lastMoveMs = nowMs;
+      }
+      if (midNow && !prevMidBtn) setCalibrating(false, Math.abs(calDx) >= 500);
+      prevMidBtn = midNow;
+      btns.l = !!ms.l; btns.r = !!ms.r; btns.m = midNow;
+      btns.x1 = !!ms.x1; btns.x2 = !!ms.x2;
+      return;
+    }
     prevMidBtn = midNow;
+    if (ms.dx || ms.dy) {
+      const step = (2.0 * cfg.sens) / Math.max(500, cfg.span);
+      const rx = Math.max(1, (padW - mouseW) * 0.5);
+      const ry = Math.max(1, (padH - mouseH) * 0.5);
+      const ratio = rx / ry;
+      tx = Math.max(-1, Math.min(1, tx + ms.dx * step));
+      ty = Math.max(-1, Math.min(1, ty + ms.dy * step * ratio));
+      lastMoveMs = nowMs;
+    }
+    if (ms.w) wheelUntil = nowMs + 140;
     btns.l = !!ms.l; btns.r = !!ms.r; btns.m = midNow;
     btns.x1 = !!ms.x1; btns.x2 = !!ms.x2;
-    return;
-  }
-  prevMidBtn = midNow;
-  if (ms.dx || ms.dy) {
-    const step = (2.0 * cfg.sens) / Math.max(500, cfg.span);
-    const rx = Math.max(1, (padW - mouseW) * 0.5);
-    const ry = Math.max(1, (padH - mouseH) * 0.5);
-    const ratio = rx / ry;
-    tx = Math.max(-1, Math.min(1, tx + ms.dx * step));
-    ty = Math.max(-1, Math.min(1, ty + ms.dy * step * ratio));
-    lastMoveMs = performance.now();
-  }
-  if (ms.w) wheelUntil = performance.now() + 140;
-  btns.l = !!ms.l; btns.r = !!ms.r; btns.m = midNow;
-  btns.x1 = !!ms.x1; btns.x2 = !!ms.x2;
-};
+  };
+  es.onerror = () => {
+    if (es && es.readyState === 2 && !esTimer) {
+      esTimer = setTimeout(() => { esTimer = null; connectSSE(); }, 1200);
+    }
+  };
+}
+connectSSE();
+setInterval(() => {
+  if (Date.now() - lastMsgMs > 4000 && !esTimer) { lastMsgMs = Date.now(); connectSSE(); }
+}, 2000);
 
-function loop(now) {
-  const dt = Math.min(0.05, (now - lastFrameMs) / 1000);
+function loopOnce() {
+  const now = Date.now();
+  const dt = Math.max(0.001, Math.min(0.05, (now - lastFrameMs) / 1000));
   lastFrameMs = now;
-  const idleMs = now - lastMoveMs;
+  const idleMs = Math.max(0, now - lastMoveMs);
+  if (!isFinite(tx)) tx = 0;
+  if (!isFinite(ty)) ty = 0;
+  if (!isFinite(px)) px = 0;
+  if (!isFinite(py)) py = 0;
   if (!calibrating) {
     if (cfg.recenter === 'fast' && idleMs > 60) {
       const k = Math.exp(-dt * 5.2);
@@ -4735,8 +5200,8 @@ function loop(now) {
   const cy = padH * 0.5 + py * maxOy;
   const vx = (px - prevX) / Math.max(0.004, dt);
   const tilt = Math.max(-6, Math.min(6, vx * 1.2));
-  mouseEl.style.transform = 'translate3d(' + (cx - mouseW * 0.5).toFixed(1) + 'px,' +
-    (cy - mouseH * 0.5).toFixed(1) + 'px,0) rotate(' + tilt.toFixed(2) + 'deg)';
+  mouseEl.style.transform = 'translate(' + (cx - mouseW * 0.5).toFixed(1) + 'px,' +
+    (cy - mouseH * 0.5).toFixed(1) + 'px) rotate(' + tilt.toFixed(2) + 'deg)';
 
   const moving = idleMs < 180;
   mbL.classList.toggle('on', btns.l);
@@ -4746,33 +5211,44 @@ function loop(now) {
   mbX2.classList.toggle('on', btns.x2);
   mbLed.classList.toggle('hot', moving || btns.l || btns.r);
 
-  if (cfg.trail) {
-    if (moving || trail.length) {
-      if (moving) trail.push([cx, cy, now]);
-      while (trail.length && (now - trail[0][2] > 620 || trail.length > 48)) trail.shift();
-      tCtx.clearRect(0, 0, padW, padH);
-      if (trail.length > 1) {
-        const speedR = Math.min(1, Math.hypot(tx - px, ty - py) * 3.5 + (btns.l ? 0.5 : 0));
-        const st = (FILL_PRESETS[cfg.theme] || FILL_PRESETS.ramp).style(speedR);
-        tCtx.lineCap = 'round'; tCtx.lineJoin = 'round';
-        for (let i = 1; i < trail.length; i++) {
-          const age = 1 - (now - trail[i][2]) / 620;
-          if (age <= 0) continue;
-          tCtx.strokeStyle = st.acc;
-          tCtx.globalAlpha = age * 0.68;
-          tCtx.lineWidth = Math.max(1.4, age * 3.5 * cfg.scale);
-          tCtx.beginPath();
-          tCtx.moveTo(trail[i - 1][0], trail[i - 1][1]);
-          tCtx.lineTo(trail[i][0], trail[i][1]);
-          tCtx.stroke();
+  if (tCtx) {
+    if (cfg.trail) {
+      if (moving || trail.length) {
+        if (moving) trail.push([cx, cy, now]);
+        while (trail.length && (now - trail[0][2] > 620 || trail.length > 48)) trail.shift();
+        tCtx.clearRect(0, 0, padW, padH);
+        if (trail.length > 1) {
+          const speedR = Math.min(1, Math.hypot(tx - px, ty - py) * 3.5 + (btns.l ? 0.5 : 0));
+          const st = (FILL_PRESETS[cfg.theme] || FILL_PRESETS.ramp).style(speedR);
+          tCtx.lineCap = 'round'; tCtx.lineJoin = 'round';
+          for (let i = 1; i < trail.length; i++) {
+            const age = 1 - (now - trail[i][2]) / 620;
+            if (age <= 0) continue;
+            tCtx.strokeStyle = st.acc;
+            tCtx.globalAlpha = age * 0.68;
+            tCtx.lineWidth = Math.max(1.4, age * 3.5 * cfg.scale);
+            tCtx.beginPath();
+            tCtx.moveTo(trail[i - 1][0], trail[i - 1][1]);
+            tCtx.lineTo(trail[i][0], trail[i][1]);
+            tCtx.stroke();
+          }
+          tCtx.globalAlpha = 1;
         }
-        tCtx.globalAlpha = 1;
       }
+    } else {
+      tCtx.clearRect(0, 0, padW, padH);
     }
-  } else {
-    tCtx.clearRect(0, 0, padW, padH);
   }
-  requestAnimationFrame(loop);
+}
+
+function loop() {
+  try {
+    loopOnce();
+  } catch (e) {
+    /* keep rAF loop alive */
+  } finally {
+    requestAnimationFrame(loop);
+  }
 }
 
 applyConfig();
