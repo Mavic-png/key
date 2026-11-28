@@ -127,7 +127,7 @@ def recordings_dir():
     if h:
         return os.path.join(h, "recordings")
     return os.path.join(os.path.expanduser("~"), "Documents", "depth-recordings")
-VERSION = "1.16.3"
+VERSION = "1.17.0"
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
@@ -1473,6 +1473,258 @@ class Engine(object):
         return {"span": span, "x": xs, "y": ys, "b": bs, "w": ws,
                 "spd": spds, "clicks": clicks, "wheels": wheels}
 
+    def _wb_analyze_strafes(self, ts, v1, v2, k1, k2, thresh=0.25):
+        events = []
+        prev_single = None
+        in_both_t0 = None
+        gap_t0 = None
+        for i in range(len(ts)):
+            t = ts[i]
+            d1 = v1[i] > thresh
+            d2 = v2[i] > thresh
+            if d1 and d2:
+                if in_both_t0 is None:
+                    in_both_t0 = t
+                gap_t0 = None
+            elif d1 or d2:
+                cur = 0 if d1 else 1
+                if in_both_t0 is not None:
+                    if prev_single is not None and prev_single != cur:
+                        ms = round(max(0.0, (t - in_both_t0) * 1000.0), 1)
+                        d_str = "%s\u2192%s" % (k1 if prev_single == 0 else k2,
+                                               k2 if prev_single == 0 else k1)
+                        events.append({"t0": round(in_both_t0, 3), "t1": round(t, 3),
+                                       "ms": ms, "kind": "overlap", "dir": d_str,
+                                       "clean": ms <= 15.0})
+                    in_both_t0 = None
+                elif gap_t0 is not None and prev_single is not None and prev_single != cur:
+                    ms = round(max(0.0, (t - gap_t0) * 1000.0), 1)
+                    if ms <= 350.0:
+                        d_str = "%s\u2192%s" % (k1 if prev_single == 0 else k2,
+                                               k2 if prev_single == 0 else k1)
+                        events.append({"t0": round(gap_t0, 3), "t1": round(t, 3),
+                                       "ms": ms, "kind": "gap", "dir": d_str,
+                                       "clean": ms <= 45.0})
+                gap_t0 = None
+                prev_single = cur
+            else:
+                in_both_t0 = None
+                if prev_single is not None and gap_t0 is None:
+                    gap_t0 = t
+        overlaps = [e for e in events if e["kind"] == "overlap"]
+        gaps = [e for e in events if e["kind"] == "gap"]
+        clean_n = sum(1 for e in events if e["clean"])
+        worst = sorted([e for e in overlaps if not e["clean"]],
+                       key=lambda e: -e["ms"])[:10]
+        return {
+            "pair": [k1, k2],
+            "total": len(events),
+            "clean_count": clean_n,
+            "clean_pct": round(clean_n * 100.0 / len(events), 1) if events else None,
+            "overlap_count": len(overlaps),
+            "avg_overlap_ms": round(sum(e["ms"] for e in overlaps) / len(overlaps), 1) if overlaps else 0.0,
+            "max_overlap_ms": max((e["ms"] for e in overlaps), default=0.0),
+            "avg_gap_ms": round(sum(e["ms"] for e in gaps) / len(gaps), 1) if gaps else 0.0,
+            "events": events,
+            "worst": worst,
+        }
+
+    def _wb_analyze_keys(self, ts, keys, cols):
+        import math
+        n_rows = max(1, len(ts))
+        out = []
+        for idx, k in enumerate(keys):
+            arr = cols[idx]
+            presses = 0
+            active_n = 0
+            active_sum = 0.0
+            peaks = []
+            trigs = []
+            in_p = False
+            cur_peak = 0.0
+            cur_trig = None
+            for v in arr:
+                if v > 0.15:
+                    active_n += 1
+                    active_sum += v
+                    if not in_p:
+                        in_p = True
+                        presses += 1
+                        cur_peak = v
+                        cur_trig = v if v >= 0.25 else None
+                    else:
+                        if v > cur_peak:
+                            cur_peak = v
+                        if cur_trig is None and v >= 0.25:
+                            cur_trig = v
+                elif in_p:
+                    peaks.append(cur_peak)
+                    if cur_trig is not None:
+                        trigs.append(cur_trig)
+                    in_p = False
+            if in_p:
+                peaks.append(cur_peak)
+                if cur_trig is not None:
+                    trigs.append(cur_trig)
+            p_mean = sum(peaks) / len(peaks) if peaks else 0.0
+            p_std = math.sqrt(sum((x - p_mean) ** 2 for x in peaks) / len(peaks)) if len(peaks) > 1 else 0.0
+            t_mean = sum(trigs) / len(trigs) if trigs else 0.0
+            t_std = math.sqrt(sum((x - t_mean) ** 2 for x in trigs) / len(trigs)) if len(trigs) > 1 else 0.0
+            out.append({
+                "key": k,
+                "presses": presses,
+                "active_pct": round(active_n * 100.0 / n_rows, 1),
+                "avg_mm": round(active_sum / active_n, 2) if active_n else 0.0,
+                "peak_mean": round(p_mean, 2),
+                "peak_std": round(p_std, 2),
+                "trig_mean": round(t_mean, 2),
+                "trig_std": round(t_std, 2),
+            })
+        out.sort(key=lambda x: (-x["presses"], -x["active_pct"]))
+        return out
+
+    def _wb_analyze_mouse(self, wide_path, ts, keys, cols):
+        import bisect, math, re
+        mouse_p = os.path.join(os.path.dirname(wide_path), "mouse.csv")
+        if not os.path.isfile(mouse_p) or not ts:
+            return None, None
+        span = self.mouse_span
+        evts = []
+        try:
+            with io.open(mouse_p, encoding="utf-8") as f:
+                hdr = False
+                for line in f:
+                    if line.startswith("#"):
+                        m = re.search(r"mouse_span\s*=\s*(\d+)", line)
+                        if m:
+                            v = int(m.group(1))
+                            if 500 <= v <= 200000:
+                                span = v
+                        continue
+                    if not hdr:
+                        hdr = True
+                        continue
+                    p = line.strip().split(",")
+                    if len(p) >= 5:
+                        evts.append((float(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4])))
+        except Exception:
+            return None, None
+        if not evts:
+            return None, None
+
+        # LMB shot stability against movement keys (W/A/S/D)
+        move_idxs = [(i, k) for i, k in enumerate(keys) if k.upper() in ("W", "A", "S", "D")]
+        shots_all = []
+        moving = []
+        prev_b = 0
+        last_shot = -1.0
+        for et, dx, dy, bmask, wh in evts:
+            if ((~prev_b) & bmask) & 1 and (et - last_shot) >= 0.04:
+                last_shot = et
+                ri = bisect.bisect_right(ts, et) - 1
+                ri = max(0, min(len(ts) - 1, ri))
+                mm_max = 0.0
+                mk = ""
+                for ci, kn in move_idxs:
+                    v = cols[ci][ri]
+                    if v > mm_max:
+                        mm_max = v
+                        mk = kn
+                still = mm_max < 0.30
+                shots_all.append([round(et, 3), round(mm_max, 2), 1 if still else 0])
+                if not still:
+                    moving.append({"t": round(et, 3), "mm": round(mm_max, 2), "key": mk})
+            prev_b = bmask
+        n_sh = len(shots_all)
+        still_n = sum(1 for s in shots_all if s[2])
+        shots = {
+            "total": n_sh,
+            "still_count": still_n,
+            "still_pct": round(still_n * 100.0 / n_sh, 1) if n_sh else None,
+            "avg_move_mm": round(sum(s[1] for s in shots_all) / n_sh, 2) if n_sh else 0.0,
+            "moving": sorted(moving, key=lambda x: -x["mm"])[:12],
+            "all": shots_all[:300],
+        }
+
+        # 24x20 mousepad activity heatmap + LMB click positions
+        gw, gh = 24, 20
+        grid = [0] * (gw * gh)
+        lmb_pts = []
+        tx = ty = 0.0
+        last_move = -9.0
+        prev_t = evts[0][0]
+        prev_b = 0
+        step_x = 2.0 / max(500.0, float(span))
+        aspect = (306.0 - 44.0) / (254.0 - 84.0)
+        for et, dx, dy, bmask, wh in evts:
+            dt = max(0.0, min(0.2, et - prev_t))
+            prev_t = et
+            if dx or dy:
+                tx = max(-1.0, min(1.0, tx + dx * step_x))
+                ty = max(-1.0, min(1.0, ty + dy * step_x * aspect))
+                last_move = et
+            elif et - last_move > 0.20 and dt > 0:
+                k = math.exp(-dt * (1.6 + min(1.4, math.hypot(tx, ty)) * 4.2))
+                tx *= k
+                ty *= k
+            gx = max(0, min(gw - 1, int((tx + 1.0) * 0.5 * gw)))
+            gy = max(0, min(gh - 1, int((ty + 1.0) * 0.5 * gh)))
+            grid[gy * gw + gx] += 1
+            if (((~prev_b) & bmask) & 1) and len(lmb_pts) < 200:
+                lmb_pts.append([round(tx, 3), round(ty, 3)])
+            prev_b = bmask
+        heat = {"w": gw, "h": gh, "grid": grid, "max": max(grid) if grid else 0, "lmb": lmb_pts}
+        return shots, heat
+
+    def wb_analysis(self, stamp=None, pair=("A", "D")):
+        manifest, _, _, wide = self._resolve_wide(stamp)
+        if not manifest or not wide:
+            return {"ok": False, "error": "no recording"}
+        ts = []
+        keys = []
+        cols = []
+        try:
+            with io.open(wide, encoding="utf-8") as f:
+                hdr = False
+                for line in f:
+                    if line.startswith("#"):
+                        continue
+                    parts = line.strip().split(",")
+                    if not hdr:
+                        hdr = True
+                        keys = [p for p in parts[2:] if p]
+                        cols = [[] for _ in keys]
+                        continue
+                    ts.append(float(parts[0]))
+                    for ci in range(len(keys)):
+                        cols[ci].append(float(parts[2 + ci]) if 2 + ci < len(parts) else 0.0)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if not ts:
+            return {"ok": False, "error": "empty recording"}
+        kmap = {k.upper(): i for i, k in enumerate(keys)}
+        k1, k2 = pair[0], pair[1]
+        if k1.upper() in kmap and k2.upper() in kmap:
+            i1, i2 = kmap[k1.upper()], kmap[k2.upper()]
+            strafes = self._wb_analyze_strafes(ts, cols[i1], cols[i2], keys[i1], keys[i2])
+        else:
+            strafes = {"pair": [k1, k2], "total": 0, "clean_count": 0, "clean_pct": None,
+                       "overlap_count": 0, "avg_overlap_ms": 0.0, "max_overlap_ms": 0.0,
+                       "avg_gap_ms": 0.0, "events": [], "worst": []}
+        key_stats = self._wb_analyze_keys(ts, keys, cols)
+        shots, heat = self._wb_analyze_mouse(wide, ts, keys, cols)
+        return {
+            "ok": True,
+            "stamp": manifest.get("stamp"),
+            "duration": round(ts[-1], 3),
+            "full_mm": round(self.full_mm, 2),
+            "keys": keys,
+            "strafes": strafes,
+            "shots": shots,
+            "key_stats": key_stats,
+            "mouse_heat": heat,
+        }
+
     def wb_series(self, step=0.02, limit=1600, stamp=None):
         manifest, _, _, wide = self._resolve_wide(stamp)
         if not manifest or not wide:
@@ -1549,7 +1801,14 @@ class Engine(object):
         keys = [k for k in (params.get("keys") or []) if k]
         speed = float(params.get("speed") or 1.0)
         bg = (params.get("bg") or "").strip()
-        png = bool(params.get("png"))
+        fmt = (params.get("fmt") or ("png" if params.get("png") else "prores")).strip().lower()
+        if fmt not in ("prores", "webm", "png"):
+            fmt = "prores"
+        inc_mouse = bool(params.get("mouse"))
+        mlay = (params.get("mouse_layout") or "side").strip().lower()
+        if mlay not in ("side", "stack", "only"):
+            mlay = "side"
+        mouse_csv = os.path.join(os.path.dirname(wide), "mouse.csv")
         out_name = params.get("out") or ("depth-%s" % time.strftime("%Y%m%d-%H%M%S"))
         exports = os.path.join(base, "exports")
         try:
@@ -1560,7 +1819,7 @@ class Engine(object):
         out_path = os.path.join(exports, out_name)
         argv = [py, kb, wide, "--fps", str(fps), "--size", size,
                 "--layout", layout, "--theme", theme, "--full", "%.2f" % full_mm,
-                "--speed", str(speed), "-o", out_path]
+                "--speed", str(speed), "--format", fmt, "-o", out_path]
         if keys:
             argv += ["--keys"] + keys
         if start > 0:
@@ -1569,8 +1828,11 @@ class Engine(object):
             argv += ["--end", "%.3f" % end]
         if bg:
             argv += ["--bg", bg]
-        if png:
+        if inc_mouse and os.path.isfile(mouse_csv):
+            argv += ["--mouse", mouse_csv, "--mouse-layout", mlay]
+        if fmt == "png":
             argv += ["--png-only", "--keep-frames"]
+        final_out = (out_path + ".webm") if fmt == "webm" else ((out_path + ".mov") if fmt == "prores" else out_path)
         try:
             proc = subprocess.Popen(argv, cwd=os.path.dirname(kb),
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1580,7 +1842,7 @@ class Engine(object):
             return False, "\u542f\u52a8\u6e32\u67d3\u5668\u5931\u8d25\uff1a%s" % exc
         with self.lock:
             self.export = {"running": True, "pct": 0, "msg": "\u6b63\u5728\u6e32\u67d3",
-                           "out": out_path, "proc": proc, "t0": time.time(),
+                           "out": final_out, "proc": proc, "t0": time.time(),
                            "eta": 0, "error": "", "argv": " ".join(argv)}
 
         def pump():
@@ -2246,6 +2508,16 @@ class Handler(BaseHTTPRequestHandler):
             stamp = (q.get("stamp") or [None])[0]
             try:
                 self._send_json(ENGINE.wb_series(step, limit=limit, stamp=stamp))
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)})
+        elif url.path == "/wb/analysis":
+            q = parse_qs(url.query)
+            stamp = (q.get("stamp") or [None])[0]
+            pair_s = (q.get("pair") or ["A,D"])[0]
+            parts = [p.strip() for p in pair_s.split(",") if p.strip()]
+            pair = (parts[0], parts[1]) if len(parts) >= 2 else ("A", "D")
+            try:
+                self._send_json(ENGINE.wb_analysis(stamp=stamp, pair=pair))
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)})
         elif url.path == "/wb/viz":
@@ -4600,6 +4872,23 @@ def workbench_html():
   .hist-keys { font-size:11px; color:var(--dim); max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   button.danger { color:#fca5a5; border-color:rgba(239,68,68,.32); background:rgba(239,68,68,.10); padding:3px 8px; font-size:11px; }
   button.danger:hover { background:rgba(239,68,68,.22); }
+  .kpi-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:10px; }
+  .kpi { background:rgba(255,255,255,.025); border:1px solid rgba(255,255,255,.08); border-radius:8px; padding:9px 11px; }
+  .kpi .kl { font-size:11px; color:var(--dim); }
+  .kpi .kv { font-size:18px; font-weight:700; margin-top:2px; color:#f4f4f5; }
+  .kpi .ks { font-size:11px; color:var(--dim); margin-top:2px; }
+  .diag-cols { display:grid; grid-template-columns:1fr 1fr 1.25fr; gap:10px; margin-top:10px; }
+  .diag-box { background:rgba(255,255,255,.02); border:1px solid rgba(255,255,255,.07); border-radius:8px; padding:8px 10px; }
+  .diag-list { display:flex; flex-direction:column; gap:5px; max-height:142px; overflow-y:auto; margin-top:6px; }
+  .diag-item { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:5px 8px; border-radius:6px;
+               background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.07); cursor:pointer; font-size:12px; }
+  .diag-item:hover { background:rgba(56,189,248,.12); border-color:rgba(56,189,248,.38); }
+  .tag-bad { color:#fda4af; font-weight:600; }
+  .tag-ok { color:#6ee7b7; font-weight:600; }
+  .ks-tbl { width:100%; border-collapse:collapse; font-size:11px; margin-top:6px; }
+  .ks-tbl th { text-align:left; color:var(--dim); font-weight:500; padding:3px 4px; border-bottom:1px solid rgba(255,255,255,.08); }
+  .ks-tbl td { padding:4px 4px; border-bottom:1px solid rgba(255,255,255,.04); }
+  @media (max-width:920px) { .kpi-grid { grid-template-columns:repeat(2,1fr); } .diag-cols { grid-template-columns:1fr; } }
 </style></head><body>
 <header>
   <h1>素材工作台</h1>
@@ -4700,6 +4989,7 @@ def workbench_html():
         <span class="pill">选中<b id="sel_len" class="num">0.000</b> 秒</span>
       </div>
       <div class="row">
+        <label id="showDiagChip" class="kchip on" style="margin:0"><input id="showDiag" type="checkbox" checked onchange="toggleDiag()">急停标注</label>
         <button type="button" onclick="zoom(0.5)">放大</button>
         <button type="button" onclick="zoom(2)">缩小</button>
         <button type="button" onclick="resetView()">全览</button>
@@ -4707,8 +4997,49 @@ def workbench_html():
     </div>
     <div id="tracks"><canvas id="cv"></canvas></div>
     <div id="hint">
-      <span>拖拽选区 · 滚轮缩放 · 悬停实时同步预览键鼠 · 双击清选 · Space 播/停 · ←/→ 逐帧微调</span>
+      <span>拖拽选区 · 滚轮缩放 · 悬停实时同步预览键鼠 · 红/绿区段=急停重叠/完美 · 双击清选 · Space 播/停 · ←/→ 微调</span>
       <span id="viewSpan" class="num">0.000s — 0.000s</span>
+    </div>
+  </div>
+
+  <div id="diagCard" class="card">
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <span class="sub" style="color:#e4e4e7;font-weight:600">FPS 实战诊断与复盘</span>
+        <span class="sub">急停键对</span>
+        <select id="diagPair" onchange="loadAnalysis()">
+          <option value="A,D">A / D</option>
+          <option value="W,S">W / S</option>
+        </select>
+      </div>
+      <div class="row">
+        <button id="exportCardBtn" class="primary" type="button" onclick="exportReviewCard()">一键导出复盘统计图 (PNG)</button>
+      </div>
+    </div>
+    <div class="kpi-grid">
+      <div class="kpi"><div class="kl">急停纯净度</div><div id="k_clean" class="kv num">—</div><div id="k_clean_s" class="ks num">暂无急停切换</div></div>
+      <div class="kpi"><div class="kl">平均重叠 / 最差</div><div id="k_ov" class="kv num">—</div><div id="k_ov_s" class="ks num">平均空窗 —</div></div>
+      <div class="kpi"><div class="kl">急停到位开枪率</div><div id="k_shot" class="kv num">—</div><div id="k_shot_s" class="ks num">需含鼠标录制</div></div>
+      <div class="kpi"><div class="kl">触发/峰值一致性</div><div id="k_cons" class="kv num">—</div><div id="k_cons_s" class="ks num">标准差越小越稳</div></div>
+    </div>
+    <div class="diag-cols">
+      <div class="diag-box">
+        <div class="sub">最差急停（点击跳转复盘）</div>
+        <div id="worstStrafeList" class="diag-list"><span class="sub">—</span></div>
+      </div>
+      <div class="diag-box">
+        <div class="sub">移动开枪瞬间（点击跳转复盘）</div>
+        <div id="movingShotList" class="diag-list"><span class="sub">—</span></div>
+      </div>
+      <div class="diag-box">
+        <div class="sub">单键频次 / 均深 / 峰值一致性 (mm)</div>
+        <div style="max-height:142px;overflow-y:auto">
+          <table class="ks-tbl">
+            <thead><tr><th>键</th><th>次</th><th>均深</th><th>峰值均值±σ</th><th>首触±σ</th></tr></thead>
+            <tbody id="keyStatsBody"><tr><td colspan="5" class="sub">—</td></tr></tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -4738,11 +5069,18 @@ def workbench_html():
       <select id="speed"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
       <span class="sub">格式</span>
       <select id="fmt">
-        <option value="prores">ProRes 4444（透明）</option>
+        <option value="webm" selected>WebM VP9（轻量透明）</option>
+        <option value="prores">ProRes 4444（透明 .mov）</option>
         <option value="png">PNG 序列（透明）</option>
       </select>
       <span class="sub">背景</span>
       <select id="bg"><option value="">透明</option><option value="#101014">深色 #101014</option><option value="#ffffff">白色</option></select>
+      <label class="kchip on" id="expMouseChip" style="margin:0"><input id="expMouse" type="checkbox" checked onchange="this.parentNode.classList.toggle('on',this.checked)">导出鼠标</label>
+      <select id="expMouseLayout" title="键鼠视频排版">
+        <option value="side">左右并排</option>
+        <option value="stack">上下叠放</option>
+        <option value="only">仅鼠标垫</option>
+      </select>
       <span style="flex:1"></span>
       <button class="primary" type="button" onclick="startExport()">开始导出</button>
       <button type="button" onclick="cancelExport()">取消</button>
@@ -4774,8 +5112,8 @@ const HUD_DEFAULT_KEYS = new Set(['Q','W','E','R','A','S','D','LShift','LCtrl','
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 const wbTrailCv = document.getElementById('wbTrail'), wbTrailCtx = wbTrailCv ? wbTrailCv.getContext('2d') : null;
 const RULER_H = 22, CV_H = 264;
-let info = null, data = null, view = [0, 1], sel = [0, 0], dragging = false, dragFrom = 0;
-let hoverT = null, playT = 0, playing = false, playLastMs = 0, showMouse = true;
+let info = null, data = null, analysis = null, view = [0, 1], sel = [0, 0], dragging = false, dragFrom = 0;
+let hoverT = null, playT = 0, playing = false, playLastMs = 0, showMouse = true, showDiag = true;
 let selectedKeys = new Set(), prevEls = {};
 
 function fmt(t) { return (t || 0).toFixed(3); }
@@ -4892,6 +5230,19 @@ function draw() {
     ctx.stroke();
   }
 
+  // FPS counter-strafe overlap (red) & clean (green) bands
+  if (showDiag && analysis && analysis.ok && analysis.strafes && analysis.strafes.events) {
+    for (const ev of analysis.strafes.events) {
+      if (ev.t1 < view[0] || ev.t0 > view[1]) continue;
+      const sx0 = xOf(ev.t0), sw = Math.max(2, xOf(ev.t1) - sx0);
+      const isBad = ev.kind === 'overlap' && !ev.clean;
+      ctx.fillStyle = isBad ? 'rgba(244,63,94,0.22)' : (ev.clean ? 'rgba(52,211,153,0.16)' : 'rgba(251,191,36,0.16)');
+      ctx.fillRect(sx0, RULER_H, sw, h - RULER_H);
+      ctx.fillStyle = isBad ? '#f43f5e' : (ev.clean ? '#34d399' : '#fbbf24');
+      ctx.fillRect(sx0, RULER_H, sw, 3);
+    }
+  }
+
   // Per-key tracks (+ optional bottom Mouse lane)
   const keys = data.keys || [], n = keys.length;
   const hasMouseLane = !!(showMouse && data.mouse && data.mouse.x && data.mouse.x.length);
@@ -4981,6 +5332,15 @@ function draw() {
         if (b & 1) { ctx.fillStyle = 'rgba(244,63,94,0.78)'; ctx.fillRect(x0m, my + 2, bw, 5); }
         if (b & 2) { ctx.fillStyle = 'rgba(251,191,36,0.78)'; ctx.fillRect(x0m, my + 8, bw, 4); }
         if ((b & 28) || wh) { ctx.fillStyle = 'rgba(52,211,153,0.78)'; ctx.fillRect(x0m, my + 13, bw, 3); }
+      }
+    }
+    // Moving-shot warning triangles along top edge of Mouse lane
+    if (showDiag && analysis && analysis.ok && analysis.shots && analysis.shots.all) {
+      ctx.fillStyle = '#fb923c';
+      for (const s of analysis.shots.all) {
+        if (s[2] || s[0] < view[0] || s[0] > view[1]) continue;
+        const sx = xOf(s[0]);
+        ctx.beginPath(); ctx.moveTo(sx, my + 1); ctx.lineTo(sx - 4, my - 5); ctx.lineTo(sx + 4, my - 5); ctx.closePath(); ctx.fill();
       }
     }
   }
@@ -5423,8 +5783,290 @@ function load(stamp) {
       }
       buildPreviewKb();
       draw();
+      loadAnalysis();
     });
   });
+}
+
+function toggleDiag() {
+  const cb = document.getElementById('showDiag');
+  showDiag = cb ? cb.checked : true;
+  const chip = document.getElementById('showDiagChip');
+  if (chip) chip.classList.toggle('on', showDiag);
+  draw();
+}
+
+function jumpToMoment(t) {
+  if (!data || !data.ok) return;
+  if (playing) togglePlay();
+  const dur = data.duration || 1;
+  playT = Math.max(0, Math.min(dur, t));
+  hoverT = null;
+  const half = Math.min(0.8, Math.max(0.25, dur * 0.2));
+  view = [Math.max(0, playT - half), Math.min(dur, playT + half)];
+  draw();
+  renderPreviewAt(playT);
+}
+
+function loadAnalysis() {
+  const pairEl = document.getElementById('diagPair');
+  const pair = pairEl ? pairEl.value : 'A,D';
+  const q = '?pair=' + encodeURIComponent(pair) + (currentStamp ? ('&stamp=' + encodeURIComponent(currentStamp)) : '');
+  fetch('/wb/analysis' + q).then(r => r.json()).then(j => {
+    analysis = j;
+    renderAnalysis();
+    draw();
+  }).catch(() => { analysis = null; renderAnalysis(); });
+}
+
+function renderAnalysis() {
+  const sEl = document.getElementById('worstStrafeList');
+  const mEl = document.getElementById('movingShotList');
+  const kEl = document.getElementById('keyStatsBody');
+  const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  if (!analysis || !analysis.ok) {
+    setTxt('k_clean', '—'); setTxt('k_clean_s', '暂无数据');
+    setTxt('k_ov', '—'); setTxt('k_ov_s', '—');
+    setTxt('k_shot', '—'); setTxt('k_shot_s', '需含鼠标录制');
+    setTxt('k_cons', '—'); setTxt('k_cons_s', '—');
+    if (sEl) sEl.innerHTML = '<span class="sub">—</span>';
+    if (mEl) mEl.innerHTML = '<span class="sub">—</span>';
+    if (kEl) kEl.innerHTML = '<tr><td colspan="5" class="sub">—</td></tr>';
+    return;
+  }
+  const st = analysis.strafes || {};
+  setTxt('k_clean', st.clean_pct != null ? (st.clean_pct.toFixed(1) + '%') : '—');
+  setTxt('k_clean_s', st.total ? (st.clean_count + '/' + st.total + ' 次切换纯净') : '当前键对无切换');
+  setTxt('k_ov', st.overlap_count ? (st.avg_overlap_ms.toFixed(1) + ' ms') : '0.0 ms');
+  setTxt('k_ov_s', '最差 ' + (st.max_overlap_ms || 0).toFixed(1) + 'ms · 均空窗 ' + (st.avg_gap_ms || 0).toFixed(1) + 'ms');
+  const sh = analysis.shots;
+  if (sh && sh.total) {
+    setTxt('k_shot', sh.still_pct.toFixed(1) + '%');
+    setTxt('k_shot_s', sh.still_count + '/' + sh.total + ' 枪到位 · 均移深 ' + sh.avg_move_mm.toFixed(2) + 'mm');
+  } else {
+    setTxt('k_shot', '—');
+    setTxt('k_shot_s', sh ? '未检测到左键开火' : '该录制无鼠标数据');
+  }
+  const ks = analysis.key_stats || [];
+  const mainKs = ks.filter(x => x.presses >= 2);
+  if (mainKs.length) {
+    const avgStd = mainKs.reduce((a, b) => a + b.peak_std, 0) / mainKs.length;
+    setTxt('k_cons', '±' + avgStd.toFixed(2) + ' mm');
+    setTxt('k_cons_s', '统计 ' + mainKs.length + ' 个高频键峰值标准差');
+  } else {
+    setTxt('k_cons', '—'); setTxt('k_cons_s', '按键次数不足 2 次');
+  }
+  if (sEl) {
+    const ws = st.worst || [];
+    sEl.innerHTML = ws.length
+      ? ws.map(e => '<div class="diag-item" onclick="jumpToMoment(' + e.t0 + ')"><span><b class="num">' + fmt(e.t0) + 's</b> ' + e.dir + '</span><span class="tag-bad num">重叠 ' + e.ms.toFixed(1) + 'ms</span></div>').join('')
+      : '<span class="tag-ok" style="font-size:12px">' + (st.total ? '全部急停均很纯净 ✓' : '未检测到重叠急停') + '</span>';
+  }
+  if (mEl) {
+    const mv = (sh && sh.moving) || [];
+    mEl.innerHTML = mv.length
+      ? mv.map(e => '<div class="diag-item" onclick="jumpToMoment(' + e.t + ')"><span><b class="num">' + fmt(e.t) + 's</b> 按住 ' + disp(norm(e.key)) + '</span><span class="tag-bad num">' + e.mm.toFixed(2) + ' mm</span></div>').join('')
+      : '<span class="sub">' + (sh && sh.total ? '所有开枪均已急停到位 ✓' : '无移动开枪记录') + '</span>';
+  }
+  if (kEl) {
+    kEl.innerHTML = ks.length
+      ? ks.slice(0, 12).map(x => '<tr><td><b>' + disp(norm(x.key)) + '</b></td><td class="num">' + x.presses + '</td><td class="num">' + x.avg_mm.toFixed(2) + '</td><td class="num">' + x.peak_mean.toFixed(2) + '±' + x.peak_std.toFixed(2) + '</td><td class="num">' + x.trig_mean.toFixed(2) + '±' + x.trig_std.toFixed(2) + '</td></tr>').join('')
+      : '<tr><td colspan="5" class="sub">无键盘采样</td></tr>';
+  }
+}
+
+function _rrect(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+
+function renderReviewCardCanvas() {
+  if (!analysis || !analysis.ok) return null;
+  const W = 1920, H = 1080;
+  const off = document.createElement('canvas');
+  off.width = W; off.height = H;
+  const g = off.getContext('2d');
+  // Background + subtle ambient glow
+  g.fillStyle = '#0b0e14'; g.fillRect(0, 0, W, H);
+  const bg1 = g.createRadialGradient(340, 120, 40, 340, 120, 680);
+  bg1.addColorStop(0, 'rgba(56,189,248,0.12)'); bg1.addColorStop(1, 'rgba(11,14,20,0)');
+  g.fillStyle = bg1; g.fillRect(0, 0, W, H);
+  const bg2 = g.createRadialGradient(1620, 920, 40, 1620, 920, 640);
+  bg2.addColorStop(0, 'rgba(244,63,94,0.10)'); bg2.addColorStop(1, 'rgba(11,14,20,0)');
+  g.fillStyle = bg2; g.fillRect(0, 0, W, H);
+
+  // Header
+  g.fillStyle = '#f8fafc'; g.font = '700 34px "Microsoft YaHei UI","Segoe UI",sans-serif';
+  g.fillText('FPS 磁轴实战复盘卡片', 60, 74);
+  g.fillStyle = 'rgba(226,232,240,0.58)'; g.font = '500 18px ui-monospace,Consolas,monospace';
+  const meta = 'ROG Falchion Ace 75 HE  ·  ' + (analysis.stamp || '—') + '  ·  ' + (analysis.duration || 0).toFixed(2) + 's  ·  满程 ' + FULL.toFixed(2) + 'mm';
+  g.textAlign = 'right'; g.fillText(meta, W - 60, 72); g.textAlign = 'left';
+
+  // Top 4 KPI cards
+  const st = analysis.strafes || {}, sh = analysis.shots, ks = analysis.key_stats || [];
+  const mainKs = ks.filter(x => x.presses >= 2);
+  const avgStd = mainKs.length ? (mainKs.reduce((a, b) => a + b.peak_std, 0) / mainKs.length) : null;
+  const kpis = [
+    ['急停纯净度 (' + (st.pair ? st.pair.join('/') : 'A/D') + ')', st.clean_pct != null ? st.clean_pct.toFixed(1) + '%' : '—',
+     st.total ? (st.clean_count + '/' + st.total + ' 次切换纯净') : '无切换数据', st.clean_pct >= 80 ? '#34d399' : '#fbbf24'],
+    ['平均重叠 / 最差重叠', st.overlap_count ? st.avg_overlap_ms.toFixed(1) + ' ms' : '0.0 ms',
+     '最差 ' + (st.max_overlap_ms || 0).toFixed(1) + ' ms · 均空窗 ' + (st.avg_gap_ms || 0).toFixed(1) + ' ms', st.avg_overlap_ms > 25 ? '#fb7185' : '#38bdf8'],
+    ['急停到位开枪率', (sh && sh.total) ? sh.still_pct.toFixed(1) + '%' : '—',
+     (sh && sh.total) ? (sh.still_count + '/' + sh.total + ' 枪到位 · 均移深 ' + sh.avg_move_mm.toFixed(2) + 'mm') : '无鼠标开火数据', (sh && sh.still_pct >= 80) ? '#34d399' : '#fb923c'],
+    ['磁轴峰值一致性', avgStd != null ? ('±' + avgStd.toFixed(2) + ' mm') : '—',
+     ks.length ? ('Top 键 ' + disp(norm(ks[0].key)) + ' (' + ks[0].presses + '次 / 均深 ' + ks[0].avg_mm.toFixed(2) + 'mm)') : '无按键数据', '#a78bfa']
+  ];
+  const kw = 432, kgap = 24;
+  kpis.forEach((kp, idx) => {
+    const x = 60 + idx * (kw + kgap), y = 104, kh = 132;
+    _rrect(g, x, y, kw, kh, 14);
+    g.fillStyle = 'rgba(255,255,255,0.035)'; g.fill();
+    g.strokeStyle = 'rgba(255,255,255,0.10)'; g.lineWidth = 1.5; g.stroke();
+    g.fillStyle = 'rgba(226,232,240,0.62)'; g.font = '500 17px "Microsoft YaHei UI",sans-serif';
+    g.fillText(kp[0], x + 22, y + 34);
+    g.fillStyle = kp[3]; g.font = '700 40px ui-monospace,Consolas,sans-serif';
+    g.fillText(kp[1], x + 22, y + 84);
+    g.fillStyle = 'rgba(226,232,240,0.56)'; g.font = '400 15px "Microsoft YaHei UI",sans-serif';
+    g.fillText(kp[2], x + 22, y + 114);
+  });
+  return off;
+}
+
+function drawReviewCardBody(g, an) {
+  // Left panel: 75% keyboard frequency & avg depth heatmap
+  const lx = 60, ly = 260, lw = 1100, lh = 466;
+  _rrect(g, lx, ly, lw, lh, 16);
+  g.fillStyle = 'rgba(255,255,255,0.03)'; g.fill();
+  g.strokeStyle = 'rgba(255,255,255,0.10)'; g.lineWidth = 1.5; g.stroke();
+  g.fillStyle = '#e2e8f0'; g.font = '600 20px "Microsoft YaHei UI",sans-serif';
+  g.fillText('键盘频次 & 平均深度热图', lx + 24, ly + 38);
+  const kmap = {};
+  let maxP = 1;
+  for (const s of (an.key_stats || [])) {
+    kmap[norm(s.key)] = s;
+    if (s.presses > maxP) maxP = s.presses;
+  }
+  const u = 62, gap = 6, ox = lx + 30, oy = ly + 64;
+  for (const it of FULL_LAYOUT) {
+    const kx = ox + it.x * u, ky = oy + it.r * (u + gap), kw = it.w * u - gap, kh = u - gap;
+    const s = kmap[it.k];
+    _rrect(g, kx, ky, kw, kh, 8);
+    if (s && s.presses > 0) {
+      const heat = Math.min(1, 0.18 + 0.82 * (s.presses / maxP));
+      const [R, G, B] = smoothRamp(heat);
+      g.fillStyle = 'rgba(' + R + ',' + G + ',' + B + ',0.38)'; g.fill();
+      g.strokeStyle = 'rgba(' + R + ',' + G + ',' + B + ',0.85)'; g.lineWidth = 1.5; g.stroke();
+      g.fillStyle = '#ffffff'; g.font = '700 15px "Segoe UI",sans-serif';
+      g.fillText(disp(it.k), kx + 7, ky + 20);
+      g.fillStyle = 'rgba(255,255,255,0.92)'; g.font = '600 11px ui-monospace,Consolas,monospace';
+      g.fillText(s.presses + '×', kx + 7, ky + 36);
+      g.fillStyle = 'rgba(255,255,255,0.72)';
+      g.fillText(s.avg_mm.toFixed(1) + 'm', kx + 7, ky + 49);
+    } else {
+      g.fillStyle = 'rgba(255,255,255,0.03)'; g.fill();
+      g.strokeStyle = 'rgba(255,255,255,0.08)'; g.lineWidth = 1; g.stroke();
+      g.fillStyle = 'rgba(255,255,255,0.30)'; g.font = '500 13px "Segoe UI",sans-serif';
+      g.fillText(disp(it.k), kx + 7, ky + 22);
+    }
+  }
+
+  // Right panel: Zowie G-SR III mousepad activity heatmap + LMB shot points
+  const rx = 1184, ry = 260, rw = 676, rh = 466;
+  _rrect(g, rx, ry, rw, rh, 16);
+  g.fillStyle = 'rgba(255,255,255,0.03)'; g.fill();
+  g.strokeStyle = 'rgba(255,255,255,0.10)'; g.lineWidth = 1.5; g.stroke();
+  g.fillStyle = '#e2e8f0'; g.font = '600 20px "Microsoft YaHei UI",sans-serif';
+  g.fillText('鼠标垫活动热力图 · 红点=左键开火', rx + 24, ry + 38);
+  const px = rx + 114, py = ry + 64, pw = 448, ph = 372;
+  _rrect(g, px, py, pw, ph, 14);
+  g.fillStyle = '#0e1118'; g.fill();
+  g.strokeStyle = 'rgba(255,255,255,0.18)'; g.lineWidth = 1.5; g.stroke();
+  g.strokeStyle = 'rgba(255,255,255,0.07)'; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(px + pw / 2, py); g.lineTo(px + pw / 2, py + ph); g.moveTo(px, py + ph / 2); g.lineTo(px + pw, py + ph / 2); g.stroke();
+  const mh = an.mouse_heat;
+  if (mh && mh.max > 0) {
+    const cw = pw / mh.w, ch = ph / mh.h;
+    for (let gy = 0; gy < mh.h; gy++) {
+      for (let gx = 0; gx < mh.w; gx++) {
+        const v = mh.grid[gy * mh.w + gx];
+        if (!v) continue;
+        const r = Math.pow(v / mh.max, 0.55);
+        const [R, G, B] = smoothRamp(r);
+        const cx = px + (gx + 0.5) * cw, cy = py + (gy + 0.5) * ch;
+        const rad = Math.max(cw, ch) * 1.15;
+        const rg = g.createRadialGradient(cx, cy, 1, cx, cy, rad);
+        rg.addColorStop(0, 'rgba(' + R + ',' + G + ',' + B + ',' + (0.18 + r * 0.55).toFixed(2) + ')');
+        rg.addColorStop(1, 'rgba(' + R + ',' + G + ',' + B + ',0)');
+        g.fillStyle = rg; g.beginPath(); g.arc(cx, cy, rad, 0, Math.PI * 2); g.fill();
+      }
+    }
+    for (const pt of (mh.lmb || [])) {
+      const sx = px + (pt[0] + 1) * 0.5 * pw, sy = py + (pt[1] + 1) * 0.5 * ph;
+      g.fillStyle = 'rgba(244,63,94,0.88)';
+      g.beginPath(); g.arc(sx, sy, 4.2, 0, Math.PI * 2); g.fill();
+    }
+  } else {
+    g.fillStyle = 'rgba(226,232,240,0.42)'; g.font = '500 18px "Microsoft YaHei UI",sans-serif';
+    g.textAlign = 'center'; g.fillText('该录制无鼠标数据', px + pw / 2, py + ph / 2 + 6); g.textAlign = 'left';
+  }
+
+  // Bottom bar: left = strafe overlap distribution, right = top key peak consistency
+  const bx = 60, by = 750, bw = 1800, bh = 276;
+  _rrect(g, bx, by, bw, bh, 16);
+  g.fillStyle = 'rgba(255,255,255,0.03)'; g.fill();
+  g.strokeStyle = 'rgba(255,255,255,0.10)'; g.lineWidth = 1.5; g.stroke();
+  g.fillStyle = '#e2e8f0'; g.font = '600 19px "Microsoft YaHei UI",sans-serif';
+  g.fillText('急停切换耗时分布（绿=纯净 · 红=重叠超标）', bx + 24, by + 36);
+  const evs = (an.strafes && an.strafes.events) ? an.strafes.events.slice(-48) : [];
+  if (evs.length) {
+    const cx0 = bx + 28, cy0 = by + 56, cw0 = 860, ch0 = 186;
+    const maxMs = Math.max(60, ...evs.map(e => e.ms));
+    const stepW = cw0 / evs.length, barW = Math.max(4, stepW - 4);
+    evs.forEach((e, i) => {
+      const bh0 = Math.max(4, (e.ms / maxMs) * (ch0 - 20));
+      g.fillStyle = (e.kind === 'overlap' && !e.clean) ? '#f43f5e' : (e.clean ? '#34d399' : '#fbbf24');
+      _rrect(g, cx0 + i * stepW, cy0 + ch0 - bh0, barW, bh0, 3); g.fill();
+    });
+    g.fillStyle = 'rgba(226,232,240,0.48)'; g.font = '400 13px ui-monospace,Consolas,monospace';
+    g.fillText('峰值 ' + maxMs.toFixed(0) + ' ms  ·  展示最近 ' + evs.length + ' 次急停切换', cx0, by + 260);
+  } else {
+    g.fillStyle = 'rgba(226,232,240,0.42)'; g.font = '400 16px "Microsoft YaHei UI",sans-serif';
+    g.fillText('未检测到急停键对切换', bx + 28, by + 138);
+  }
+  const rx2 = bx + 930;
+  g.fillStyle = '#e2e8f0'; g.font = '600 19px "Microsoft YaHei UI",sans-serif';
+  g.fillText('单键峰值深度与一致性 (mean ± σ)', rx2, by + 36);
+  const topK = (an.key_stats || []).slice(0, 6);
+  topK.forEach((k, i) => {
+    const y = by + 62 + i * 33;
+    g.fillStyle = '#f8fafc'; g.font = '600 15px ui-monospace,Consolas,monospace';
+    g.fillText(disp(norm(k.key)), rx2, y + 16);
+    const barX = rx2 + 78, barMax = 520;
+    _rrect(g, barX, y + 4, barMax, 14, 7); g.fillStyle = 'rgba(255,255,255,0.06)'; g.fill();
+    const bw1 = Math.max(8, Math.min(1, k.peak_mean / FULL) * barMax);
+    _rrect(g, barX, y + 4, bw1, 14, 7); g.fillStyle = '#38bdf8'; g.fill();
+    g.fillStyle = 'rgba(226,232,240,0.82)'; g.font = '500 14px ui-monospace,Consolas,monospace';
+    g.fillText(k.peak_mean.toFixed(2) + ' ± ' + k.peak_std.toFixed(2) + ' mm  (' + k.presses + '次)', barX + barMax + 14, y + 16);
+  });
+}
+
+function exportReviewCard() {
+  const off = renderReviewCardCanvas();
+  if (!off) { alert('请先加载一段录制数据'); return; }
+  const g = off.getContext('2d');
+  drawReviewCardBody(g, analysis);
+  const name = 'fps-review-' + (analysis.stamp || 'card') + '.png';
+  const a = document.createElement('a');
+  a.href = off.toDataURL('image/png');
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  const logEl = document.getElementById('log');
+  if (logEl) logEl.textContent = '已导出复盘统计卡片：' + name;
 }
 
 function onWbFullChange(v) {
@@ -5438,8 +6080,11 @@ function onWbFullChange(v) {
 function startExport() {
   if (!data || !data.ok) { alert('还没有可导出的录制'); return; }
   if (!(sel[1] > sel[0])) { alert('请先在时间轴上拖出一段区间'); return; }
+  const incMouse = !!(document.getElementById('expMouse') && document.getElementById('expMouse').checked && data.mouse);
+  const mLay = (document.getElementById('expMouseLayout') || {}).value || 'side';
   const picked = (info.keys || []).filter(k => selectedKeys.has(k));
-  if (!picked.length) { alert('请至少勾选一个导出键位'); return; }
+  if (!picked.length && !(incMouse && mLay === 'only')) { alert('请至少勾选一个导出键位'); return; }
+  const fmt = document.getElementById('fmt').value || 'webm';
   const params = {
     stamp: currentStamp || undefined,
     start: sel[0], end: sel[1],
@@ -5450,7 +6095,10 @@ function startExport() {
     fps: Number(document.getElementById('fps').value),
     speed: Number(document.getElementById('speed').value),
     bg: document.getElementById('bg').value,
-    png: document.getElementById('fmt').value === 'png',
+    fmt: fmt,
+    png: fmt === 'png',
+    mouse: incMouse,
+    mouse_layout: mLay,
     keys: picked
   };
   const tok = window.__token || '';

@@ -15,6 +15,7 @@ import csv
 import math
 import multiprocessing as mp
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -161,6 +162,94 @@ def sample_value(arr, t):
     return arr[i][1] if 0 <= t - arr[i][0] <= 0.12 else 0.0
 
 
+def load_mouse_csv(path, start=0.0, end=0.0, speed=1.0):
+    """Load mouse.csv and integrate normalized pad coordinates with smart lift-off recenter."""
+    if not path or not os.path.isfile(path):
+        return None
+    span = 14800
+    evts = []
+    with open(path, encoding="utf-8-sig") as f:
+        hdr = False
+        for ln in f:
+            if ln.lstrip().startswith("#"):
+                m = re.search(r"mouse_span\s*=\s*(\d+)", ln)
+                if m:
+                    v = int(m.group(1))
+                    if 500 <= v <= 200000:
+                        span = v
+                continue
+            if not hdr:
+                hdr = True
+                continue
+            p = ln.strip().split(",")
+            if len(p) < 5:
+                continue
+            try:
+                evts.append((float(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4])))
+            except ValueError:
+                continue
+    if not evts:
+        return None
+    step_x = 2.0 / max(500.0, float(span))
+    aspect = (306.0 - 44.0) / (254.0 - 84.0)
+    tx = ty = 0.0
+    last_move = -9.0
+    prev_t = evts[0][0]
+    dur_raw = evts[-1][0]
+    # Sample at 100 Hz from 0 to dur_raw so smart recenter matches /wb & /overlay/mouse
+    n_pts = int(math.ceil(dur_raw * 100.0)) + 2
+    idx = 0
+    n_ev = len(evts)
+    btn = 0
+    samples = []
+    for k in range(n_pts):
+        t = k * 0.01
+        dt = max(0.0, min(0.2, t - prev_t))
+        prev_t = t
+        sdx = sdy = w_acc = b_hit = 0
+        while idx < n_ev and evts[idx][0] <= t + 1e-6:
+            et, dx, dy, bm, wh = evts[idx]
+            sdx += dx
+            sdy += dy
+            b_hit |= bm
+            btn = bm
+            if wh:
+                w_acc += wh
+            if dx or dy:
+                last_move = et
+            idx += 1
+        if sdx or sdy:
+            tx = max(-1.0, min(1.0, tx + sdx * step_x))
+            ty = max(-1.0, min(1.0, ty + sdy * step_x * aspect))
+        elif t - last_move > 0.20 and dt > 0:
+            kk = math.exp(-dt * (1.6 + min(1.4, math.hypot(tx, ty)) * 4.2))
+            tx *= kk
+            ty *= kk
+        if t >= start and (not end or t <= end + 0.02):
+            factor = 1.0 / max(1e-6, speed)
+            samples.append(((t - start) * factor, tx, ty, btn | b_hit, w_acc))
+    return samples if samples else None
+
+
+def sample_mouse(samples, t):
+    if not samples:
+        return 0.0, 0.0, 0, 0, 0
+    lo, hi = 0, len(samples) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if samples[mid][0] <= t:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    i = max(0, min(len(samples) - 1, hi))
+    j = min(len(samples) - 1, i + 1)
+    dt = samples[j][0] - samples[i][0]
+    f = max(0.0, min(1.0, (t - samples[i][0]) / dt)) if dt > 1e-6 else 0.0
+    x = samples[i][1] + (samples[j][1] - samples[i][1]) * f
+    y = samples[i][2] + (samples[j][2] - samples[i][2]) * f
+    return x, y, samples[i][3], samples[i][4], i
+
+
 # ------------------------------------------------------------------ art
 
 def depth_color(ratio, theme):
@@ -228,7 +317,127 @@ def build_slot(label, x, y, w, unit, gap, theme, alpha, width_px):
                 label_img=label_img, width=width_px, theme=theme)
 
 
-def render_frame(idx, fps, size, slots, series, bg=None, full=FULL):
+def build_mouse_art(x, y, pw, ph, alpha, theme):
+    """Pre-render static Zowie G-SR III mousepad RGBA layer."""
+    pw, ph = max(60, int(round(pw))), max(50, int(round(ph)))
+    rad = max(8, int(min(pw, ph) * 0.055))
+    pad = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+    d = ImageDraw.Draw(pad)
+    d.rounded_rectangle([0, 0, pw - 1, ph - 1], radius=rad,
+                        fill=(14, 16, 22, int(255 * min(1.0, alpha * 0.82))),
+                        outline=(255, 255, 255, 56), width=max(1, pw // 160))
+    # Subtle center crosshair + corner brackets
+    d.line([(pw // 2, 10), (pw // 2, ph - 10)], fill=(255, 255, 255, 18), width=1)
+    d.line([(10, ph // 2), (pw - 10, ph // 2)], fill=(255, 255, 255, 18), width=1)
+    c_len = max(8, pw // 22)
+    c_col = (255, 255, 255, 72)
+    m = max(6, pw // 36)
+    w_c = max(1, pw // 140)
+    for (ax, ay, bx, by, cx, cy) in (
+        (m, m + c_len, m, m, m + c_len, m),
+        (pw - m - c_len, m, pw - m, m, pw - m, m + c_len),
+        (m, ph - m - c_len, m, ph - m, m + c_len, ph - m),
+        (pw - m - c_len, ph - m, pw - m, ph - m, pw - m, ph - m - c_len),
+    ):
+        d.line([(ax, ay), (bx, by), (cx, cy)], fill=c_col, width=w_c)
+    mw = max(18, int(round(pw * (63.9 / 470.0))))
+    mh = max(34, int(round(ph * (127.1 / 390.0))))
+    return dict(x=int(round(x)), y=int(round(y)), w=pw, h=ph, mw=mw, mh=mh,
+                inset=max(6, pw // 28), pad=pad, theme=theme, alpha=alpha)
+
+
+def draw_mouse_overlay(canvas, t, mart, samples):
+    """Composite mousepad, 0.55s fading trail, and Viper-proportioned mouse onto RGBA canvas."""
+    if not mart or not samples:
+        return
+    px, py, pw, ph = mart["x"], mart["y"], mart["w"], mart["h"]
+    mw, mh, inset = mart["mw"], mart["mh"], mart["inset"]
+    canvas.alpha_composite(mart["pad"], (px, py))
+
+    nx, ny, bmask, wh, idx = sample_mouse(samples, t)
+    def to_xy(vx, vy):
+        cx = inset + mw * 0.5 + (vx + 1.0) * 0.5 * (pw - mw - inset * 2)
+        cy = inset + mh * 0.5 + (vy + 1.0) * 0.5 * (ph - mh - inset * 2)
+        return cx, cy
+
+    acc = depth_color(0.75, mart["theme"])
+    # 0.55s fading trail inside pad bounds
+    trail_img = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+    td = ImageDraw.Draw(trail_img)
+    win = 0.55
+    k0 = idx
+    while k0 > 0 and (t - samples[k0 - 1][0]) <= win:
+        k0 -= 1
+    prev = None
+    for k in range(k0, idx + 1):
+        pt = to_xy(samples[k][1], samples[k][2])
+        age = max(0.0, t - samples[k][0])
+        a = max(0.0, 1.0 - age / win)
+        if prev is not None and a > 0.02:
+            td.line([prev, pt], fill=(acc[0], acc[1], acc[2], int(185 * a)),
+                    width=max(2, int(round((1.4 + a * 2.4) * (pw / 306.0)))))
+        prev = pt
+    cx, cy = to_xy(nx, ny)
+    if prev is not None:
+        td.line([prev, (cx, cy)], fill=(acc[0], acc[1], acc[2], 195),
+                width=max(2, int(round(3.2 * (pw / 306.0)))))
+    canvas.alpha_composite(trail_img, (px, py))
+
+    # Symmetrical Viper V4 Pro silhouette with button highlights clipped to shell mask
+    m_img = Image.new("RGBA", (mw + 8, mh + 8), (0, 0, 0, 0))
+    md = ImageDraw.Draw(m_img)
+    ox, oy = 4, 4
+    r_m = max(6, mw // 2)
+    a_m = int(255 * min(1.0, mart["alpha"] * 1.02))
+    md.rounded_rectangle([ox, oy, ox + mw - 1, oy + mh - 1], radius=r_m,
+                         fill=(26, 30, 39, a_m))
+    split_y = oy + int(mh * 0.40)
+    mid_x = ox + mw // 2
+    if bmask & 3:
+        s_mask = Image.new("L", (mw + 8, mh + 8), 0)
+        ImageDraw.Draw(s_mask).rounded_rectangle([ox + 1, oy + 1, ox + mw - 2, oy + mh - 2],
+                                                 radius=max(4, r_m - 1), fill=220)
+        b_ov = Image.new("RGBA", (mw + 8, mh + 8), (0, 0, 0, 0))
+        bd = ImageDraw.Draw(b_ov)
+        if bmask & 1:
+            bd.rectangle([ox, oy, mid_x - 1, split_y], fill=(acc[0], acc[1], acc[2], 255))
+        if bmask & 2:
+            bd.rectangle([mid_x + 1, oy, ox + mw, split_y], fill=(acc[0], acc[1], acc[2], 255))
+        b_a = b_ov.getchannel("A")
+        b_ov.putalpha(Image.composite(s_mask, Image.new("L", s_mask.size, 0), b_a))
+        m_img.alpha_composite(b_ov)
+        md = ImageDraw.Draw(m_img)
+    md.rounded_rectangle([ox, oy, ox + mw - 1, oy + mh - 1], radius=r_m,
+                         outline=(255, 255, 255, 165), width=max(1, mw // 22))
+    md.line([(ox + 2, split_y), (ox + mw - 3, split_y)], fill=(255, 255, 255, 75), width=1)
+    md.line([(mid_x, oy + 3), (mid_x, split_y)], fill=(255, 255, 255, 75), width=1)
+    # Scroll wheel
+    ww = max(3, int(mw * 0.14))
+    wh_px = max(6, int(mh * 0.15))
+    wx0, wy0 = mid_x - ww // 2, oy + int(mh * 0.11)
+    w_on = bool((bmask & 4) or wh != 0)
+    md.rounded_rectangle([wx0, wy0, wx0 + ww, wy0 + wh_px], radius=max(2, ww // 2),
+                         fill=(acc[0], acc[1], acc[2], 240) if w_on else (160, 170, 185, 165),
+                         outline=(255, 255, 255, 200), width=1)
+    # Side buttons (X2 top, X1 bottom on left edge)
+    sw = max(2, int(mw * 0.08))
+    sh_px = max(5, int(mh * 0.12))
+    for bit, frac in ((16, 0.34), (8, 0.49)):
+        sy0 = oy + int(mh * frac)
+        on = bool(bmask & bit)
+        md.rounded_rectangle([ox - 1, sy0, ox + sw, sy0 + sh_px], radius=2,
+                             fill=(acc[0], acc[1], acc[2], 245) if on else (160, 170, 185, 140))
+    # Center LED dot
+    led_r = max(2, mw // 16)
+    ly = oy + int(mh * 0.48)
+    md.ellipse([mid_x - led_r, ly - led_r, mid_x + led_r, ly + led_r],
+               fill=(acc[0], acc[1], acc[2], 255 if bmask else 155))
+    canvas.alpha_composite(m_img, (int(round(px + cx - mw * 0.5 - ox)),
+                                   int(round(py + cy - mh * 0.5 - oy))))
+
+
+def render_frame(idx, fps, size, slots, series, bg=None, full=FULL,
+                 mouse_art=None, mouse_samples=None):
     W, H = size
     canvas = Image.new("RGBA", (W, H), bg if bg else (0, 0, 0, 0))
     t = idx / float(fps)
@@ -257,6 +466,8 @@ def render_frame(idx, fps, size, slots, series, bg=None, full=FULL):
         img = s["label_img"].get(ratio > 0.05)
         if img is not None:
             canvas.alpha_composite(img, (s["x"], s["y"]))
+    if mouse_art and mouse_samples:
+        draw_mouse_overlay(canvas, t, mouse_art, mouse_samples)
     return canvas
 
 
@@ -307,7 +518,8 @@ def _render_segment(job):
     try:
         for i in range(start, end):
             img = render_frame(i, fps, size, _W["slots"], _W["series"],
-                               _W.get("bg"), _W.get("full", FULL))
+                               _W.get("bg"), _W.get("full", FULL),
+                               _W.get("mouse_art"), _W.get("mouse_samples"))
             proc.stdin.write(img.tobytes())
             written += 1
     except BrokenPipeError:
@@ -336,9 +548,26 @@ def _render_range(rng):
     out = _W["out"]
     for i in range(start, end):
         img = render_frame(i, _W["fps"], _W["size"], _W["slots"], _W["series"],
-                           _W.get("bg"), _W.get("full", FULL))
+                           _W.get("bg"), _W.get("full", FULL),
+                           _W.get("mouse_art"), _W.get("mouse_samples"))
         img.save(os.path.join(out, "frame_%05d.png" % i), "PNG", compress_level=1)
     return end - start
+
+
+def encode_webm(out_dir, movie, fps, jobs):
+    """Encode PNG sequence into lightweight transparent WebM (VP9 yuva420p)."""
+    pattern = os.path.join(out_dir, "frame_%05d.png")
+    threads = max(2, min(16, int(jobs or 4) * 2))
+    cmd = [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-framerate", str(fps), "-i", pattern,
+        "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+        "-auto-alt-ref", "0", "-b:v", "0", "-crf", "30",
+        "-deadline", "good", "-cpu-used", "4",
+        "-row-mt", "1", "-threads", str(threads),
+        movie,
+    ]
+    return subprocess.run(cmd).returncode
 
 
 def encode_segments(out_dir, movie, fps, n, jobs):
@@ -428,6 +657,11 @@ def main():
     ap.add_argument("--end", type=float, default=0.0)
     ap.add_argument("--jobs", type=int, default=0, help="worker processes (0 = all cores)")
     ap.add_argument("--bg", default="", help="solid background colour, e.g. #101014")
+    ap.add_argument("--mouse", default="", help="optional mouse.csv for synced mousepad overlay")
+    ap.add_argument("--mouse-layout", default="side", choices=("side", "stack", "only"),
+                    help="keyboard + mouse placement: side | stack | only")
+    ap.add_argument("--format", default="prores", choices=("prores", "webm", "png"),
+                    help="output format: prores (.mov) | webm (VP9 alpha) | png")
     ap.add_argument("--png-only", action="store_true")
     ap.add_argument("--pipe", action="store_true", default=False,
                     help="stream frames into per-worker ffmpeg (slower on ProRes)")
@@ -441,7 +675,7 @@ def main():
 
     W, H = [int(v) for v in args.size.lower().split("x")]
     series, dur = load_csv(args.csv)
-    if not series:
+    if not series and not args.mouse:
         print("no usable rows in %s" % args.csv)
         return 2
     if args.alias:
@@ -466,9 +700,15 @@ def main():
         series = {k: [(t * factor, mm) for t, mm in v] for k, v in series.items()}
         dur = dur * factor
 
+    mouse_samples = load_mouse_csv(args.mouse, start=args.start, end=args.end, speed=args.speed) if args.mouse else None
+    if mouse_samples and dur <= 0.0:
+        dur = mouse_samples[-1][0]
+    mlay = args.mouse_layout if mouse_samples else "none"
     theme = THEMES[args.theme]
     layout_defs = LAYOUTS[args.layout]
-    if args.keys:
+    if mlay == "only":
+        slots_def = []
+    elif args.keys:
         want = set(args.keys)
         slots_def = [(label, x, y, w) for label, x, y, w in layout_defs if label in want]
     elif args.layout == "full":
@@ -476,19 +716,57 @@ def main():
     else:
         default_keys = {"W", "A", "S", "D", "LAlt", "LCtrl", "LShift", "Space"}
         slots_def = [(label, x, y, w) for label, x, y, w in layout_defs if label in default_keys]
-    if not slots_def:
+    if not slots_def and mlay != "only":
         print("no matching keys for layout %s" % args.layout)
         return 2
-    maxx = max(x + w for _, x, y, w in slots_def)
-    maxy = max(y + 1 for _, x, y, w in slots_def)
-    unit = args.u or min(W * 0.82 / maxx, H * 0.78 / maxy)
-    gap = unit * 0.08
-    ox = (W - maxx * unit) / 2.0
-    oy = (H - (maxy * (unit + gap) - gap)) / 2.0
-    width_px = max(1, int(unit * 0.014))
-    slots = [build_slot(label, (ox + x * unit) / unit, (oy + y * (unit + gap)) / (unit + gap),
-                        w, unit, gap, theme, args.alpha, width_px)
-             for label, x, y, w in slots_def]
+
+    mouse_art = None
+    slots = []
+    pad_ratio = 470.0 / 390.0
+    if mlay == "only":
+        ph = min(H * 0.78, (W * 0.82) / pad_ratio)
+        pw = ph * pad_ratio
+        mouse_art = build_mouse_art((W - pw) / 2.0, (H - ph) / 2.0, pw, ph, args.alpha, theme)
+    else:
+        maxx = max(x + w for _, x, y, w in slots_def)
+        maxy = max(y + 1 for _, x, y, w in slots_def)
+        if mlay == "side":
+            kb_box_w, kb_box_h = W * 0.56, H * 0.76
+            unit = args.u or min(kb_box_w / maxx, kb_box_h / maxy)
+            gap = unit * 0.08
+            kb_w, kb_h = maxx * unit, maxy * (unit + gap) - gap
+            ph = min(H * 0.72, max(kb_h * 1.08, H * 0.38))
+            pw = ph * pad_ratio
+            sep = max(36.0, W * 0.03)
+            tot_w = kb_w + sep + pw
+            if tot_w > W * 0.90:
+                sc = (W * 0.90) / tot_w
+                unit *= sc; gap *= sc; kb_w *= sc; kb_h *= sc; pw *= sc; ph *= sc; sep *= sc
+                tot_w = kb_w + sep + pw
+            ox = (W - tot_w) / 2.0
+            oy = (H - kb_h) / 2.0
+            mouse_art = build_mouse_art(ox + kb_w + sep, (H - ph) / 2.0, pw, ph, args.alpha, theme)
+        elif mlay == "stack":
+            kb_box_w, kb_box_h = W * 0.80, H * 0.42
+            unit = args.u or min(kb_box_w / maxx, kb_box_h / maxy)
+            gap = unit * 0.08
+            kb_w, kb_h = maxx * unit, maxy * (unit + gap) - gap
+            ph = min(H * 0.40, (W * 0.65) / pad_ratio)
+            pw = ph * pad_ratio
+            sep = max(24.0, H * 0.03)
+            tot_h = kb_h + sep + ph
+            ox = (W - kb_w) / 2.0
+            oy = (H - tot_h) / 2.0
+            mouse_art = build_mouse_art((W - pw) / 2.0, oy + kb_h + sep, pw, ph, args.alpha, theme)
+        else:
+            unit = args.u or min(W * 0.82 / maxx, H * 0.78 / maxy)
+            gap = unit * 0.08
+            ox = (W - maxx * unit) / 2.0
+            oy = (H - (maxy * (unit + gap) - gap)) / 2.0
+        width_px = max(1, int(unit * 0.014))
+        slots = [build_slot(label, (ox + x * unit) / unit, (oy + y * (unit + gap)) / (unit + gap),
+                            w, unit, gap, theme, args.alpha, width_px)
+                 for label, x, y, w in slots_def]
 
     out_dir = args.out or (os.path.splitext(os.path.basename(args.csv))[0] + "-frames")
     if os.path.isdir(out_dir):
@@ -515,12 +793,14 @@ def main():
             print("bad --bg value, expected #RRGGBB or #RRGGBBAA")
             return 2
     cfg = dict(out=out_dir, fps=args.fps, size=(W, H), slots=slots, series=series,
-               bg=bg, full=full_mm, ffmpeg=FFMPEG)
+               bg=bg, full=full_mm, ffmpeg=FFMPEG,
+               mouse_art=mouse_art, mouse_samples=mouse_samples)
+    out_fmt = "png" if args.png_only else args.format
     if jobs <= 1 or n < 40:
         _init(cfg)
         _render_range((0, n))
     else:
-        if args.pipe and not args.png_only:
+        if args.pipe and out_fmt == "prores":
             seg_dir = os.path.join(out_dir, "..", os.path.basename(out_dir) + "-seg")
             seg_dir = os.path.abspath(seg_dir)
             shutil.rmtree(seg_dir, ignore_errors=True)
@@ -576,7 +856,7 @@ def main():
         print("hint: %.0fs of footage -- --png-only renders in ~%.0fs and Premiere "
               "imports the sequence directly" % (dur, n / 250.0))
 
-    if args.png_only:
+    if out_fmt == "png":
         if args.mp4:
             import time as _t
             t_mp4 = _t.perf_counter()
@@ -591,10 +871,17 @@ def main():
         print("(sequence is ~4x faster than ProRes and keeps alpha)")
         return 0
 
-    movie = out_dir + ".mov"
-    print("encoding with %d parallel segments…" % jobs)
     t_enc = time.perf_counter()
-    rc = encode_segments(out_dir, movie, args.fps, n, jobs)
+    if out_fmt == "webm":
+        movie = out_dir + ".webm"
+        print("encoding WebM (VP9 yuva420p alpha)…")
+        rc = encode_webm(out_dir, movie, args.fps, jobs)
+        fmt_desc = "WebM VP9 with alpha"
+    else:
+        movie = out_dir + ".mov"
+        print("encoding with %d parallel segments…" % jobs)
+        rc = encode_segments(out_dir, movie, args.fps, n, jobs)
+        fmt_desc = "ProRes 4444 with alpha"
     if rc != 0:
         print("ffmpeg failed")
         return 3
@@ -610,7 +897,7 @@ def main():
                   % (args.mp4, _t.perf_counter() - t_mp4))
     if not args.keep_frames:
         shutil.rmtree(out_dir, ignore_errors=True)
-    print("video -> %s (ProRes 4444 with alpha)" % movie)
+    print("video -> %s (%s)" % (movie, fmt_desc))
     return 0
 
 

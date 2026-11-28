@@ -1093,6 +1093,101 @@ def t_socd_hold_and_silent_fallback():
     assert e.keys[31]["mm"] == 0.0, e.keys[31]["mm"]
 
 
+def t_wb_fps_analysis():
+    """/wb/analysis detects bad overlaps, clean gaps, moving shots, key std & mouse heatmap."""
+    base = dl.recordings_dir()
+    stamp = "20261128-075900"
+    vdir = os.path.join(base, stamp)
+    os.makedirs(vdir, exist_ok=True)
+    wide = os.path.join(vdir, "wide.csv")
+    mouse_p = os.path.join(vdir, "mouse.csv")
+    # 2.00s at 100Hz:
+    # - 0.10..0.46 A=3.5; 0.40..0.75 D=3.2 => 60ms bad overlap A->D at 0.40..0.46
+    # - 0.78..1.10 A=3.0 => 20ms clean gap D->A at 0.76..0.78
+    with io.open(wide, "w", encoding="utf-8") as f:
+        f.write("# test\nt_s,wall,A,D\n")
+        for i in range(201):
+            t = i * 0.01
+            a = 3.5 if 0.10 <= t <= 0.46 else (3.0 if 0.78 <= t <= 1.10 else 0.0)
+            d = 3.2 if 0.40 <= t <= 0.75 else 0.0
+            f.write("%.3f,2026-11-28T07:59:00,%.2f,%.2f\n" % (t, a, d))
+    with io.open(mouse_p, "w", encoding="utf-8") as f:
+        f.write("# tool=depth-live  mouse_span=10000\nt_s,dx,dy,btn,wheel\n")
+        # Shot 1 at 0.55s while D=3.2 (moving shot)
+        f.write("0.500,300,50,0,0\n0.550,20,0,1,0\n0.600,0,0,0,0\n")
+        # Shot 2 at 1.40s while A=D=0.0 (still shot)
+        f.write("1.350,-250,-40,0,0\n1.400,0,0,1,0\n1.450,0,0,0,0\n")
+    e = dl.Engine()
+    an = e.wb_analysis(stamp=stamp, pair=("A", "D"))
+    assert an["ok"], an
+    st = an["strafes"]
+    assert st["total"] == 2 and st["overlap_count"] == 1 and st["clean_count"] == 1, st
+    assert abs(st["clean_pct"] - 50.0) < 0.2 and st["worst"][0]["ms"] >= 55.0, st
+    sh = an["shots"]
+    assert sh["total"] == 2 and sh["still_count"] == 1 and abs(sh["still_pct"] - 50.0) < 0.2, sh
+    assert sh["moving"][0]["key"] == "D" and sh["moving"][0]["mm"] >= 3.0, sh
+    ks = {k["key"]: k for k in an["key_stats"]}
+    assert ks["A"]["presses"] == 2 and ks["A"]["peak_std"] > 0.1, ks
+    assert an["mouse_heat"]["max"] > 0 and len(an["mouse_heat"]["lmb"]) == 2, an["mouse_heat"]
+    # Legacy recording without mouse.csv
+    os.remove(mouse_p)
+    an2 = e.wb_analysis(stamp=stamp, pair=("A", "D"))
+    assert an2["ok"] and an2["shots"] is None and an2["mouse_heat"] is None and an2["strafes"]["total"] == 2
+
+
+def t_kb_frames_mouse_overlay_and_webm():
+    """kb-frames.py renders synced keyboard+mouse RGBA frames (side/stack) and VP9 alpha WebM."""
+    import glob, shutil, subprocess, tempfile
+    from PIL import Image
+    here = os.path.dirname(os.path.abspath(__file__))
+    kb = os.path.join(here, "kb-frames.py")
+    tmp = tempfile.mkdtemp()
+    try:
+        wide = os.path.join(tmp, "wide.csv")
+        mouse = os.path.join(tmp, "mouse.csv")
+        with io.open(wide, "w", encoding="utf-8") as f:
+            f.write("# test\nt_s,wall,W,A,S,D\n")
+            for i in range(25):
+                t = i * 0.02
+                f.write("%.3f,2026-11-28T08:00:00,%.2f,%.2f,0.00,%.2f\n"
+                        % (t, 3.4 if i < 10 else 0.0, 3.2 if 8 <= i < 16 else 0.0, 3.5 if i >= 14 else 0.0))
+        with io.open(mouse, "w", encoding="utf-8") as f:
+            f.write("# tool=depth-live  mouse_span=10000\nt_s,dx,dy,btn,wheel\n")
+            for i in range(25):
+                f.write("%.3f,%d,%d,%d,0\n" % (i * 0.02, 160 if i < 12 else -120, 40, 1 if 10 <= i <= 16 else 0))
+
+        # Test side-by-side & stack PNG alpha frames
+        for mlay in ("side", "stack"):
+            out_dir = os.path.join(tmp, "f_" + mlay)
+            r = subprocess.run([sys.executable, kb, wide, "--mouse", mouse, "--mouse-layout", mlay,
+                                "--layout", "hud", "--fps", "20", "--size", "640x360",
+                                "--jobs", "1", "--png-only", "-o", out_dir],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            frames = sorted(glob.glob(os.path.join(out_dir, "*.png")))
+            assert len(frames) >= 8, len(frames)
+            img = Image.open(frames[len(frames) // 2])
+            assert img.mode == "RGBA" and img.size == (640, 360)
+            a_min, a_max = img.getchannel("A").getextrema()
+            assert a_min == 0 and a_max > 200, (mlay, a_min, a_max)
+
+        # Test WebM VP9 transparent export if ffmpeg is installed
+        if shutil.which("ffmpeg"):
+            out_base = os.path.join(tmp, "out_vp9")
+            r = subprocess.run([sys.executable, kb, wide, "--mouse", mouse, "--mouse-layout", "side",
+                                "--layout", "hud", "--fps", "20", "--size", "640x360",
+                                "--jobs", "1", "--format", "webm", "-o", out_base],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            webm_path = out_base + ".webm"
+            assert os.path.isfile(webm_path) and os.path.getsize(webm_path) > 1000, webm_path
+            ff = subprocess.run(["ffmpeg", "-c:v", "libvpx-vp9", "-i", webm_path], capture_output=True, text=True)
+            info_s = (ff.stderr or "").lower()
+            assert "vp9" in info_s and ("alpha_mode" in info_s or "yuva420p" in info_s), ff.stderr
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print("depth pipeline tests")
     for name, fn in [
@@ -1148,6 +1243,8 @@ def main():
         ("mouse cap, mouse-only & integrity", t_mouse_memory_cap_and_mouse_only_and_integrity),
         ("RT release preserves true travel", t_rt_release_preserves_true_travel),
         ("SOCD hold + silent fallback zero", t_socd_hold_and_silent_fallback),
+        ("workbench FPS diagnosis analysis", t_wb_fps_analysis),
+        ("kb-frames mouse overlay + WebM VP9 alpha", t_kb_frames_mouse_overlay_and_webm),
     ]:
         check(name, fn)
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
